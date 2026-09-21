@@ -381,12 +381,12 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 **Files:**
 - Create: `pyproject.toml`, `.gitignore`, `.pre-commit-config.yaml`, `.secrets.baseline`, `README.md` (заглушка), `agent_dispatch/__init__.py`, `agent_dispatch/version.py`, `tests/__init__.py`, `tests/conftest.py`, `tests/test_smoke.py`
 
-- [ ] `pyproject.toml`: пакет `agent_dispatch`, entrypoint `agent-dispatch = agent_dispatch.cli:app`, deps pydantic, fastapi, uvicorn, mcp, httpx, pyyaml, jinja2, typer, jsonschema; dev pytest, pytest-asyncio, respx, ruff, detect-secrets; `asyncio_mode = "auto"`
-- [ ] `.gitignore`: `.venv/`, `__pycache__/`, `*.db`, `env`, `.env*`, `logs/`, `dist/`, `evals/reports/`
-- [ ] `.pre-commit-config.yaml`: ruff check + format, detect-secrets, `uv run pytest tests/ -q` как local hook
-- [ ] `tests/conftest.py`: фикстура `tmp_config_dir` (изолированные `config.yaml`, `env`, `data_dir` через env `AGENT_DISPATCH_CONFIG_DIR`/`AGENT_DISPATCH_DATA_DIR`), фикстура `git_repo` (temp-репа с одним коммитом)
-- [ ] `tests/test_smoke.py`: импорт пакета, версия строка
-- [ ] `uv sync`, `uv run pytest tests/ -q` зелёный, `uv run ruff check .` чистый, pre-commit проходит на тестовом коммите
+- [x] `pyproject.toml`: пакет `agent_dispatch`, entrypoint `agent-dispatch = agent_dispatch.cli:app`, deps pydantic, fastapi, uvicorn, mcp, httpx, pyyaml, jinja2, typer, jsonschema; dev pytest, pytest-asyncio, respx, ruff, detect-secrets; `asyncio_mode = "auto"`
+- [x] `.gitignore`: `.venv/`, `__pycache__/`, `*.db`, `env`, `.env*`, `logs/`, `dist/`, `evals/reports/`
+- [x] `.pre-commit-config.yaml`: ruff check + format, detect-secrets, `uv run pytest tests/ -q` как local hook
+- [x] `tests/conftest.py`: фикстура `tmp_config_dir` (изолированные `config.yaml`, `env`, `data_dir` через env `AGENT_DISPATCH_CONFIG_DIR`/`AGENT_DISPATCH_DATA_DIR`), фикстура `git_repo` (temp-репа с одним коммитом)
+- [x] `tests/test_smoke.py`: импорт пакета, версия строка
+- [x] `uv sync`, `uv run pytest tests/ -q` зелёный, `uv run ruff check .` чистый, pre-commit проходит на тестовом коммите
 
 ### Task 2: Config: загрузка YAML + env, валидация, дефолты
 
