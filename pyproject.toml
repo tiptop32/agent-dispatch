@@ -1,0 +1,50 @@
+[project]
+name = "agent-dispatch"
+version = "0.1.0"
+description = "Маршрутизация coding-задач между Claude Code, Codex и OpenCode. Start anywhere. Dispatch anywhere."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "pydantic>=2.13,<3",
+    "fastapi>=0.141,<1",
+    "uvicorn>=0.53,<1",
+    "mcp>=2.2,<3",
+    "httpx>=0.28,<1",
+    "pyyaml>=6.0,<7",
+    "jinja2>=3.1,<4",
+    "typer>=0.27,<1",
+    "jsonschema>=4.26,<5",
+]
+
+[project.scripts]
+agent-dispatch = "agent_dispatch.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1,<10",
+    "pytest-asyncio>=1.4,<2",
+    "respx>=0.23,<1",
+    "ruff>=0.14",
+    "detect-secrets>=1.5,<2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_dispatch"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["docs", "*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
