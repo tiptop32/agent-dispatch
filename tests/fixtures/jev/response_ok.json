@@ -1,0 +1,47 @@
+{
+  "model": "typesafe/jev-1.13-20260917",
+  "answers": {
+    "executor": {
+      "type": "choice",
+      "choice": "codex",
+      "probabilities": {
+        "opencode/x5-code": 0,
+        "opencode/kimi": 0,
+        "codex": 1,
+        "claude": 0
+      },
+      "confidence": 0.99
+    },
+    "difficulty": {
+      "type": "score",
+      "score": 1,
+      "legend": {
+        "0": {
+          "label": "trivial",
+          "description": "one-line or config change"
+        },
+        "1": {
+          "label": "moderate",
+          "description": "localized bug fix in one module"
+        },
+        "2": {
+          "label": "hard",
+          "description": "cross-module reasoning or design decisions"
+        }
+      },
+      "probabilities": {
+        "0": 0,
+        "1": 0.99,
+        "2": 0.01
+      },
+      "confidence": 0.98
+    }
+  },
+  "usage": {
+    "input_tokens": 695,
+    "output_tokens": 71,
+    "cost": 2.919e-05
+  },
+  "id": "gen-dec-1790003970-s8m57TOYXD1bfJKescR5",
+  "provider": "TypeSafe"
+}

@@ -1,0 +1,6 @@
+{
+  "error": {
+    "message": "[\n  {\n    \"expected\": \"array\",\n    \"code\": \"invalid_type\",\n    \"path\": [\n      \"questions\",\n      \"difficulty\",\n      \"criteria\"\n    ],\n    \"message\": \"Invalid input: expected array, received object\"\n  }\n]",
+    "code": 400
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": {
+    "task": "Найди причину падения теста tests/test_client.py::test_waiter_timeout и исправь. Не менять публичный API, прогнать затронутые тесты.",
+    "context": "pytest падает после рефакторинга waiter в src/client.py; таймаут не сбрасывается между повторами",
+    "files": [
+      "tests/test_client.py",
+      "src/client.py"
+    ],
+    "constraints": [
+      "не менять публичный API",
+      "прогнать затронутые тесты"
+    ],
+    "source_agent": "codex"
+  },
+  "questions": {
+    "executor": {
+      "type": "choice",
+      "instructions": "Which coding agent should execute this task?",
+      "criteria": {
+        "claude": "Claude Code: strongest reasoning, multi-file refactors, ambiguous or design-heavy tasks; most expensive",
+        "codex": "OpenAI Codex CLI: solid autonomous bug fixing and test-driven fixes in a single repo; medium cost",
+        "opencode/kimi": "OpenCode with Kimi K2.5: cheap, good for small well-specified edits, docs, boilerplate",
+        "opencode/x5-code": "OpenCode with corporate x5-airun code model: cheap internal model for routine edits with corporate data constraints"
+      }
+    },
+    "difficulty": {
+      "type": "score",
+      "instructions": "How hard is this coding task?",
+      "criteria": [
+        {
+          "label": "trivial",
+          "description": "one-line or config change"
+        },
+        {
+          "label": "moderate",
+          "description": "localized bug fix in one module"
+        },
+        {
+          "label": "hard",
+          "description": "cross-module reasoning or design decisions"
+        }
+      ]
+    }
+  }
+}
