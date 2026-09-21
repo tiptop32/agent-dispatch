@@ -22,9 +22,9 @@ AgentDispatch это отдельный локальный сервис, кот�
 - CLI: `claude` 2.1.270, `codex-cli` 0.155.1 (через codex-lb, `~/.codex/config.toml` `model_provider = "codex-lb"`), `opencode` 1.18.31, `uv`, `python3` 3.11.
 - OpenCode сконфигурирован с провайдерами `openrouter` (`kimi-k2.5`, `minimax-m2.5`) и `copilot` (`x5-airun-code-large-exp` и другие `x5-airun-*`). DeepSeek и GLM НЕ настроены, в registry v0.1 их нет.
 - Jev через OpenRouter: `POST https://openrouter.ai/api/alpha/decisions`, модель `typesafe/jev-1.13`. Живая проба: 200 OK, ~1 с, 695 input tokens, cost $0.000029. Ключ `OPENROUTER_API_KEY`.
-- Jev через Vercel AI Gateway: `POST https://ai-gateway.vercel.sh/typesafe/v1/systemone`, модель `typesafe-ai/jev`, тело идентичное. Ключ `AI_GATEWAY_API_KEY` (бесплатный до 2026-09-25). Проба: схема валидируется, но `403 customer_verification_required`, Vercel требует карту на команде. Работает только после привязки карты; free tier с жёстким rate limit.
-- Оба ключа в `~/.config/agent-dispatch/env` (права 600).
-- Формат Jev. Запрос: `{model, state: str|object, questions: {name: {type: choice|score|noul, instructions, criteria}}}`. Для `choice` `criteria` это map `label -> description`; для `score` `criteria` это упорядоченный массив `[{label, description}]` (объект даёт 400 с zod-путём). Тип yes/no называется `noul` на обоих endpoint (не `boolean`). Ответ: `{model, answers: {name: {type: "choice", choice, probabilities: {label: p}, confidence} | {type: "score", score, legend, probabilities, confidence}}, usage: {input_tokens, output_tokens, cost}, id, provider}`. Jev не виден в `GET /api/v1/models`.
+- Vercel AI Gateway как второй провайдер Jev рассмотрен и отклонён 2026-09-21: требует карту на команде (`403 customer_verification_required`), free tier с жёстким rate limit. Не используем.
+- Ключ в `~/.config/agent-dispatch/env` (права 600).
+- Формат Jev. Запрос: `{model, state: str|object, questions: {name: {type: choice|score|noul, instructions, criteria}}}`. Для `choice` `criteria` это map `label -> description`; для `score` `criteria` это упорядоченный массив `[{label, description}]` (объект даёт 400 с zod-путём). Тип yes/no называется `noul`. Ответ: `{model, answers: {name: {type: "choice", choice, probabilities: {label: p}, confidence} | {type: "score", score, legend, probabilities, confidence}}, usage: {input_tokens, output_tokens, cost}, id, provider}`. Jev не виден в `GET /api/v1/models`.
 - Headless-режимы (флаги проверены по `--help`): `claude -p --output-format json --permission-mode <mode> --allowedTools <list> --add-dir <cwd>`; `codex exec --json -C <cwd> --sandbox workspace-write --output-schema <schema.json> -o <last_message.json>`, вне git-репы требует `--skip-git-repo-check`; `opencode run --format json --dir <cwd> --model <provider/model>`.
 - Что НЕ проверено и проверяется в Task 21: (а) выполняет ли `claude -p` Bash без TTY при `--allowedTools`; (б) выполняет ли `opencode run` команды без интерактивного подтверждения; (в) точная форма JSON-вывода `claude -p --output-format json` (по данным ревью там `modelUsage`, а не `model`).
 - Версии на PyPI на день плана: mcp 2.2.0, fastapi 0.141.1, pydantic 2.13.5, typer 0.27.2, httpx 0.28.1.
@@ -79,7 +79,7 @@ agent (claude / codex / opencode)
 Ключевые решения и почему:
 
 1. **Демон + тонкий MCP-прокси.** Задача исполнителя идёт 5-20 минут и должна пережить смерть исходного агента; `status` работает из любого агента и из CLI; телеметрия в одном месте. Демон стартует лениво: прокси делает `GET /health`, при отсутствии спавнит `agent-dispatch serve` detached (stdin `DEVNULL`, stdout+stderr в `data_dir/logs/serve.log`, `start_new_session=True`) и ждёт `/health`. Порт, pid и случайный токен в `~/.local/share/agent-dispatch/serve.json` (0600).
-2. **Router за интерфейсом, два бэкенда.** `jev` основной, `claude_local` (`claude -p` с JSON-схемой) как fallback при недоступности Jev. Jev не является публичным API проекта и заменяем через `router.backend`. У Jev два провайдера (`openrouter`, `vercel`) с одинаковым телом запроса.
+2. **Router за интерфейсом, два бэкенда.** `jev` основной, `claude_local` (`claude -p` с JSON-схемой) как fallback при недоступности Jev. Jev не является публичным API проекта и заменяем через `router.backend`; endpoint, модель и имя ключа настраиваются.
 3. **Ровно один вызов Jev на dispatch/route.** Все вопросы (`executor` choice плюс телеметрийные `difficulty`, `task_type`, `risk`, `ambiguity`) идут в одном запросе. `dispatch_to` и `status` Jev не зовут. Escalation берёт цепочку из конфига.
 4. **Hop-протокол через окружение, инкремент ровно в одном месте.** Демон запускает исполнителя задачи с `hop = h` с env `AGENT_DISPATCH_HOP = h + 1`, `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`. Дочерний агент поднимает свой MCP-прокси, тот читает env и передаёт `hop = int(env)` без изменений (0, если env нет). Guard `hop >= max_hops` в демоне. Трассировка при `max_hops: 2`: root hop=0 → ребёнок HOP=1, может делегировать → внук HOP=2, его dispatch отклоняется.
 5. **Исполнитель правит прямо в cwd**, без worktree. `changed_files` через `git status --porcelain` до и после. cwd обязан быть git-репой (иначе `bad_cwd`): codex вне git не работает, а diff без git недостоверен. Корневые задачи с одинаковым `realpath(cwd)` выполняются последовательно.
@@ -107,10 +107,9 @@ mcp:
 router:
   backend: jev                       # jev | claude_local
   jev:
-    provider: openrouter             # openrouter | vercel
-    base_url: null                   # null = дефолт провайдера
-    model: null                      # null = дефолт провайдера
-    api_key_env: null                # null = дефолт провайдера (OPENROUTER_API_KEY | AI_GATEWAY_API_KEY)
+    base_url: https://openrouter.ai/api/alpha/decisions
+    model: typesafe/jev-1.13
+    api_key_env: OPENROUTER_API_KEY
     retries: 2
     timeout_seconds: 15
   claude_local:
@@ -160,8 +159,6 @@ escalation:                          # принимается конфигом �
   codex: [claude]
 ```
 
-Дефолты провайдеров Jev: `openrouter` → `https://openrouter.ai/api/alpha/decisions`, `typesafe/jev-1.13`, `OPENROUTER_API_KEY`; `vercel` → `https://ai-gateway.vercel.sh/typesafe/v1/systemone`, `typesafe-ai/jev`, `AI_GATEWAY_API_KEY`.
-
 Env-файл `~/.config/agent-dispatch/env` (`KEY=VALUE`, `#` комментарии) читается функцией `load_env_file -> dict[str, SecretStr]` и складывается в `Settings.secrets`; `os.environ` не трогается. Пути раскрываются через `expanduser`. Приоритет `data_dir`: env `AGENT_DISPATCH_DATA_DIR` > yaml > дефолт; `AGENT_DISPATCH_CONFIG_DIR` задаёт, где искать `config.yaml` и `env`.
 
 ### Модели (`agent_dispatch/models.py`, pydantic v2)
@@ -205,7 +202,7 @@ class RouteDecision(BaseModel):
     judgments: dict[str, Judgment] = {}
     latency_ms: int = 0
     cost_usd: float | None = None
-    meta: dict[str, Any] = {}              # warning, jev_id, provider
+    meta: dict[str, Any] = {}              # warning, jev_id
 
 class Availability(BaseModel): available: bool; version: str | None; error: str | None; checked_at: datetime
 class TestsInfo(BaseModel): command: str | None; result: Literal["passed","failed","not_run"] | None; output_tail: str | None
@@ -370,12 +367,12 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 
 `agent-dispatch export` выгружает датасет, из которого считаются: routing accuracy (после разметки feedback), доля `fallback`/`override`/`low_confidence`, success rate и медианная длительность по executor. Первая цифра после недели использования: routing accuracy ≥ 0.8 на размеченных задачах и доля `low_confidence` < 20%.
 
-Замечание для docs/architecture.md: `state` Jev содержит `task` и `context` и уходит на OpenRouter/Vercel даже для задач, которые потом пойдут в корпоративную модель `opencode/x5-code`. Если это ограничение, задачу нужно отправлять через `dispatch_to`.
+Замечание для docs/architecture.md: `state` Jev содержит `task` и `context` и уходит на OpenRouter даже для задач, которые потом пойдут в корпоративную модель `opencode/x5-code`. Если это ограничение, задачу нужно отправлять через `dispatch_to`.
 
 ## What Goes Where
 
 - **Implementation Steps**: всё, что делается в этой репе: код, тесты, evals, документация, конфиг-пример.
-- **Post-Completion**: подключение MCP к трём агентам на машине пользователя, ротация ключей, карта на Vercel, наблюдение за телеметрией.
+- **Post-Completion**: подключение MCP к трём агентам на машине пользователя, ротация ключа, наблюдение за телеметрией.
 
 ## Implementation Steps
 
@@ -396,8 +393,8 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 **Files:**
 - Create: `agent_dispatch/config.py`, `agent_dispatch/config_default.yaml`, `tests/test_config.py`, `tests/fixtures/config/minimal.yaml`, `tests/fixtures/config/full.yaml`, `tests/fixtures/config/bad_fallback.yaml`, `tests/fixtures/config/bad_escalation.yaml`
 
-- [ ] тесты: дефолты без файла; полный файл парсится в `Settings`; `fallback_executor` не из `executors` → `ConfigError`; `adapter: opencode` без `model` → `ConfigError`; `escalation` с неизвестным именем → `ConfigError`; `command` по умолчанию равен `adapter`; `extra_args` по умолчанию из `config_default.yaml`; `executors` мержатся по ключу, `enabled: false` выключает дефолтный, новый ключ добавляется; env-файл `KEY=VALUE` парсится, `#` и пустые строки пропускаются, значение с `=` внутри сохраняется; после загрузки `os.environ` не содержит ключей; `Settings.secrets` это `SecretStr`, `repr(settings)` не содержит значения; `~` раскрывается; `AGENT_DISPATCH_DATA_DIR` побеждает yaml; `AGENT_DISPATCH_CONFIG_DIR` задаёт путь; `jev.provider: vercel` подставляет дефолтные `base_url/model/api_key_env`; явные значения побеждают дефолты провайдера
-- [ ] pydantic-модели `ServerSettings`, `McpSettings`, `JevSettings` (с `resolved_base_url/model/api_key_env`), `ClaudeLocalSettings`, `RouterSettings`, `RoutingSettings`, `ExecutorSettings` (`adapter, command, model, extra_args, enabled, description`), `Settings` c `model_validator`, `extra="forbid"`
+- [ ] тесты: дефолты без файла; полный файл парсится в `Settings`; `fallback_executor` не из `executors` → `ConfigError`; `adapter: opencode` без `model` → `ConfigError`; `escalation` с неизвестным именем → `ConfigError`; `command` по умолчанию равен `adapter`; `extra_args` по умолчанию из `config_default.yaml`; `executors` мержатся по ключу, `enabled: false` выключает дефолтный, новый ключ добавляется; env-файл `KEY=VALUE` парсится, `#` и пустые строки пропускаются, значение с `=` внутри сохраняется; после загрузки `os.environ` не содержит ключей; `Settings.secrets` это `SecretStr`, `repr(settings)` не содержит значения; `~` раскрывается; `AGENT_DISPATCH_DATA_DIR` побеждает yaml; `AGENT_DISPATCH_CONFIG_DIR` задаёт путь
+- [ ] pydantic-модели `ServerSettings`, `McpSettings`, `JevSettings`, `ClaudeLocalSettings`, `RouterSettings`, `RoutingSettings`, `ExecutorSettings` (`adapter, command, model, extra_args, enabled, description`), `Settings` c `model_validator`, `extra="forbid"`
 - [ ] `load_settings(config_dir: Path | None = None) -> Settings`, `load_env_file(path) -> dict[str, SecretStr]`
 - [ ] `Settings.enabled_executors()`, `Settings.secret(name) -> str | None`, `Settings.secret_names() -> set[str]`
 - [ ] run tests - must pass before next task
@@ -446,11 +443,11 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 ### Task 7: Router-интерфейс и Jev-клиент на фикстурах
 
 **Files:**
-- Create: `agent_dispatch/routing/base.py`, `agent_dispatch/routing/jev.py`, `agent_dispatch/routing/questions.py`, `tests/test_jev_router.py`, `tests/fixtures/jev/response_unknown_choice.json`, `tests/fixtures/jev/response_403_vercel_card.json`
+- Create: `agent_dispatch/routing/base.py`, `agent_dispatch/routing/jev.py`, `agent_dispatch/routing/questions.py`, `tests/test_jev_router.py`, `tests/fixtures/jev/response_unknown_choice.json`
 - Modify: `tests/fixtures/jev/request_executor.json` (убрать `cwd` из `state`, переименовать `context_summary` в `context`)
 
-- [ ] фикстуры: `request_executor.json` это точное ожидаемое тело для тестового запроса; `response_ok.json` и `response_400_score_criteria.json` уже записаны с живой пробы 2026-09-21; добавить `response_403_vercel_card.json` с живого ответа Vercel
-- [ ] тесты (respx): тело запроса равно `request_executor.json` (state = `{task, context, files, constraints, source_agent}`, без `cwd`); `score.criteria` массив; ответ ok → `RouteDecision(router=jev, executor=codex, scores, judgments.difficulty, meta.jev_id, meta.provider)`; `latency_ms >= 0`; `cost_usd` из usage; 500 ×3 → `RouterError` после `retries` попыток и backoff через инжектированный `sleep`; 400 → `RouterError` без retry; 403 → `RouterError` без retry с текстом ошибки; choice вне кандидатов → `RouterError`; Σp ≠ 1 → `RouterError`; нет ключа → `RouterError` до сетевого вызова; `provider: vercel` шлёт на Vercel URL с `typesafe-ai/jev`
+- [ ] фикстуры: `request_executor.json` это точное ожидаемое тело для тестового запроса; `response_ok.json` и `response_400_score_criteria.json` уже записаны с живой пробы 2026-09-21
+- [ ] тесты (respx): тело запроса равно `request_executor.json` (state = `{task, context, files, constraints, source_agent}`, без `cwd`); `score.criteria` массив; ответ ok → `RouteDecision(router=jev, executor=codex, scores, judgments.difficulty, meta.jev_id)`; `latency_ms >= 0`; `cost_usd` из usage; 500 ×3 → `RouterError` после `retries` попыток и backoff через инжектированный `sleep`; 400 → `RouterError` без retry; 401/403 → `RouterError` без retry с текстом ошибки; choice вне кандидатов → `RouterError`; Σp ≠ 1 → `RouterError`; нет ключа → `RouterError` до сетевого вызова; `base_url`/`model` из конфига попадают в запрос
 - [ ] `routing/base.py`: `Router` Protocol (`decide(package, candidates: dict[str, str]) -> RouteDecision`), `RouterError`
 - [ ] `routing/questions.py`: `build_state(package)`, `build_questions(candidates)` (executor choice + difficulty/task_type/risk/ambiguity)
 - [ ] `routing/jev.py`: `JevRouter(settings, client, sleep=asyncio.sleep)`
@@ -587,7 +584,7 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - Create: `evals/__init__.py`, `evals/routing/__init__.py`, `evals/routing/cases.jsonl`, `evals/routing/__main__.py`, `evals/smoke/__init__.py`, `evals/smoke/__main__.py`, `evals/smoke/repo_template/` (мини-проект с pytest и одним намеренно падающим тестом), `evals/README.md`
 
 - [ ] `cases.jsonl`: 20 задач `{task, context, files, constraints, expected_executor, rationale}`; примерно 6 claude, 7 codex, 7 opencode
-- [ ] `evals/routing/__main__.py`: живой роутер через `POST /route` живого демона, accuracy, отчёт `evals/reports/routing-<date>.json`, матрица ошибок, exit 1 при accuracy < 0.8; флаги `--router claude_local`, `--provider vercel`
+- [ ] `evals/routing/__main__.py`: живой роутер через `POST /route` живого демона, accuracy, отчёт `evals/reports/routing-<date>.json`, матрица ошибок, exit 1 при accuracy < 0.8; флаг `--router claude_local`
 - [ ] `evals/smoke/__main__.py`: копирует `repo_template` в tmp, `git init` + commit, три задачи через `dispatch_to` на каждом enabled executor через живой демон, проверяет `completed`, `changed_files` непустой, `pytest` зелёный; `--executors codex,claude`
 - [ ] прогнать оба eval вживую, вписать результат с датой в `evals/README.md`
 - [ ] run gate tests - must pass before next task
@@ -602,8 +599,8 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [ ] pre-commit хук (включая detect-secrets) работает на тестовом коммите
 
 ### Task 22: [Final] Документация и подключение
-- [ ] `README.md` на русском: что это, установка (`uv tool install .`), конфиг с примером, команды CLI, подключение MCP к Claude Code (`claude mcp add agent-dispatch -e AGENT_DISPATCH_SOURCE_AGENT=claude -- agent-dispatch mcp`), Codex (`~/.codex/config.toml` `[mcp_servers.agent-dispatch]` с `tool_timeout_sec`), OpenCode (`opencode.json` `mcp`), как поднять MCP-таймауты и `wait_seconds`, текст правила для агентов из раздела 16 спеки, как читать телеметрию, как добавить новый executor (только config.yaml), как переключить Jev на Vercel
-- [ ] `docs/architecture.md`: схема, порядок guards, hop-протокол с трассировкой, контракт Jev с примером запроса и ответа для обоих провайдеров, формат result-блока, замечание про уход `task/context` во внешний роутер
+- [ ] `README.md` на русском: что это, установка (`uv tool install .`), конфиг с примером, команды CLI, подключение MCP к Claude Code (`claude mcp add agent-dispatch -e AGENT_DISPATCH_SOURCE_AGENT=claude -- agent-dispatch mcp`), Codex (`~/.codex/config.toml` `[mcp_servers.agent-dispatch]` с `tool_timeout_sec`), OpenCode (`opencode.json` `mcp`), как поднять MCP-таймауты и `wait_seconds`, текст правила для агентов из раздела 16 спеки, как читать телеметрию, как добавить новый executor (только config.yaml)
+- [ ] `docs/architecture.md`: схема, порядок guards, hop-протокол с трассировкой, контракт Jev с примером запроса и ответа, формат result-блока, замечание про уход `task/context` во внешний роутер
 - [ ] тест `tests/test_config_example.py`: `config.example.yaml` в корне равен `agent_dispatch/config_default.yaml`
 - [ ] `CLAUDE.md` репы: как запускать тесты и evals, где фикстуры, правило «Jev не делает side effects», правило «ключи не в os.environ»
 - [ ] move this plan to `docs/plans/completed/`
@@ -615,7 +612,6 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - через неделю использования: `agent-dispatch export --since 7d`, разметить outcome через `feedback`, посчитать routing accuracy и долю `low_confidence`; если accuracy < 0.8, править `description` executors в config.yaml, а не код
 
 **External system updates:**
-- пробный ключ OpenRouter и ключ Vercel, переданные в чате 2026-09-21, ротировать после первого рабочего прогона (они были показаны в переписке)
-- чтобы заработал `provider: vercel`, привязать карту к команде Vercel (запросы сейчас отвечают `403 customer_verification_required`); бесплатные кредиты действуют до 2026-09-25, rate limit free tier жёсткий
+- пробный ключ OpenRouter, переданный в чате 2026-09-21, ротировать после первого рабочего прогона (он был показан в переписке)
 - при появлении DeepSeek/GLM в `~/.config/opencode/opencode.json` добавить их в `executors` и `escalation` config.yaml, код менять не нужно
 - codex-lb должен быть запущен (`~/my_git_reps/codex-lb/clb status`), иначе `doctor` покажет codex недоступным
