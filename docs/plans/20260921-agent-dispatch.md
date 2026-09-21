@@ -308,7 +308,7 @@ This task was delegated by {{ source_agent }} via AgentDispatch (hop {{ hop }} o
 
 Состояния задачи: `queued → routing → running → {completed, partial, failed, needs_context, needs_escalation, cancelled}`.
 
-Env дочернего процесса: `os.environ` минус все ключи, имена которых есть в `Settings.secrets`, плюс `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP = hop + 1`.
+Env дочернего процесса: `executors/env.py:child_env(settings, extra)` = `os.environ` минус `Settings.secret_names()`, минус маркеры сессии Claude Code (`CLAUDECODE`, `CLAUDE_CODE_*`, иначе `claude -p` отказывается работать вложенно), плюс `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP = hop + 1`. Уже реализовано и используется claude_local-роутером.
 
 ### HTTP API (`api/`)
 
@@ -412,36 +412,38 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [x] `schemas/__init__.py`: `load_agent_result_schema()`, `validate_agent_result(obj) -> list[str]` (ошибки)
 - [x] run tests - must pass before next task
 
+➕ run B (codex-flow 20260921-172819-ef58): живой вызов Jev поймал, что `instructions` обязателен у каждого вопроса (иначе 400) и что noul-ответ имеет форму `{"noul": p}`; фикстура `tests/fixtures/jev/response_ok_full.json` записана с живого ответа на 6 вопросов. Добавлен `executors/env.py:child_env`.
+
 ### Task 4: Task Package и рендер промпта со снапшотом
 
 **Files:**
 - Create: `agent_dispatch/dispatch/__init__.py`, `agent_dispatch/dispatch/task_package.py`, `agent_dispatch/templates/task_package.md.j2`, `tests/test_task_package.py`, `tests/snapshots/prompt_claude_prompt.md`, `tests/snapshots/prompt_claude_summary.md`, `tests/snapshots/prompt_claude_full.md`, `tests/snapshots/prompt_codex_summary.md`
 
-- [ ] тесты `build_task_package(req, settings)`: в режиме `prompt`/`prompt+summary` `git_status is None`; в `full` заполнен из `git_repo` с изменённым файлом
-- [ ] тесты `render_prompt(package, adapter_kind, settings)`: четыре снапшота совпадают; `prompt` не содержит `Constraints`; `hop=1, max_hops=2` даёт `Do NOT delegate further` и не содержит `split this task`; `hop=0` даёт инструкцию fan-out с числом `max_children`; `codex` и `claude` различаются только секцией `Result format`
-- [ ] `TaskPackage`, `build_task_package`, `render_prompt`; git-команды только в `full`
-- [ ] run tests - must pass before next task
+- [x] тесты `build_task_package(req, settings)`: в режиме `prompt`/`prompt+summary` `git_status is None`; в `full` заполнен из `git_repo` с изменённым файлом
+- [x] тесты `render_prompt(package, adapter_kind, settings)`: четыре снапшота совпадают; `prompt` не содержит `Constraints`; `hop=1, max_hops=2` даёт `Do NOT delegate further` и не содержит `split this task`; `hop=0` даёт инструкцию fan-out с числом `max_children`; `codex` и `claude` различаются только секцией `Result format`
+- [x] `TaskPackage`, `build_task_package`, `render_prompt`; git-команды только в `full`
+- [x] run tests - must pass before next task
 
 ### Task 5: Парсер result-блока и нормализация ExecutionResult
 
 **Files:**
 - Create: `agent_dispatch/executors/__init__.py`, `agent_dispatch/executors/result_parser.py`, `agent_dispatch/executors/process.py` (только `ProcessOutcome`), `tests/test_result_parser.py`, `tests/fixtures/agent_output/*.txt`
 
-- [ ] тесты `extract_result_block`: один блок; два блока (последний); мусор до/после; без закрывающих бэктиков → `None`; невалидный JSON → `None`; блок с языком `json` без тега → `None`; пустой текст → `None`
-- [ ] тесты `normalize`: валидный блок → `completed`; `None` + exit 0 → `partial`, `summary` = хвост ≤ 2000 символов, `meta.parse_error`; exit ≠ 0 → `failed`, `error` = хвост stderr; `timed_out` → `failed`, `error="timeout"`; `changed_files` из git побеждают поле агента; `status` вне enum → `partial` с `parse_error`; лишнее поле в блоке → `partial` с `parse_error` (через `validate_agent_result`)
-- [ ] реализовать `ProcessOutcome`, `extract_result_block`, `normalize`
-- [ ] run tests - must pass before next task
+- [x] тесты `extract_result_block`: один блок; два блока (последний); мусор до/после; без закрывающих бэктиков → `None`; невалидный JSON → `None`; блок с языком `json` без тега → `None`; пустой текст → `None`
+- [x] тесты `normalize`: валидный блок → `completed`; `None` + exit 0 → `partial`, `summary` = хвост ≤ 2000 символов, `meta.parse_error`; exit ≠ 0 → `failed`, `error` = хвост stderr; `timed_out` → `failed`, `error="timeout"`; `changed_files` из git побеждают поле агента; `status` вне enum → `partial` с `parse_error`; лишнее поле в блоке → `partial` с `parse_error` (через `validate_agent_result`)
+- [x] реализовать `ProcessOutcome`, `extract_result_block`, `normalize`
+- [x] run tests - must pass before next task
 
 ### Task 6: Guards: чистые функции с табличными тестами
 
 **Files:**
 - Create: `agent_dispatch/routing/__init__.py`, `agent_dispatch/routing/guards.py`, `tests/test_guards.py`
 
-- [ ] тесты `pre_guards(req, settings, unavailable: set[str], parent_exists: bool, sibling_count: int) -> GuardEvent | RouteDecision | None`: bad_cwd (нет, файл, не git); hop ≥ max_hops; hop < max_hops проходит; parent задан и не существует → unknown_parent; `sibling_count >= max_children` → max_children, `sibling_count < max_children` проходит; explicit disabled; explicit unavailable; explicit ok → `RouteDecision(router=override)` даже если executor.adapter == source_agent
-- [ ] тесты `candidates(settings, unavailable, source_agent, hop) -> list[str]`: `source_agent=opencode, hop=0` исключает оба `opencode/*`; `codex` исключает только `codex`; при `hop=1` ничего не исключается даже с флагом true; флаг false ничего не исключает; unavailable и disabled вычитаются; `cli`/`unknown` ничего не исключают
-- [ ] тесты `post_guards(decision, settings, candidates) -> tuple[RouteDecision, list[GuardEvent]]`: low_confidence; low_margin при `0.55/0.45` (разница 0.10 проходит с допуском 1e-9), `0.54/0.46` не проходит; fallback не в кандидатах → top1 + `meta.warning` + событие; всё ок → без изменений и без событий
-- [ ] реализовать `pre_guards`, `candidates`, `post_guards`, `single_candidate_decision`
-- [ ] run tests - must pass before next task
+- [x] тесты `pre_guards(req, settings, unavailable: set[str], parent_exists: bool, sibling_count: int) -> GuardEvent | RouteDecision | None`: bad_cwd (нет, файл, не git); hop ≥ max_hops; hop < max_hops проходит; parent задан и не существует → unknown_parent; `sibling_count >= max_children` → max_children, `sibling_count < max_children` проходит; explicit disabled; explicit unavailable; explicit ok → `RouteDecision(router=override)` даже если executor.adapter == source_agent
+- [x] тесты `candidates(settings, unavailable, source_agent, hop) -> list[str]`: `source_agent=opencode, hop=0` исключает оба `opencode/*`; `codex` исключает только `codex`; при `hop=1` ничего не исключается даже с флагом true; флаг false ничего не исключает; unavailable и disabled вычитаются; `cli`/`unknown` ничего не исключают
+- [x] тесты `post_guards(decision, settings, candidates) -> tuple[RouteDecision, list[GuardEvent]]`: low_confidence; low_margin при `0.55/0.45` (разница 0.10 проходит с допуском 1e-9), `0.54/0.46` не проходит; fallback не в кандидатах → top1 + `meta.warning` + событие; всё ок → без изменений и без событий
+- [x] реализовать `pre_guards`, `candidates`, `post_guards`, `single_candidate_decision`
+- [x] run tests - must pass before next task
 
 ### Task 7: Router-интерфейс и Jev-клиент на фикстурах
 
@@ -449,23 +451,23 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - Create: `agent_dispatch/routing/base.py`, `agent_dispatch/routing/jev.py`, `agent_dispatch/routing/questions.py`, `tests/test_jev_router.py`, `tests/fixtures/jev/response_unknown_choice.json`
 - Modify: `tests/fixtures/jev/request_executor.json` (убрать `cwd` из `state`, переименовать `context_summary` в `context`)
 
-- [ ] фикстуры: `request_executor.json` это точное ожидаемое тело для тестового запроса; `response_ok.json` и `response_400_score_criteria.json` уже записаны с живой пробы 2026-09-21
-- [ ] тесты (respx): тело запроса равно `request_executor.json` (state = `{task, context, files, constraints, source_agent}`, без `cwd`); `score.criteria` массив; ответ ok → `RouteDecision(router=jev, executor=codex, scores, judgments.difficulty, meta.jev_id)`; `latency_ms >= 0`; `cost_usd` из usage; 500 ×3 → `RouterError` после `retries` попыток и backoff через инжектированный `sleep`; 400 → `RouterError` без retry; 401/403 → `RouterError` без retry с текстом ошибки; choice вне кандидатов → `RouterError`; Σp ≠ 1 → `RouterError`; нет ключа → `RouterError` до сетевого вызова; `base_url`/`model` из конфига попадают в запрос
-- [ ] `routing/base.py`: `Router` Protocol (`decide(package, candidates: dict[str, str]) -> RouteDecision`), `RouterError`
-- [ ] `routing/questions.py`: `build_state(package)`, `build_questions(candidates)` (executor choice + difficulty/task_type/risk/ambiguity score/choice + decomposable noul); ответ noul парсится в `Judgment(kind="noul", value=bool, probabilities={"true": p, "false": 1-p})`
-- [ ] `routing/jev.py`: `JevRouter(settings, client, sleep=asyncio.sleep)`
-- [ ] run tests - must pass before next task
+- [x] фикстуры: `request_executor.json` это точное ожидаемое тело для тестового запроса; `response_ok.json` и `response_400_score_criteria.json` уже записаны с живой пробы 2026-09-21
+- [x] тесты (respx): тело запроса равно `request_executor.json` (state = `{task, context, files, constraints, source_agent}`, без `cwd`); `score.criteria` массив; ответ ok → `RouteDecision(router=jev, executor=codex, scores, judgments.difficulty, meta.jev_id)`; `latency_ms >= 0`; `cost_usd` из usage; 500 ×3 → `RouterError` после `retries` попыток и backoff через инжектированный `sleep`; 400 → `RouterError` без retry; 401/403 → `RouterError` без retry с текстом ошибки; choice вне кандидатов → `RouterError`; Σp ≠ 1 → `RouterError`; нет ключа → `RouterError` до сетевого вызова; `base_url`/`model` из конфига попадают в запрос
+- [x] `routing/base.py`: `Router` Protocol (`decide(package, candidates: dict[str, str]) -> RouteDecision`), `RouterError`
+- [x] `routing/questions.py`: `build_state(package)`, `build_questions(candidates)` (executor choice + difficulty/task_type/risk/ambiguity score/choice + decomposable noul); ответ noul парсится в `Judgment(kind="noul", value=bool, probabilities={"true": p, "false": 1-p})`
+- [x] `routing/jev.py`: `JevRouter(settings, client, sleep=asyncio.sleep)`
+- [x] run tests - must pass before next task
 
 ### Task 8: claude_local роутер и цепочка fallback
 
 **Files:**
 - Create: `agent_dispatch/routing/claude_local.py`, `agent_dispatch/routing/decision.py`, `tests/test_claude_local_router.py`, `tests/test_decision.py`, `tests/fakes/claude_router_ok.sh`, `tests/fakes/claude_router_bad.sh`
 
-- [ ] тесты claude_local (fake-CLI печатает `{"result": "{\"executor\":\"codex\",\"scores\":{...}}"}`): валидный → `RouteDecision(router=claude_local)`; exit ≠ 0 → `RouterError`; невалидный JSON → `RouterError`; executor вне кандидатов → `RouterError`
-- [ ] тесты `decide_with_fallback(package, candidates, settings, routers) -> tuple[RouteDecision, list[GuardEvent]]`: jev ok → jev; jev error → claude_local + событие; оба error → `router=fallback, reason=router_unavailable, confidence=0`; один кандидат → без вызовов роутеров
-- [ ] `claude_local.py`: `<command> -p --output-format json` с промптом «choose executor, respond with JSON {executor, scores}»; парсинг `result`
-- [ ] `decision.py`: оркестрация pre/candidates/router/post, возвращает решение и события
-- [ ] run tests - must pass before next task
+- [x] тесты claude_local (fake-CLI печатает `{"result": "{\"executor\":\"codex\",\"scores\":{...}}"}`): валидный → `RouteDecision(router=claude_local)`; exit ≠ 0 → `RouterError`; невалидный JSON → `RouterError`; executor вне кандидатов → `RouterError`
+- [x] тесты `decide_with_fallback(package, candidates, settings, routers) -> tuple[RouteDecision, list[GuardEvent]]`: jev ok → jev; jev error → claude_local + событие; оба error → `router=fallback, reason=router_unavailable, confidence=0`; один кандидат → без вызовов роутеров
+- [x] `claude_local.py`: `<command> -p --output-format json` с промптом «choose executor, respond with JSON {executor, scores}»; парсинг `result`
+- [x] `decision.py`: оркестрация pre/candidates/router/post, возвращает решение и события
+- [x] run tests - must pass before next task
 
 ➕ run A (codex-flow 20260921-160148-a904): тесты флакали при первом exec новых fake-скриптов (syspolicyd на macOS), добавлен session-прогрев в conftest. Найдено и исправлено в ревью: env-парсер комментариев, YAML→ConfigError, deadlock stdin>64КБ, лимит строки 64КиБ, SIGKILL группе после выхода родителя, `git status -z`, `pgid = process.pid`.
 

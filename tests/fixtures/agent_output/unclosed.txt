@@ -1,0 +1,2 @@
+```agent-dispatch-result
+{"status":"completed","summary":"ok"}

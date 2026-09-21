@@ -1,0 +1,6 @@
+```agent-dispatch-result
+{"status":"partial","summary":"old"}
+```
+```agent-dispatch-result
+{"status":"completed","summary":"new"}
+```

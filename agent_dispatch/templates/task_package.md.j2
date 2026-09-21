@@ -1,0 +1,28 @@
+# Task
+{{ task }}
+
+# Workspace
+cwd: {{ cwd }}
+{% if context_mode != "prompt" %}
+# Context
+{{ context or "(none)" }}
+## Relevant files
+{{ files | bullets }}
+## Constraints
+{{ constraints | bullets }}
+## Success criteria
+{{ success_criteria | bullets }}
+{% endif %}
+{% if context_mode == "full" %}
+# Repository state
+$ git status --short
+{{ git_status }}
+$ git diff --stat
+{{ git_diff_stat }}
+{% endif %}
+# Delegation
+This task was delegated by {{ source_agent }} via AgentDispatch (hop {{ hop }} of {{ max_hops }}).
+{% if hop + 1 >= max_hops %}Do NOT delegate further: the hop limit is reached.{% else %}You may split this task into at most {{ max_children }} independent subtasks and delegate each with the AgentDispatch `dispatch` tool; the router picks the best agent for each. Do not delegate the whole task as-is. Subtasks share this working tree: give each a disjoint `files` list.{% endif %}
+
+# Result format
+{{ result_instructions }}

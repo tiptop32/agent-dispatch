@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import json
+import re
+
+from agent_dispatch.executors.process import ProcessOutcome
+from agent_dispatch.models import ExecutionResult, TestsInfo
+from agent_dispatch.schemas import validate_agent_result
+
+RESULT_TAG = "agent-dispatch-result"
+_BLOCK = re.compile(rf"^```{re.escape(RESULT_TAG)}\s*$([\s\S]*?)^```\s*$", re.MULTILINE)
+
+
+def extract_result_block(text: str) -> dict | None:
+    matches = list(_BLOCK.finditer(text))
+    if not matches:
+        return None
+    try:
+        value = json.loads(matches[-1].group(1).strip())
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _tail(value: str) -> str:
+    return value[-2000:]
+
+
+def normalize(
+    raw: dict | None,
+    outcome: ProcessOutcome,
+    changed_files: list[str] | None,
+    executor: str,
+    model: str | None,
+) -> ExecutionResult:
+    meta = {"exit_code": outcome.exit_code, "duration_ms": outcome.duration_ms}
+    if outcome.timed_out:
+        return ExecutionResult(
+            status="failed",
+            executor=executor,
+            model=model,
+            summary=_tail(outcome.stdout),
+            changed_files=changed_files or [],
+            error="timeout",
+            meta=meta,
+        )
+    if outcome.exit_code not in (0, None):
+        return ExecutionResult(
+            status="failed",
+            executor=executor,
+            model=model,
+            summary=_tail(outcome.stdout),
+            changed_files=changed_files or [],
+            error=_tail(outcome.stderr),
+            meta=meta,
+        )
+    if raw is None:
+        meta["parse_error"] = "no result block"
+        return ExecutionResult(
+            status="partial",
+            executor=executor,
+            model=model,
+            summary=_tail(outcome.stdout),
+            changed_files=changed_files or [],
+            meta=meta,
+        )
+    errors = validate_agent_result(raw)
+    if errors:
+        meta["parse_error"] = "; ".join(errors)
+        return ExecutionResult(
+            status="partial",
+            executor=executor,
+            model=model,
+            summary=raw.get("summary") or _tail(outcome.stdout),
+            changed_files=changed_files or [],
+            meta=meta,
+        )
+    tests = raw.get("tests")
+    return ExecutionResult(
+        status=raw["status"],
+        executor=executor,
+        model=model,
+        summary=raw["summary"],
+        changed_files=changed_files if changed_files is not None else raw.get("changed_files", []),
+        tests=TestsInfo(command=tests.get("command"), result=tests.get("result"))
+        if tests
+        else None,
+        confidence=raw.get("confidence"),
+        needs_escalation=raw.get("needs_escalation", False),
+        meta=meta,
+    )
