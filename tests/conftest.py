@@ -1,4 +1,5 @@
 import os
+import signal
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
@@ -7,6 +8,30 @@ import pytest
 
 FAKES_DIR = Path(__file__).parent / "fakes"
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def warm_fake_cli() -> None:
+    """Один раз exec-нуть каждый fake-скрипт.
+
+    На macOS первый exec нового файла проходит проверку syspolicyd и может занять
+    сотни миллисекунд; тесты run_cli с таймаутом 0.2-1.0 с из-за этого флакали
+    при первом прогоне после изменения скриптов. Popen возвращается после exec,
+    поэтому достаточно запустить и сразу убить.
+    """
+    for script in sorted(FAKES_DIR.glob("*.sh")):
+        proc = subprocess.Popen(
+            [str(script)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
 
 
 @pytest.fixture

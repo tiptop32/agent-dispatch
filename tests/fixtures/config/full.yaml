@@ -1,0 +1,39 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+  max_concurrent_tasks: 4
+  data_dir: ~/agent-dispatch-data
+mcp:
+  wait_seconds: 25
+router:
+  backend: claude_local
+  jev:
+    base_url: https://example.test/decisions
+    model: example/router
+    api_key_env: EXAMPLE_API_KEY
+    retries: 3
+    timeout_seconds: 20
+  claude_local:
+    command: claude-custom
+    model: opus
+routing:
+  min_confidence: 0.7
+  min_margin: 0.2
+  fallback_executor: local
+  max_hops: 3
+  exclude_source_agent: false
+  default_timeout_seconds: 900
+  availability_ttl_seconds: 30
+executors:
+  claude:
+    enabled: false
+  local:
+    adapter: codex
+    command: codex-custom
+    model: gpt-example
+    extra_args: ["--quiet"]
+    enabled: true
+    description: Local test executor
+escalation:
+  local: [codex]
+

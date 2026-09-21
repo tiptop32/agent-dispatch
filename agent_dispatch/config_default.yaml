@@ -1,0 +1,62 @@
+server:
+  host: 127.0.0.1
+  port: 7433
+  max_concurrent_tasks: 2
+  data_dir: ~/.local/share/agent-dispatch
+
+mcp:
+  wait_seconds: 50
+
+router:
+  backend: jev
+  jev:
+    base_url: https://openrouter.ai/api/alpha/decisions
+    model: typesafe/jev-1.13
+    api_key_env: OPENROUTER_API_KEY
+    retries: 2
+    timeout_seconds: 15
+  claude_local:
+    command: claude
+    model: null
+
+routing:
+  min_confidence: 0.60
+  min_margin: 0.10
+  fallback_executor: codex
+  max_hops: 2
+  exclude_source_agent: true
+  default_timeout_seconds: 1800
+  availability_ttl_seconds: 60
+
+executors:
+  claude:
+    adapter: claude
+    command: claude
+    extra_args: ["--permission-mode", "acceptEdits", "--allowedTools", "Bash,Edit,Write,Read,Glob,Grep"]
+    enabled: true
+    description: "Claude Code: strongest reasoning, multi-file refactors, ambiguous or design-heavy tasks; most expensive"
+  codex:
+    adapter: codex
+    command: codex
+    extra_args: ["--sandbox", "workspace-write"]
+    enabled: true
+    description: "OpenAI Codex CLI: autonomous bug fixing and test-driven fixes in a single repo; medium cost"
+  opencode/kimi:
+    adapter: opencode
+    command: opencode
+    model: openrouter/kimi-k2.5
+    extra_args: []
+    enabled: true
+    description: "OpenCode with Kimi K2.5: cheap, good for small well-specified edits, docs, boilerplate"
+  opencode/x5-code:
+    adapter: opencode
+    command: opencode
+    model: copilot/x5-airun-code-large-exp
+    extra_args: []
+    enabled: true
+    description: "OpenCode with corporate x5-airun code model: cheap internal model for routine edits with corporate data constraints"
+
+escalation:
+  opencode/kimi: [codex, claude]
+  opencode/x5-code: [codex, claude]
+  codex: [claude]

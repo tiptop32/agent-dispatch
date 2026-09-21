@@ -80,8 +80,9 @@ agent (claude / codex / opencode)
 
 1. **Демон + тонкий MCP-прокси.** Задача исполнителя идёт 5-20 минут и должна пережить смерть исходного агента; `status` работает из любого агента и из CLI; телеметрия в одном месте. Демон стартует лениво: прокси делает `GET /health`, при отсутствии спавнит `agent-dispatch serve` detached (stdin `DEVNULL`, stdout+stderr в `data_dir/logs/serve.log`, `start_new_session=True`) и ждёт `/health`. Порт, pid и случайный токен в `~/.local/share/agent-dispatch/serve.json` (0600).
 2. **Router за интерфейсом, два бэкенда.** `jev` основной, `claude_local` (`claude -p` с JSON-схемой) как fallback при недоступности Jev. Jev не является публичным API проекта и заменяем через `router.backend`; endpoint, модель и имя ключа настраиваются.
-3. **Ровно один вызов Jev на dispatch/route.** Все вопросы (`executor` choice плюс телеметрийные `difficulty`, `task_type`, `risk`, `ambiguity`) идут в одном запросе. `dispatch_to` и `status` Jev не зовут. Escalation берёт цепочку из конфига.
+3. **Ровно один вызов Jev на dispatch/route.** Все вопросы (`executor` choice плюс телеметрийные `difficulty`, `task_type`, `risk`, `ambiguity` и `decomposable` noul) идут в одном запросе. `dispatch_to` и `status` Jev не зовут. Escalation берёт цепочку из конфига.
 4. **Hop-протокол через окружение, инкремент ровно в одном месте.** Демон запускает исполнителя задачи с `hop = h` с env `AGENT_DISPATCH_HOP = h + 1`, `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`. Дочерний агент поднимает свой MCP-прокси, тот читает env и передаёт `hop = int(env)` без изменений (0, если env нет). Guard `hop >= max_hops` в демоне. Трассировка при `max_hops: 2`: root hop=0 → ребёнок HOP=1, может делегировать → внук HOP=2, его dispatch отклоняется.
+   **Fan-out сабагентов (решение 2026-09-21).** Исполнитель может разбить задачу и отдать до `routing.max_children` (по умолчанию 2) подзадач через тот же `dispatch`; каждую роутит Jev. Guard `max_children` считает детей по `parent_task_id`. Task Package содержит инструкцию про fan-out только когда `hop + 1 < max_hops`. `exclude_source_agent` действует только на hop 0: сабагенты могут быть того же типа, что и родитель, цель fan-out это параллелизм. Сабагенты одной задачи делят рабочее дерево, поэтому инструкция требует непересекающихся `files`.
 5. **Исполнитель правит прямо в cwd**, без worktree. `changed_files` через `git status --porcelain` до и после. cwd обязан быть git-репой (иначе `bad_cwd`): codex вне git не работает, а diff без git недостоверен. Корневые задачи с одинаковым `realpath(cwd)` выполняются последовательно.
 6. **Structured Result, гибрид.** Codex через `--output-schema`. Claude и OpenCode получают в промпте инструкцию завершить ответ блоком ```` ```agent-dispatch-result {...} ```` ````, парсер берёт последний такой блок. Не распарсилось: `status=partial`, `summary` = хвост 2000 символов, `parse_error` в meta. Ненулевой exit или timeout: `failed`.
 7. **Registry только из реально работающего**: `claude`, `codex`, `opencode/kimi`, `opencode/x5-code`. Descriptions executors (criteria для Jev) живут в config.yaml, не в коде.
@@ -121,7 +122,8 @@ routing:
   min_margin: 0.10
   fallback_executor: codex
   max_hops: 2
-  exclude_source_agent: true         # исключает всех executors с adapter == source_agent
+  max_children: 2                    # сабагентов на одну задачу
+  exclude_source_agent: true         # исключает executors с adapter == source_agent, только на hop 0
   default_timeout_seconds: 1800
   availability_ttl_seconds: 60
 
@@ -169,7 +171,7 @@ class SourceAgent(StrEnum): claude, codex, opencode, cli, unknown
 class TaskStatus(StrEnum): queued, routing, running, completed, partial, failed, needs_context, needs_escalation, cancelled
 TerminalStatus = Literal["completed","partial","failed","needs_context","needs_escalation"]
 class RouterKind(StrEnum): jev, claude_local, fallback, override
-class GuardReason(StrEnum): low_confidence, low_margin, disabled, unavailable, router_unavailable, user_override, single_candidate, max_hops, bad_cwd, unknown_parent, escalated
+class GuardReason(StrEnum): low_confidence, low_margin, disabled, unavailable, router_unavailable, user_override, single_candidate, max_hops, max_children, bad_cwd, unknown_parent, escalated
 
 class DispatchRequest(BaseModel):
     task: str                              # min_length=1
@@ -189,7 +191,7 @@ class DispatchRequest(BaseModel):
     root_agent: SourceAgent | None = None
     hop: int = 0                           # ge=0
 
-class Judgment(BaseModel): kind: Literal["choice","score"]; value: str | float; confidence: float; probabilities: dict[str, float]
+class Judgment(BaseModel): kind: Literal["choice","score","noul"]; value: str | float | bool; confidence: float; probabilities: dict[str, float]
 
 class GuardEvent(BaseModel): reason: GuardReason; detail: str; executor: str | None = None
 
@@ -272,7 +274,7 @@ $ git diff --stat
 {% endif %}
 # Delegation
 This task was delegated by {{ source_agent }} via AgentDispatch (hop {{ hop }} of {{ max_hops }}).
-{% if hop + 1 >= max_hops %}Do NOT delegate further: the hop limit is reached.{% endif %}
+{% if hop + 1 >= max_hops %}Do NOT delegate further: the hop limit is reached.{% else %}You may split this task into at most {{ max_children }} independent subtasks and delegate each with the AgentDispatch `dispatch` tool; the router picks the best agent for each. Do not delegate the whole task as-is. Subtasks share this working tree: give each a disjoint `files` list.{% endif %}
 
 # Result format
 {{ result_instructions }}
@@ -287,9 +289,10 @@ This task was delegated by {{ source_agent }} via AgentDispatch (hop {{ hop }} o
 1. pre-guards (guards.py, чистые функции)
    bad_cwd         cwd не существует, не директория или не git-репа       → failed
    max_hops        hop >= routing.max_hops                                  → failed
+   max_children    parent_task_id задан и у родителя уже max_children детей   → failed
    unknown_parent  parent_task_id задан, но не найден в storage            → failed
    override        executor задан явно: disabled или unavailable → failed; иначе RouteDecision(router=override, reason=user_override, confidence=1.0), Jev не зовём, exclude_source_agent не применяется
-2. кандидаты = enabled − unavailable(кэш, TTL) − {e | e.adapter == source_agent} при exclude_source_agent
+2. кандидаты = enabled − unavailable(кэш, TTL) − {e | e.adapter == source_agent} при exclude_source_agent и hop == 0
    пусто           → failed, reason=unavailable
    один            → RouteDecision(router=fallback, reason=single_candidate, confidence=1.0)
 3. decide_with_fallback(package, candidates) → RouteDecision
@@ -393,21 +396,21 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 **Files:**
 - Create: `agent_dispatch/config.py`, `agent_dispatch/config_default.yaml`, `tests/test_config.py`, `tests/fixtures/config/minimal.yaml`, `tests/fixtures/config/full.yaml`, `tests/fixtures/config/bad_fallback.yaml`, `tests/fixtures/config/bad_escalation.yaml`
 
-- [ ] тесты: дефолты без файла; полный файл парсится в `Settings`; `fallback_executor` не из `executors` → `ConfigError`; `adapter: opencode` без `model` → `ConfigError`; `escalation` с неизвестным именем → `ConfigError`; `command` по умолчанию равен `adapter`; `extra_args` по умолчанию из `config_default.yaml`; `executors` мержатся по ключу, `enabled: false` выключает дефолтный, новый ключ добавляется; env-файл `KEY=VALUE` парсится, `#` и пустые строки пропускаются, значение с `=` внутри сохраняется; после загрузки `os.environ` не содержит ключей; `Settings.secrets` это `SecretStr`, `repr(settings)` не содержит значения; `~` раскрывается; `AGENT_DISPATCH_DATA_DIR` побеждает yaml; `AGENT_DISPATCH_CONFIG_DIR` задаёт путь
-- [ ] pydantic-модели `ServerSettings`, `McpSettings`, `JevSettings`, `ClaudeLocalSettings`, `RouterSettings`, `RoutingSettings`, `ExecutorSettings` (`adapter, command, model, extra_args, enabled, description`), `Settings` c `model_validator`, `extra="forbid"`
-- [ ] `load_settings(config_dir: Path | None = None) -> Settings`, `load_env_file(path) -> dict[str, SecretStr]`
-- [ ] `Settings.enabled_executors()`, `Settings.secret(name) -> str | None`, `Settings.secret_names() -> set[str]`
-- [ ] run tests - must pass before next task
+- [x] тесты: дефолты без файла; полный файл парсится в `Settings`; `fallback_executor` не из `executors` → `ConfigError`; `adapter: opencode` без `model` → `ConfigError`; `escalation` с неизвестным именем → `ConfigError`; `command` по умолчанию равен `adapter`; `extra_args` по умолчанию из `config_default.yaml`; `executors` мержатся по ключу, `enabled: false` выключает дефолтный, новый ключ добавляется; env-файл `KEY=VALUE` парсится, `#` и пустые строки пропускаются, значение с `=` внутри сохраняется; после загрузки `os.environ` не содержит ключей; `Settings.secrets` это `SecretStr`, `repr(settings)` не содержит значения; `~` раскрывается; `AGENT_DISPATCH_DATA_DIR` побеждает yaml; `AGENT_DISPATCH_CONFIG_DIR` задаёт путь
+- [x] pydantic-модели `ServerSettings`, `McpSettings`, `JevSettings`, `ClaudeLocalSettings`, `RouterSettings`, `RoutingSettings`, `ExecutorSettings` (`adapter, command, model, extra_args, enabled, description`), `Settings` c `model_validator`, `extra="forbid"`
+- [x] `load_settings(config_dir: Path | None = None) -> Settings`, `load_env_file(path) -> dict[str, SecretStr]`
+- [x] `Settings.enabled_executors()`, `Settings.secret(name) -> str | None`, `Settings.secret_names() -> set[str]`
+- [x] run tests - must pass before next task
 
 ### Task 3: Модели домена и схема result-блока
 
 **Files:**
 - Create: `agent_dispatch/models.py`, `agent_dispatch/schemas/agent_result.schema.json`, `agent_dispatch/schemas/__init__.py`, `tests/test_models.py`
 
-- [ ] тесты: `DispatchRequest` с пустым `task` → ошибка; `wait_seconds=-1` → ошибка; `hop` по умолчанию 0; `files` с `..` → ошибка; `ContextMode("prompt+summary")` парсится; `ExecutionResult` round-trip JSON; `ExecutionResult(status="queued")` → ошибка; схема валидна по `jsonschema.Draft202012Validator.check_schema`, принимает `{status, summary}`, отвергает лишнее поле и `status="running"`
-- [ ] реализовать модели из Technical Details, включая `GuardEvent`, `Availability`, `TaskView`
-- [ ] `schemas/__init__.py`: `load_agent_result_schema()`, `validate_agent_result(obj) -> list[str]` (ошибки)
-- [ ] run tests - must pass before next task
+- [x] тесты: `DispatchRequest` с пустым `task` → ошибка; `wait_seconds=-1` → ошибка; `hop` по умолчанию 0; `files` с `..` → ошибка; `ContextMode("prompt+summary")` парсится; `ExecutionResult` round-trip JSON; `ExecutionResult(status="queued")` → ошибка; схема валидна по `jsonschema.Draft202012Validator.check_schema`, принимает `{status, summary}`, отвергает лишнее поле и `status="running"`
+- [x] реализовать модели из Technical Details, включая `GuardEvent`, `Availability`, `TaskView`
+- [x] `schemas/__init__.py`: `load_agent_result_schema()`, `validate_agent_result(obj) -> list[str]` (ошибки)
+- [x] run tests - must pass before next task
 
 ### Task 4: Task Package и рендер промпта со снапшотом
 
@@ -415,7 +418,7 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - Create: `agent_dispatch/dispatch/__init__.py`, `agent_dispatch/dispatch/task_package.py`, `agent_dispatch/templates/task_package.md.j2`, `tests/test_task_package.py`, `tests/snapshots/prompt_claude_prompt.md`, `tests/snapshots/prompt_claude_summary.md`, `tests/snapshots/prompt_claude_full.md`, `tests/snapshots/prompt_codex_summary.md`
 
 - [ ] тесты `build_task_package(req, settings)`: в режиме `prompt`/`prompt+summary` `git_status is None`; в `full` заполнен из `git_repo` с изменённым файлом
-- [ ] тесты `render_prompt(package, adapter_kind, settings)`: четыре снапшота совпадают; `prompt` не содержит `Constraints`; `hop=1, max_hops=2` даёт `Do NOT delegate further`, `hop=0` не даёт; `codex` и `claude` различаются только секцией `Result format`
+- [ ] тесты `render_prompt(package, adapter_kind, settings)`: четыре снапшота совпадают; `prompt` не содержит `Constraints`; `hop=1, max_hops=2` даёт `Do NOT delegate further` и не содержит `split this task`; `hop=0` даёт инструкцию fan-out с числом `max_children`; `codex` и `claude` различаются только секцией `Result format`
 - [ ] `TaskPackage`, `build_task_package`, `render_prompt`; git-команды только в `full`
 - [ ] run tests - must pass before next task
 
@@ -434,8 +437,8 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 **Files:**
 - Create: `agent_dispatch/routing/__init__.py`, `agent_dispatch/routing/guards.py`, `tests/test_guards.py`
 
-- [ ] тесты `pre_guards(req, settings, unavailable: set[str], parent_exists: bool) -> GuardEvent | RouteDecision | None`: bad_cwd (нет, файл, не git); hop ≥ max_hops; hop < max_hops проходит; parent задан и не существует → unknown_parent; explicit disabled; explicit unavailable; explicit ok → `RouteDecision(router=override)` даже если executor.adapter == source_agent
-- [ ] тесты `candidates(settings, unavailable, source_agent) -> list[str]`: `source_agent=opencode` исключает оба `opencode/*`; `codex` исключает только `codex`; флаг false ничего не исключает; unavailable и disabled вычитаются; `cli`/`unknown` ничего не исключают
+- [ ] тесты `pre_guards(req, settings, unavailable: set[str], parent_exists: bool, sibling_count: int) -> GuardEvent | RouteDecision | None`: bad_cwd (нет, файл, не git); hop ≥ max_hops; hop < max_hops проходит; parent задан и не существует → unknown_parent; `sibling_count >= max_children` → max_children, `sibling_count < max_children` проходит; explicit disabled; explicit unavailable; explicit ok → `RouteDecision(router=override)` даже если executor.adapter == source_agent
+- [ ] тесты `candidates(settings, unavailable, source_agent, hop) -> list[str]`: `source_agent=opencode, hop=0` исключает оба `opencode/*`; `codex` исключает только `codex`; при `hop=1` ничего не исключается даже с флагом true; флаг false ничего не исключает; unavailable и disabled вычитаются; `cli`/`unknown` ничего не исключают
 - [ ] тесты `post_guards(decision, settings, candidates) -> tuple[RouteDecision, list[GuardEvent]]`: low_confidence; low_margin при `0.55/0.45` (разница 0.10 проходит с допуском 1e-9), `0.54/0.46` не проходит; fallback не в кандидатах → top1 + `meta.warning` + событие; всё ок → без изменений и без событий
 - [ ] реализовать `pre_guards`, `candidates`, `post_guards`, `single_candidate_decision`
 - [ ] run tests - must pass before next task
@@ -449,7 +452,7 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [ ] фикстуры: `request_executor.json` это точное ожидаемое тело для тестового запроса; `response_ok.json` и `response_400_score_criteria.json` уже записаны с живой пробы 2026-09-21
 - [ ] тесты (respx): тело запроса равно `request_executor.json` (state = `{task, context, files, constraints, source_agent}`, без `cwd`); `score.criteria` массив; ответ ok → `RouteDecision(router=jev, executor=codex, scores, judgments.difficulty, meta.jev_id)`; `latency_ms >= 0`; `cost_usd` из usage; 500 ×3 → `RouterError` после `retries` попыток и backoff через инжектированный `sleep`; 400 → `RouterError` без retry; 401/403 → `RouterError` без retry с текстом ошибки; choice вне кандидатов → `RouterError`; Σp ≠ 1 → `RouterError`; нет ключа → `RouterError` до сетевого вызова; `base_url`/`model` из конфига попадают в запрос
 - [ ] `routing/base.py`: `Router` Protocol (`decide(package, candidates: dict[str, str]) -> RouteDecision`), `RouterError`
-- [ ] `routing/questions.py`: `build_state(package)`, `build_questions(candidates)` (executor choice + difficulty/task_type/risk/ambiguity)
+- [ ] `routing/questions.py`: `build_state(package)`, `build_questions(candidates)` (executor choice + difficulty/task_type/risk/ambiguity score/choice + decomposable noul); ответ noul парсится в `Judgment(kind="noul", value=bool, probabilities={"true": p, "false": 1-p})`
 - [ ] `routing/jev.py`: `JevRouter(settings, client, sleep=asyncio.sleep)`
 - [ ] run tests - must pass before next task
 
@@ -464,17 +467,19 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [ ] `decision.py`: оркестрация pre/candidates/router/post, возвращает решение и события
 - [ ] run tests - must pass before next task
 
+➕ run A (codex-flow 20260921-160148-a904): тесты флакали при первом exec новых fake-скриптов (syspolicyd на macOS), добавлен session-прогрев в conftest. Найдено и исправлено в ревью: env-парсер комментариев, YAML→ConfigError, deadlock stdin>64КБ, лимит строки 64КиБ, SIGKILL группе после выхода родителя, `git status -z`, `pgid = process.pid`.
+
 ### Task 9: Процесс-раннер и workspace: запуск CLI, лог, timeout, cancel, kill group
 
 **Files:**
 - Modify: `agent_dispatch/executors/process.py`
 - Create: `agent_dispatch/executors/workspace.py`, `tests/test_process.py`, `tests/test_workspace.py`, `tests/fakes/echo_ok.sh`, `tests/fakes/sleep_forever.sh`, `tests/fakes/ignore_term.sh`, `tests/fakes/spawn_child_and_sleep.sh`, `tests/fakes/exit_3.sh`
 
-- [ ] тесты `run_cli`: exit 0 stdout собран; exit 3; timeout 0.2 с на `sleep_forever` → `timed_out`, процесс мёртв; `ignore_term` с `grace_seconds=0.2` → убит SIGKILL, `duration < 1 с`; `spawn_child_and_sleep` → в течение 1 с `os.killpg(pgid, 0)` даёт `ProcessLookupError`; отмена `asyncio.Task` во время работы → группа убита, `CancelledError` пробрасывается; stdin передаётся; лог содержит stdout и stderr; `duration_ms >= 0`
-- [ ] тесты workspace: `is_git_repo` true/false; правка одного файла и создание второго → `["a.py", "b.py"]` отсортировано; untracked и modified оба учитываются
-- [ ] `run_cli` с `grace_seconds` параметром, `killpg` в `finally` при `CancelledError`
-- [ ] `is_git_repo`, `snapshot`, `diff`
-- [ ] run tests - must pass before next task
+- [x] тесты `run_cli`: exit 0 stdout собран; exit 3; timeout 0.2 с на `sleep_forever` → `timed_out`, процесс мёртв; `ignore_term` с `grace_seconds=0.2` → убит SIGKILL, `duration < 1 с`; `spawn_child_and_sleep` → в течение 1 с `os.killpg(pgid, 0)` даёт `ProcessLookupError`; отмена `asyncio.Task` во время работы → группа убита, `CancelledError` пробрасывается; stdin передаётся; лог содержит stdout и stderr; `duration_ms >= 0`
+- [x] тесты workspace: `is_git_repo` true/false; правка одного файла и создание второго → `["a.py", "b.py"]` отсортировано; untracked и modified оба учитываются
+- [x] `run_cli` с `grace_seconds` параметром, `killpg` в `finally` при `CancelledError`
+- [x] `is_git_repo`, `snapshot`, `diff`
+- [x] run tests - must pass before next task
 
 ### Task 10: База адаптеров, registry, Claude-адаптер
 
@@ -513,6 +518,7 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - Create: `agent_dispatch/telemetry/__init__.py`, `agent_dispatch/telemetry/storage.py`, `agent_dispatch/telemetry/schema.sql`, `tests/test_storage.py`
 
 - [ ] тесты: создание БД в tmp, `user_version = 1`; `insert_task`/`update_task`/`get_task` round-trip `TaskRecord`; `task_exists`; `add_decision` с `task_id=None` для `/route`; `add_event`; `export(since)` отдаёт по строке на задачу с вложенными `decision` и `events`, плюс строки `{task: null, decision}`; повторный `open` идемпотентен; 20 конкурентных записей не теряются
+- [ ] `count_children(parent_task_id) -> int` (все статусы, кроме `cancelled`)
 - [ ] `Storage(path)`: `open()`, схема из `schema.sql`, WAL, `asyncio.Lock` на запись, методы выше
 - [ ] run tests - must pass before next task
 
@@ -521,7 +527,7 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 **Files:**
 - Create: `agent_dispatch/dispatch/dispatcher.py`, `tests/test_dispatcher.py`, `tests/fakes/adapters.py` (`FakeAdapter` с настраиваемым результатом, `asyncio.Event` для управления ходом, опциональным callback «сделать вложенный submit»)
 
-- [ ] тесты: happy path `submit → completed`, decision и result записаны, события `guard/spawn/exit`; `wait_seconds=0` → `queued` сразу, потом `completed`; `max_concurrent_tasks=1`, две корневые задачи → вторая стартует только после `Event` первой; `max_concurrent_tasks=1`, корневая задача делает вложенный `submit(hop=1, parent_task_id=self)` и ждёт его → ребёнок выполняется, deadlock нет; две корневые задачи в одном `realpath(cwd)` сериализуются, в разных cwd идут параллельно; `cancel` во время `running` → `cancelled`, адаптер отменён; hop ≥ max → `failed` без вызова адаптера; explicit executor → `router=override`; неизвестный `parent_task_id` → `failed, reason=unknown_parent`; исключение адаптера → `failed` с `error`, воркер жив; `log_path` задаётся при создании и лежит в `data_dir/logs/`; env дочернего процесса без секретов и с `AGENT_DISPATCH_HOP = hop + 1`
+- [ ] тесты: happy path `submit → completed`, decision и result записаны, события `guard/spawn/exit`; `wait_seconds=0` → `queued` сразу, потом `completed`; `max_concurrent_tasks=1`, две корневые задачи → вторая стартует только после `Event` первой; `max_concurrent_tasks=1`, корневая задача делает вложенный `submit(hop=1, parent_task_id=self)` и ждёт его → ребёнок выполняется, deadlock нет; две корневые задачи в одном `realpath(cwd)` сериализуются, в разных cwd идут параллельно; `cancel` во время `running` → `cancelled`, адаптер отменён; hop ≥ max → `failed` без вызова адаптера; explicit executor → `router=override`; неизвестный `parent_task_id` → `failed, reason=unknown_parent`; третий ребёнок одного родителя при `max_children=2` → `failed, reason=max_children`, первые два выполняются параллельно; исключение адаптера → `failed` с `error`, воркер жив; `log_path` задаётся при создании и лежит в `data_dir/logs/`; env дочернего процесса без секретов и с `AGENT_DISPATCH_HOP = hop + 1`
 - [ ] `Dispatcher(settings, storage, adapters, availability, routers)`: `submit`, `wait`, `get`, `cancel`, `route_only`; семафор и per-cwd lock только для `hop == 0`
 - [ ] run tests - must pass before next task
 

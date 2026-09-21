@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["status", "summary"],
+  "properties": {
+    "status": {"enum": ["completed", "partial", "failed", "needs_context", "needs_escalation"]},
+    "summary": {"type": "string"},
+    "changed_files": {"type": "array", "items": {"type": "string"}},
+    "tests": {
+      "type": "object",
+      "properties": {
+        "command": {"type": "string"},
+        "result": {"enum": ["passed", "failed", "not_run"]}
+      }
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "needs_escalation": {"type": "boolean"}
+  },
+  "additionalProperties": false
+}
