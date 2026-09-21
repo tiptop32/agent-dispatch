@@ -13,7 +13,8 @@ repos:
         types: [python]
       - id: detect-secrets
         name: detect-secrets
-        entry: uv run detect-secrets-hook --baseline .secrets.baseline
+        # api_key_env это имя переменной окружения, не значение
+        entry: uv run detect-secrets-hook --baseline .secrets.baseline --exclude-lines 'api_key_env'
         language: system
         exclude: ^(uv\.lock)$
       - id: pytest-gate

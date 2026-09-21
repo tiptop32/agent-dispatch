@@ -28,8 +28,10 @@ def git_repo(tmp_path: Path) -> Iterator[Path]:
     """Временная git-репа с одним коммитом и файлом a.py."""
     repo = tmp_path / "repo"
     repo.mkdir()
+    # Внутри git-хука (pre-commit) выставлены GIT_INDEX_FILE, GIT_DIR и другие GIT_*,
+    # они утекли бы во вложенную репу и сломали её. Убираем всё GIT_*.
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
         "GIT_AUTHOR_NAME": "test",
         "GIT_AUTHOR_EMAIL": "test@example.com",
         "GIT_COMMITTER_NAME": "test",
