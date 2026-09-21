@@ -24,6 +24,7 @@ routing:
   min_margin: 0.10
   fallback_executor: codex
   max_hops: 2
+  max_children: 2
   exclude_source_agent: true
   default_timeout_seconds: 1800
   availability_ttl_seconds: 60

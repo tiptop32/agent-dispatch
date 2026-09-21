@@ -11,6 +11,7 @@ from agent_dispatch.models import (
     ExecutionResult,
     GuardEvent,
     GuardReason,
+    Judgment,
     RouteDecision,
     RouterKind,
     SourceAgent,
@@ -139,3 +140,14 @@ def test_remaining_domain_models_compose_into_task_view() -> None:
     assert view.log_tail == "finished"
     assert guard.reason is GuardReason.single_candidate
     assert availability.available is True
+
+
+def test_judgment_accepts_noul_kind_with_bool_value() -> None:
+    judgment = Judgment(
+        kind="noul", value=True, confidence=0.8, probabilities={"true": 0.9, "false": 0.1}
+    )
+    assert judgment.value is True
+
+
+def test_guard_reason_has_max_children() -> None:
+    assert GuardReason("max_children") is GuardReason.max_children

@@ -59,6 +59,7 @@ class GuardReason(StrEnum):
     max_hops = "max_hops"
     bad_cwd = "bad_cwd"
     unknown_parent = "unknown_parent"
+    max_children = "max_children"
     escalated = "escalated"
 
 
@@ -90,8 +91,8 @@ class DispatchRequest(_Model):
 
 
 class Judgment(_Model):
-    kind: Literal["choice", "score"]
-    value: str | float
+    kind: Literal["choice", "score", "noul"]
+    value: str | float | bool
     confidence: float
     probabilities: dict[str, float]
 

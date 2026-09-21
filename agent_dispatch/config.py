@@ -56,6 +56,7 @@ class RoutingSettings(_ConfigModel):
     min_margin: float = 0.10
     fallback_executor: str = "codex"
     max_hops: int = Field(2, ge=0)
+    max_children: int = Field(2, ge=0)
     exclude_source_agent: bool = True
     default_timeout_seconds: int = Field(1800, ge=0)
     availability_ttl_seconds: int = Field(60, ge=0)

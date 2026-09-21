@@ -250,3 +250,7 @@ def test_secrets_in_user_yaml_raise_config_error(tmp_config_dir: Path) -> None:
         match=r"secrets: keys belong in the env file, not config\.yaml",
     ):
         load_settings()
+
+
+def test_max_children_defaults_to_two(tmp_config_dir: Path) -> None:
+    assert load_settings(tmp_config_dir).routing.max_children == 2
