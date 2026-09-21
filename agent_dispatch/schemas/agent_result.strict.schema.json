@@ -1,0 +1,67 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "partial",
+        "failed",
+        "needs_context",
+        "needs_escalation"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tests": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "passed",
+            "failed",
+            "not_run",
+            null
+          ]
+        }
+      },
+      "required": [
+        "command",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "confidence": {
+      "type": "number"
+    },
+    "needs_escalation": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "status",
+    "summary",
+    "changed_files",
+    "tests",
+    "confidence",
+    "needs_escalation"
+  ],
+  "additionalProperties": false
+}

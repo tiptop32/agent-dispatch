@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -20,7 +21,11 @@ from agent_dispatch.models import (
     TaskView,
     Usage,
 )
-from agent_dispatch.schemas import load_agent_result_schema, validate_agent_result
+from agent_dispatch.schemas import (
+    load_agent_result_schema,
+    load_agent_result_strict_schema,
+    validate_agent_result,
+)
 
 
 def request_data(**overrides: object) -> dict[str, object]:
@@ -151,3 +156,21 @@ def test_judgment_accepts_noul_kind_with_bool_value() -> None:
 
 def test_guard_reason_has_max_children() -> None:
     assert GuardReason("max_children") is GuardReason.max_children
+
+
+def test_strict_schema_requires_every_property_at_each_level() -> None:
+    schema = load_agent_result_strict_schema()
+    assert set(schema["required"]) == set(schema["properties"])
+    assert schema["additionalProperties"] is False
+    tests = schema["properties"]["tests"]
+    assert set(tests["required"]) == set(tests["properties"])
+    assert tests["additionalProperties"] is False
+
+
+def test_strict_schema_accepts_live_codex_last_message() -> None:
+    from pathlib import Path
+
+    raw = json.loads(
+        (Path(__file__).parent / "fixtures/agent_output/codex_last_message.json").read_text()
+    )
+    assert validate_agent_result(raw) == []

@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a0c53c-3863-7162-8e11-6c44760a6e3c"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"loading hooks from both /Users/tiptop32/.codex/hooks.json and /Users/tiptop32/.codex/config.toml; prefer a single representation for this layer"}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"clamping SessionEnd hook timeout to 3s in /Users/tiptop32/.codex/plugins/cache/openai-codex/codex/1.0.6/hooks/hooks.json"}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"error","message":"Skill descriptions were shortened to fit the skills context budget. Codex can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest."}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"{\"status\":\"completed\",\"summary\":\"nothing to do\",\"changed_files\":[],\"tests\":{\"command\":\"none\",\"result\":\"not_run\"},\"confidence\":1,\"needs_escalation\":false}"}}
+{"type":"turn.completed","usage":{"input_tokens":24900,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":201,"reasoning_output_tokens":151}}
