@@ -594,16 +594,18 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [x] интеграция в `Dispatcher._run`, `decision.reason=escalated`
 - [x] run tests - must pass before next task
 
+➕ run G (codex-flow 20260922-081941-a393): харнесс smoke проверяет calc.py через ast и подпроцесс независимо от тестов агента; `--router {daemon,jev,claude_local}` (in-process режимы обходят демон). Живой прогон в Task 21.
+
 ### Task 20: Evals: routing accuracy и smoke на живых CLI
 
 **Files:**
 - Create: `evals/__init__.py`, `evals/routing/__init__.py`, `evals/routing/cases.jsonl`, `evals/routing/__main__.py`, `evals/smoke/__init__.py`, `evals/smoke/__main__.py`, `evals/smoke/repo_template/` (мини-проект с pytest и одним намеренно падающим тестом), `evals/README.md`
 
-- [ ] `cases.jsonl`: 20 задач `{task, context, files, constraints, expected_executor, rationale}`; примерно 6 claude, 7 codex, 7 opencode
-- [ ] `evals/routing/__main__.py`: живой роутер через `POST /route` живого демона, accuracy, отчёт `evals/reports/routing-<date>.json`, матрица ошибок, exit 1 при accuracy < 0.8; флаг `--router claude_local`
-- [ ] `evals/smoke/__main__.py`: копирует `repo_template` в tmp, `git init` + commit, три задачи через `dispatch_to` на каждом enabled executor через живой демон, проверяет `completed`, `changed_files` непустой, `pytest` зелёный; `--executors codex,claude`
+- [x] `cases.jsonl`: 20 задач `{task, context, files, constraints, expected_executor, rationale}`; примерно 6 claude, 7 codex, 7 opencode
+- [x] `evals/routing/__main__.py`: живой роутер через `POST /route` живого демона, accuracy, отчёт `evals/reports/routing-<date>.json`, матрица ошибок, exit 1 при accuracy < 0.8; флаг `--router claude_local`
+- [x] `evals/smoke/__main__.py`: копирует `repo_template` в tmp, `git init` + commit, три задачи через `dispatch_to` на каждом enabled executor через живой демон, проверяет `completed`, `changed_files` непустой, `pytest` зелёный; `--executors codex,claude`
 - [ ] прогнать оба eval вживую, вписать результат с датой в `evals/README.md`
-- [ ] run gate tests - must pass before next task
+- [x] run gate tests - must pass before next task
 
 ### Task 21: Verify acceptance criteria
 - [ ] живая проверка headless-прав: `claude -p` с `extra_args` из дефолта выполняет `pytest` без TTY; `opencode run` выполняет команду без подтверждения; если нет, поправить дефолтные `extra_args`/README и обновить план (➕)
