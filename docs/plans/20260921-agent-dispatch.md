@@ -526,14 +526,16 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [x] `Storage(path)`: `open()`, схема из `schema.sql`, WAL, `asyncio.Lock` на запись, методы выше
 - [x] run tests - must pass before next task
 
+➕ run D (codex-flow 20260922-044825-52c9): добавлены `recover_stale()` (задачи из БД после рестарта демона → failed, вызывать из lifespan в Task 15), `_decide()`, done-колбэк воркера для отмены до старта, git через `to_thread`, `cancel(task_id, wait_seconds)`. `serve_state.py` уже в main до run E.
+
 ### Task 14: Dispatcher: state machine, семафор корневых задач, lock по cwd, cancel
 
 **Files:**
 - Create: `agent_dispatch/dispatch/dispatcher.py`, `tests/test_dispatcher.py`, `tests/fakes/adapters.py` (`FakeAdapter` с настраиваемым результатом, `asyncio.Event` для управления ходом, опциональным callback «сделать вложенный submit»)
 
-- [ ] тесты: happy path `submit → completed`, decision и result записаны, события `guard/spawn/exit`; `wait_seconds=0` → `queued` сразу, потом `completed`; `max_concurrent_tasks=1`, две корневые задачи → вторая стартует только после `Event` первой; `max_concurrent_tasks=1`, корневая задача делает вложенный `submit(hop=1, parent_task_id=self)` и ждёт его → ребёнок выполняется, deadlock нет; две корневые задачи в одном `realpath(cwd)` сериализуются, в разных cwd идут параллельно; `cancel` во время `running` → `cancelled`, адаптер отменён; hop ≥ max → `failed` без вызова адаптера; explicit executor → `router=override`; неизвестный `parent_task_id` → `failed, reason=unknown_parent`; третий ребёнок одного родителя при `max_children=2` → `failed, reason=max_children`, первые два выполняются параллельно; исключение адаптера → `failed` с `error`, воркер жив; `log_path` задаётся при создании и лежит в `data_dir/logs/`; env дочернего процесса без секретов и с `AGENT_DISPATCH_HOP = hop + 1`
-- [ ] `Dispatcher(settings, storage, adapters, availability, routers)`: `submit`, `wait`, `get`, `cancel`, `route_only`; семафор и per-cwd lock только для `hop == 0`
-- [ ] run tests - must pass before next task
+- [x] тесты: happy path `submit → completed`, decision и result записаны, события `guard/spawn/exit`; `wait_seconds=0` → `queued` сразу, потом `completed`; `max_concurrent_tasks=1`, две корневые задачи → вторая стартует только после `Event` первой; `max_concurrent_tasks=1`, корневая задача делает вложенный `submit(hop=1, parent_task_id=self)` и ждёт его → ребёнок выполняется, deadlock нет; две корневые задачи в одном `realpath(cwd)` сериализуются, в разных cwd идут параллельно; `cancel` во время `running` → `cancelled`, адаптер отменён; hop ≥ max → `failed` без вызова адаптера; explicit executor → `router=override`; неизвестный `parent_task_id` → `failed, reason=unknown_parent`; третий ребёнок одного родителя при `max_children=2` → `failed, reason=max_children`, первые два выполняются параллельно; исключение адаптера → `failed` с `error`, воркер жив; `log_path` задаётся при создании и лежит в `data_dir/logs/`; env дочернего процесса без секретов и с `AGENT_DISPATCH_HOP = hop + 1`
+- [x] `Dispatcher(settings, storage, adapters, availability, routers)`: `submit`, `wait`, `get`, `cancel`, `route_only`; семафор и per-cwd lock только для `hop == 0`
+- [x] run tests - must pass before next task
 
 ### Task 15: HTTP API демона (FastAPI), токен, Host-check, команда serve
 
