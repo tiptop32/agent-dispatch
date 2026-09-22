@@ -114,3 +114,17 @@ async def test_claude_check_preserves_base_environment(tmp_path):
     )
     assert (await adapter.check()).available
     assert "HOME=/x" in capture.read_text()
+
+
+@pytest.mark.asyncio
+async def test_claude_passes_model_flag_when_configured(git_repo, tmp_path):
+    capture = tmp_path / "capture"
+    adapter = ClaudeAdapter(
+        "claude/sonnet",
+        ExecutorSettings(
+            adapter="claude", command=str(ROOT / "fakes/claude_ok.sh"), model="sonnet"
+        ),
+    )
+    await adapter.execute(context(git_repo, tmp_path, FAKE_CAPTURE=str(capture)))
+    argv = (tmp_path / "capture.argv").read_text().splitlines()
+    assert argv[-2:] == ["--model", "sonnet"]

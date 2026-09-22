@@ -82,7 +82,7 @@ Endpoint `POST https://openrouter.ai/api/alpha/decisions`, модель `typesaf
 
 Только `executor` влияет на маршрут. Остальные judgments пишутся в телеметрию для анализа routing accuracy. Jev не делает side effects: он никогда не запускает исполнителя.
 
-Замечание: `state` (`task`, `context`, `files`, `constraints`) уходит на OpenRouter даже для задач, которые потом пойдут в корпоративную модель `opencode/x5-code`. Если это ограничение, отправляйте такие задачи через `dispatch_to`, где Jev не вызывается.
+Замечание: `state` (`task`, `context`, `files`, `constraints`) уходит на OpenRouter даже для задач, которые потом пойдут в корпоративную модель, подключённую через OpenCode. Если это ограничение, отправляйте такие задачи через `dispatch_to`, где Jev не вызывается.
 
 ## Формат результата
 

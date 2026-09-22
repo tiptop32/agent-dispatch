@@ -40,6 +40,7 @@ class ClaudeAdapter:
             "json",
             "--add-dir",
             ctx.cwd,
+            *(["--model", self.settings.model] if self.settings.model else []),
             *self.settings.extra_args,
         ]
         try:

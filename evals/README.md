@@ -20,9 +20,9 @@ JSON-отчёты сохраняются в `evals/reports/` (этот ката�
 
 | Дата | Accuracy | Стоимость, USD | P50, мс | Промахи |
 |---|---:|---:|---:|---|
-| 2026-09-22 | 95% (19/20) | 0.0008 | 456 | r19 (x5-code → codex, confidence 0.35: ниже порога, в dispatch сработал бы fallback) |
+| 2026-09-22 | 100% (20/20) | 0.0008 | 422 | нет |
 
-Прогон 2026-09-22 через живой демон и Jev (`typesafe/jev-1.13` на OpenRouter). Все 6 claude-задач, 7 codex и 4 kimi распознаны; из трёх x5-code задач одна ушла в codex с confidence 0.35, что ниже `min_confidence`, значит в реальном `dispatch` её получил бы `fallback_executor`. Шесть решений с confidence < 0.9 (r12, r13, r15, r16, r19, r20): все на границе kimi/x5-code и codex/kimi, где descriptions executors близки.
+Прогон 2026-09-22 через Jev напрямую (`--router jev`, `typesafe/jev-1.13` на OpenRouter) на дефолтном реестре: 6 claude, 7 codex, 7 kimi. Пять решений с confidence < 0.9 (r12 0.80, r13 0.75, r15 0.84, r16 0.73, r20 0.86): все на границе codex/kimi, где descriptions executors близки. Предыдущий прогон того же дня на 20 кейсах, из которых три были заточены под корпоративный executor, дал 95%: один такой кейс ушёл в codex с confidence 0.35, что ниже `min_confidence`, и в реальном `dispatch` его получил бы `fallback_executor`. Эти три кейса заменены на r18-r20 для `opencode/kimi`.
 
 ## Smoke
 
@@ -30,7 +30,7 @@ JSON-отчёты сохраняются в `evals/reports/` (этот ката�
 |---|---|---|---|---|
 | 2026-09-22 | codex | ok (~7 мин) | ok | ok |
 | 2026-09-22 | claude | ok (~40 с) | ok | ok |
-| 2026-09-22 | opencode/x5-code | ok (~20 с) | ok | ok |
+| 2026-09-22 | opencode (корпоративная модель) | ok (~20 с) | ok | ok |
 
 Первый прогон smoke показал дефект харнесса: шаблон репы содержал баг в `add()` для всех задач, поэтому `docstring` и `rename` проваливались по `pytest` у всех исполнителей одинаково. Теперь баг вносится только для задачи `fix` (`prepare_repo(..., inject_bug=True)`).
 

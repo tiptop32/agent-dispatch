@@ -20,8 +20,7 @@
       "criteria": {
         "claude": "Claude Code: strongest reasoning, multi-file refactors, ambiguous or design-heavy tasks; most expensive",
         "codex": "OpenAI Codex CLI: solid autonomous bug fixing and test-driven fixes in a single repo; medium cost",
-        "opencode/kimi": "OpenCode with Kimi K2.5: cheap, good for small well-specified edits, docs, boilerplate",
-        "opencode/x5-code": "OpenCode with corporate x5-airun code model: cheap internal model for routine edits with corporate data constraints"
+        "opencode/kimi": "OpenCode with Kimi K2.5: cheap, good for small well-specified edits, docs, boilerplate"
       }
     },
     "difficulty": {

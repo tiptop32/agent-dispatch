@@ -60,7 +60,7 @@ agent-dispatch dispatch --cwd ~/repo "tests/test_x.py fails; find the bug in src
 # changed_files: src/x.py
 # summary: ...
 
-agent-dispatch dispatch --executor opencode/x5-code --cwd ~/repo "add a docstring to parse_args in cli.py"
+agent-dispatch dispatch --executor opencode/kimi --cwd ~/repo "add a docstring to parse_args in cli.py"
 agent-dispatch status <task_id>
 agent-dispatch executors
 ```

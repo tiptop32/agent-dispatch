@@ -5,7 +5,6 @@
       "type": "choice",
       "choice": "codex",
       "probabilities": {
-        "opencode/x5-code": 0,
         "opencode/kimi": 0,
         "codex": 1,
         "claude": 0

@@ -20,7 +20,7 @@ AgentDispatch это отдельный локальный сервис, кот�
 
 Проверенные факты окружения (2026-09-21):
 - CLI: `claude` 2.1.270, `codex-cli` 0.155.1 (через codex-lb, `~/.codex/config.toml` `model_provider = "codex-lb"`), `opencode` 1.18.31, `uv`, `python3` 3.11.
-- OpenCode сконфигурирован с провайдерами `openrouter` (`kimi-k2.5`, `minimax-m2.5`) и `copilot` (`x5-airun-code-large-exp` и другие `x5-airun-*`). DeepSeek и GLM НЕ настроены, в registry v0.1 их нет.
+- OpenCode сконфигурирован с провайдерами `openrouter` (`kimi-k2.5`, `minimax-m2.5`) и `copilot` (корпоративные кодинг-модели). DeepSeek и GLM НЕ настроены, в registry v0.1 их нет.
 - Jev через OpenRouter: `POST https://openrouter.ai/api/alpha/decisions`, модель `typesafe/jev-1.13`. Живая проба: 200 OK, ~1 с, 695 input tokens, cost $0.000029. Ключ `OPENROUTER_API_KEY`.
 - Vercel AI Gateway как второй провайдер Jev рассмотрен и отклонён 2026-09-21: требует карту на команде (`403 customer_verification_required`), free tier с жёстким rate limit. Не используем.
 - Ключ в `~/.config/agent-dispatch/env` (права 600).
@@ -85,7 +85,7 @@ agent (claude / codex / opencode)
    **Fan-out сабагентов (решение 2026-09-21).** Исполнитель может разбить задачу и отдать до `routing.max_children` (по умолчанию 2) подзадач через тот же `dispatch`; каждую роутит Jev. Guard `max_children` считает детей по `parent_task_id`. Task Package содержит инструкцию про fan-out только когда `hop + 1 < max_hops`. `exclude_source_agent` действует только на hop 0: сабагенты могут быть того же типа, что и родитель, цель fan-out это параллелизм. Сабагенты одной задачи делят рабочее дерево, поэтому инструкция требует непересекающихся `files`.
 5. **Исполнитель правит прямо в cwd**, без worktree. `changed_files` через `git status --porcelain` до и после. cwd обязан быть git-репой (иначе `bad_cwd`): codex вне git не работает, а diff без git недостоверен. Корневые задачи с одинаковым `realpath(cwd)` выполняются последовательно.
 6. **Structured Result, гибрид.** Codex через `--output-schema`. Claude и OpenCode получают в промпте инструкцию завершить ответ блоком ```` ```agent-dispatch-result {...} ```` ````, парсер берёт последний такой блок. Не распарсилось: `status=partial`, `summary` = хвост 2000 символов, `parse_error` в meta. Ненулевой exit или timeout: `failed`.
-7. **Registry только из реально работающего**: `claude`, `codex`, `opencode/kimi`, `opencode/x5-code`. Descriptions executors (criteria для Jev) живут в config.yaml, не в коде.
+7. **Registry только из реально работающего**: `claude`, `codex`, `opencode/kimi`. Descriptions executors (criteria для Jev) живут в config.yaml, не в коде.
 8. **Guards в коде, не в Jev.** Порядок фиксирован (см. Technical Details), каждый guard пишет event в телеметрию.
 9. **Ключи никогда не попадают в `os.environ`** и в env дочерних процессов. Env-файл читается в `Settings` как `SecretStr`.
 10. **Долгие вызовы и MCP-таймауты.** У Codex дефолтный `tool_timeout_sec` 60 с, у Claude Code `MCP_TOOL_TIMEOUT`. Прокси по умолчанию ждёт `mcp.wait_seconds: 50`, потом отдаёт `running` + `task_id`, агент опрашивает `status`. README описывает, как поднять таймауты хоста и `wait_seconds`.
@@ -147,17 +147,9 @@ executors:                           # merge по ключу с config_default.y
     extra_args: []
     enabled: true
     description: "OpenCode with Kimi K2.5: cheap, good for small well-specified edits, docs, boilerplate"
-  opencode/x5-code:
-    adapter: opencode
-    command: opencode
-    model: copilot/x5-airun-code-large-exp
-    extra_args: []
-    enabled: true
-    description: "OpenCode with corporate x5-airun code model: cheap internal model for routine edits with corporate data constraints"
 
 escalation:                          # принимается конфигом с Task 2, применяется с Task 19
   opencode/kimi: [codex, claude]
-  opencode/x5-code: [codex, claude]
   codex: [claude]
 ```
 
@@ -370,7 +362,7 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 
 `agent-dispatch export` выгружает датасет, из которого считаются: routing accuracy (после разметки feedback), доля `fallback`/`override`/`low_confidence`, success rate и медианная длительность по executor. Первая цифра после недели использования: routing accuracy ≥ 0.8 на размеченных задачах и доля `low_confidence` < 20%.
 
-Замечание для docs/architecture.md: `state` Jev содержит `task` и `context` и уходит на OpenRouter даже для задач, которые потом пойдут в корпоративную модель `opencode/x5-code`. Если это ограничение, задачу нужно отправлять через `dispatch_to`.
+Замечание для docs/architecture.md: `state` Jev содержит `task` и `context` и уходит на OpenRouter даже для задач, которые потом пойдут в корпоративную модель, подключённую через OpenCode. Если это ограничение, задачу нужно отправлять через `dispatch_to`.
 
 ## What Goes Where
 

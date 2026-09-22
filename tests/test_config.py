@@ -23,7 +23,6 @@ def test_defaults_without_user_files_are_working(tmp_config_dir: Path) -> None:
         "claude",
         "codex",
         "opencode/kimi",
-        "opencode/x5-code",
     }
 
 

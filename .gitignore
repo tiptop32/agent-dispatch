@@ -14,3 +14,4 @@ build/
 evals/reports/
 .pytest_cache/
 .ruff_cache/
+.idea/

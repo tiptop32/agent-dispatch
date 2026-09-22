@@ -138,3 +138,17 @@ async def test_codex_missing_binary_reports_unavailable(tmp_path):
         "codex", ExecutorSettings(adapter="codex", command="/nonexistent/codex")
     ).check()
     assert not result.available and result.error
+
+
+@pytest.mark.asyncio
+async def test_codex_passes_model_flag_when_configured(git_repo, tmp_path):
+    cap = tmp_path / "cap"
+    adapter = CodexAdapter(
+        "codex/luna",
+        ExecutorSettings(
+            adapter="codex", command=str(ROOT / "fakes/codex_ok.sh"), model="gpt-5.6-luna"
+        ),
+    )
+    await adapter.execute(ctx(git_repo, tmp_path, FAKE_CAPTURE=str(cap)))
+    args = (tmp_path / "cap.argv").read_text().splitlines()
+    assert args[-3:] == ["-m", "gpt-5.6-luna", "-"]

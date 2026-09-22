@@ -51,6 +51,7 @@ class CodexAdapter:
             str(schema_path),
             "-o",
             str(last_path),
+            *(["-m", self.settings.model] if self.settings.model else []),
             *self.settings.extra_args,
             "-",
         ]

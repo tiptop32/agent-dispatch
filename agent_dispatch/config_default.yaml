@@ -49,15 +49,7 @@ executors:
     extra_args: []
     enabled: true
     description: "OpenCode with Kimi K2.5: cheap, good for small well-specified edits, docs, boilerplate"
-  opencode/x5-code:
-    adapter: opencode
-    command: opencode
-    model: copilot/x5-airun-code-large-exp
-    extra_args: []
-    enabled: true
-    description: "OpenCode with corporate x5-airun code model: cheap internal model for routine edits with corporate data constraints"
 
 escalation:
   opencode/kimi: [codex, claude]
-  opencode/x5-code: [codex, claude]
   codex: [claude]

@@ -27,7 +27,7 @@ def _configure(
     claude_command: str = "claude",
 ):
     lines = []
-    for name in ("claude", "codex", "opencode/kimi", "opencode/x5-code"):
+    for name in ("claude", "codex", "opencode/kimi"):
         command = "/nonexistent" if name == broken else str(FAKE)
         lines.extend([f"  {name}:", f'    command: "{command}"'])
     (tmp_config_dir / "config.yaml").write_text(

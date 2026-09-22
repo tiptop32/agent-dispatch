@@ -22,7 +22,6 @@ def test_load_cases_has_twenty_rows_and_required_fields():
         "claude",
         "codex",
         "opencode/kimi",
-        "opencode/x5-code",
     }
     assert all(case["task"] and case["rationale"] for case in cases)
 
