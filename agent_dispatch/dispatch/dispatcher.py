@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_dispatch.config import Settings
+from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import build_task_package, render_prompt
 from agent_dispatch.executors.base import ExecutorAdapter, RunContext
 from agent_dispatch.executors.env import child_env
@@ -58,7 +60,7 @@ class Dispatcher:
     def _now() -> datetime:
         return datetime.now(UTC)
 
-    async def submit(self, req: DispatchRequest) -> TaskRecord:
+    async def submit(self, req: DispatchRequest, escalated_from: str | None = None) -> TaskRecord:
         task_id = uuid.uuid4().hex
         root = req.root_agent or req.source_agent
         log_path = self.settings.server.data_dir / "logs" / f"{task_id}.log"
@@ -66,7 +68,7 @@ class Dispatcher:
         record = TaskRecord(
             task_id=task_id,
             parent_task_id=req.parent_task_id,
-            escalated_from=None,
+            escalated_from=escalated_from,
             root_agent=root,
             source_agent=req.source_agent,
             hop=req.hop,
@@ -97,18 +99,34 @@ class Dispatcher:
         return await self.storage.get_task(task_id)
 
     async def wait(self, task_id: str, seconds: float) -> TaskRecord:
+        deadline = time.monotonic() + max(0.0, seconds)
         record = await self.get(task_id)
         if record is None:
             raise KeyError(task_id)
-        if record.status not in _FINAL and seconds > 0:
-            event = self._events.get(task_id)
-            if event is None:
+        if seconds <= 0:
+            # Нулевое ожидание: вернуть саму задачу, не следуя за эскалацией.
+            return record
+        visited = {record.task_id}
+        while True:
+            remaining = deadline - time.monotonic()
+            if record.status not in _FINAL and remaining > 0:
+                event = self._events.get(record.task_id)
+                if event is not None:
+                    try:
+                        await asyncio.wait_for(event.wait(), remaining)
+                    except TimeoutError:
+                        pass
+                record = await self.get(record.task_id) or record
+            if record.status not in _FINAL:
                 return record
-            try:
-                await asyncio.wait_for(event.wait(), seconds)
-            except TimeoutError:
-                pass
-        return await self.get(task_id)  # type: ignore[return-value]
+            child_id = record.result.meta.get("escalated_to") if record.result else None
+            if not child_id:
+                return record
+            child = await self.get(child_id)
+            if child is None or child.task_id in visited:
+                return record
+            visited.add(child.task_id)
+            record = child
 
     async def cancel(self, task_id: str, wait_seconds: float = 5.0) -> TaskRecord:
         record = await self.get(task_id)
@@ -157,15 +175,16 @@ class Dispatcher:
         return decision, events
 
     async def _decide(
-        self, req: DispatchRequest
+        self, req: DispatchRequest, *, is_escalation: bool = False
     ) -> tuple[RouteDecision, GuardEvent | None, list[GuardEvent], list[str]]:
         await self.availability.check_all()
         parent_exists = (
             await self.storage.task_exists(req.parent_task_id) if req.parent_task_id else False
         )
-        siblings = (
-            await self.storage.count_children(req.parent_task_id) if req.parent_task_id else 0
-        )
+        siblings = 0
+        if req.parent_task_id and not is_escalation:
+            # Ретраи эскалации не съедают квоту fan-out родителя, cancelled тоже.
+            siblings = await self.storage.count_children(req.parent_task_id, exclude_escalated=True)
         verdict = pre_guards(
             req, self.settings, self.availability.unavailable(), parent_exists, siblings
         )
@@ -269,12 +288,18 @@ class Dispatcher:
             record.status = TaskStatus.routing
             await self.storage.update_task(record)
             req = record.request
-            decision, guard, events, names = await self._decide(req)
+            decision, guard, events, names = await self._decide(
+                req, is_escalation=record.escalated_from is not None
+            )
             if guard and guard.reason != GuardReason.user_override:
                 await self._guard_failure(record, guard)
                 return
             if guard is not None:
                 events.append(guard)
+            if record.escalated_from is not None:
+                decision = decision.model_copy(
+                    update={"router": RouterKind.fallback, "reason": GuardReason.escalated}
+                )
             record.decision = decision
             await self.storage.add_decision(task_id, decision, names)
             for event in events:
@@ -348,6 +373,27 @@ class Dispatcher:
                         )
                     record.result = result
                     record.status, record.finished_at = TaskStatus(result.status), self._now()
+                    reason = should_escalate(result) if req.allow_escalation else None
+                    if reason is not None:
+                        tried = await self._escalation_chain(record)
+                        nxt = next_executor(decision.executor, self.settings, tried)
+                        if nxt is None:
+                            result.meta["escalation_chain"] = tried
+                            if result.status != "failed":
+                                result.status = "failed"
+                                result.error = f"escalation exhausted: {reason}"
+                                record.status = TaskStatus.failed
+                        else:
+                            await self.storage.add_event(
+                                task_id,
+                                "escalate",
+                                {"from": decision.executor, "to": nxt, "reason": reason},
+                            )
+                            child = await self.submit(
+                                req.model_copy(update={"executor": nxt}),
+                                escalated_from=task_id,
+                            )
+                            result.meta["escalated_to"] = child.task_id
                     await self.storage.add_event(
                         task_id,
                         "exit",
@@ -386,6 +432,23 @@ class Dispatcher:
                 event.set()
         finally:
             self._release_cwd_lock(record.request)
+
+    async def _escalation_chain(self, record: TaskRecord) -> list[str]:
+        chain: list[str] = []
+        current: TaskRecord | None = record
+        seen = {record.task_id}
+        for _ in range(10):
+            if current.decision is not None:
+                chain.append(current.decision.executor)
+            previous_id = current.escalated_from
+            if previous_id is None or previous_id in seen:
+                break
+            seen.add(previous_id)
+            current = await self.storage.get_task(previous_id)
+            if current is None:
+                break
+        chain.reverse()
+        return chain
 
     def _release_cwd_lock(self, req: DispatchRequest) -> None:
         """Убрать lock cwd из словаря, если он свободен и его никто не ждёт."""

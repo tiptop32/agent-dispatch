@@ -142,11 +142,12 @@ class Storage:
             is not None
         )
 
-    async def count_children(self, parent_task_id: str) -> int:
-        row = self._db.execute(
-            "SELECT COUNT(*) FROM tasks WHERE parent_task_id=? AND status != 'cancelled'",
-            (parent_task_id,),
-        ).fetchone()
+    async def count_children(self, parent_task_id: str, exclude_escalated: bool = False) -> int:
+        """Дети родителя без cancelled; с exclude_escalated не считаются ретраи эскалации."""
+        query = "SELECT COUNT(*) FROM tasks WHERE parent_task_id=? AND status != 'cancelled'"
+        if exclude_escalated:
+            query += " AND escalated_from IS NULL"
+        row = self._db.execute(query, (parent_task_id,)).fetchone()
         return int(row[0])
 
     async def ancestors(self, task_id: str) -> list[str]:

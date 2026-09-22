@@ -184,3 +184,15 @@ async def test_concurrent_inserts_are_not_lost(storage: Storage):
     tasks = [make_task() for _ in range(20)]
     await asyncio.gather(*(storage.insert_task(task) for task in tasks))
     assert len(await storage.list_tasks(limit=100)) == 20
+
+
+async def test_count_children_can_exclude_escalation_retries(storage: Storage):
+    parent = make_task()
+    await storage.insert_task(parent)
+    for escalated in (None, parent.task_id, None):
+        child = make_task(parent=parent.task_id)
+        child.escalated_from = escalated
+        await storage.insert_task(child)
+    await storage.insert_task(make_task(parent=parent.task_id, status="cancelled"))
+    assert await storage.count_children(parent.task_id) == 3
+    assert await storage.count_children(parent.task_id, exclude_escalated=True) == 2

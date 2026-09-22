@@ -562,14 +562,16 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [x] `mcp/autostart.py`: `ensure_daemon(settings, deadline_seconds=5.0, sleep=asyncio.sleep, popen=subprocess.Popen)`
 - [x] run tests - must pass before next task
 
+➕ run F (codex-flow 20260922-064950-85de): `Dispatcher.wait` следует за `meta.escalated_to` (кроме `seconds == 0`), ретраи эскалации не съедают `max_children` (`Storage.count_children(exclude_escalated=True)`), исчерпанная цепочка даёт `failed`; CLI `dispatch` опрашивает `status` после 202; doctor учитывает `router.backend`.
+
 ### Task 17: CLI (typer): serve, mcp, route, dispatch, status, cancel, executors, feedback, export
 
 **Files:**
 - Create: `agent_dispatch/cli.py`, `tests/test_cli.py`
 
-- [ ] тесты (`CliRunner`, HTTP замокан respx, `serve.json` в tmp): `route "fix tests"` печатает `executor:` и `confidence:`; `dispatch --executor opencode/kimi "x"` шлёт `executor`; `dispatch --wait 0` печатает `task_id`; `status <id>`; `cancel <id>`; `executors` таблица; `feedback <id> --outcome user_accepted`; `export --since 7d` пишет JSONL в stdout; демон недоступен → exit 2 с подсказкой; токен из `serve.json` уходит в Bearer
-- [ ] `cli.py`: команды через `DispatchClient`, `dispatch`/`route` зовут `ensure_daemon`
-- [ ] run tests - must pass before next task
+- [x] тесты (`CliRunner`, HTTP замокан respx, `serve.json` в tmp): `route "fix tests"` печатает `executor:` и `confidence:`; `dispatch --executor opencode/kimi "x"` шлёт `executor`; `dispatch --wait 0` печатает `task_id`; `status <id>`; `cancel <id>`; `executors` таблица; `feedback <id> --outcome user_accepted`; `export --since 7d` пишет JSONL в stdout; демон недоступен → exit 2 с подсказкой; токен из `serve.json` уходит в Bearer
+- [x] `cli.py`: команды через `DispatchClient`, `dispatch`/`route` зовут `ensure_daemon`
+- [x] run tests - must pass before next task
 
 ### Task 18: doctor
 
@@ -577,9 +579,9 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - Create: `agent_dispatch/doctor.py`, `tests/test_doctor.py`
 - Modify: `agent_dispatch/cli.py`
 
-- [ ] тесты (`command` каждого executor указывает на fake или на несуществующий путь, respx для `/health` и Jev): строки «config найден», «env: OPENROUTER_API_KEY задан/не задан» без значения, «демон жив/нет», по строке на executor с версией или ошибкой, «Jev: ok» только с `--online`; `--json` отдаёт структуру; exit 1, если хоть одна проверка красная; вывод не содержит значения ключа
-- [ ] `doctor.py`: `run_checks(settings, online: bool) -> list[Check]`; команда `doctor` в CLI
-- [ ] run tests - must pass before next task
+- [x] тесты (`command` каждого executor указывает на fake или на несуществующий путь, respx для `/health` и Jev): строки «config найден», «env: OPENROUTER_API_KEY задан/не задан» без значения, «демон жив/нет», по строке на executor с версией или ошибкой, «Jev: ok» только с `--online`; `--json` отдаёт структуру; exit 1, если хоть одна проверка красная; вывод не содержит значения ключа
+- [x] `doctor.py`: `run_checks(settings, online: bool) -> list[Check]`; команда `doctor` в CLI
+- [x] run tests - must pass before next task
 
 ### Task 19: Escalation chains (v0.3) поверх dispatcher
 
@@ -587,10 +589,10 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - Create: `agent_dispatch/dispatch/escalation.py`, `tests/test_escalation.py`
 - Modify: `agent_dispatch/dispatch/dispatcher.py`, `tests/test_dispatcher.py`
 
-- [ ] тесты: `kimi failed → codex completed` даёт две TaskRecord, вторая с `escalated_from` первой, тем же `parent_task_id` и `hop`, событие `escalate`; `needs_escalation=True` при `completed` эскалирует; `tests.result == failed` эскалирует; `allow_escalation=False` не эскалирует; цепочка исчерпана → финальный `failed` с `meta.escalation_chain`; executor без цепочки → без эскалации; эскалация не зовёт роутер; ребёнок эскалации не эскалирует повторно к уже пройденному executor
-- [ ] `escalation.next_executor(current, settings, tried) -> str | None`
-- [ ] интеграция в `Dispatcher._run`, `decision.reason=escalated`
-- [ ] run tests - must pass before next task
+- [x] тесты: `kimi failed → codex completed` даёт две TaskRecord, вторая с `escalated_from` первой, тем же `parent_task_id` и `hop`, событие `escalate`; `needs_escalation=True` при `completed` эскалирует; `tests.result == failed` эскалирует; `allow_escalation=False` не эскалирует; цепочка исчерпана → финальный `failed` с `meta.escalation_chain`; executor без цепочки → без эскалации; эскалация не зовёт роутер; ребёнок эскалации не эскалирует повторно к уже пройденному executor
+- [x] `escalation.next_executor(current, settings, tried) -> str | None`
+- [x] интеграция в `Dispatcher._run`, `decision.reason=escalated`
+- [x] run tests - must pass before next task
 
 ### Task 20: Evals: routing accuracy и smoke на живых CLI
 
