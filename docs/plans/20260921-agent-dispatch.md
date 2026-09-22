@@ -537,28 +537,30 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [x] `Dispatcher(settings, storage, adapters, availability, routers)`: `submit`, `wait`, `get`, `cancel`, `route_only`; семафор и per-cwd lock только для `hop == 0`
 - [x] run tests - must pass before next task
 
+➕ run E (codex-flow 20260922-055621-1515): mcp SDK 2.x (`MCPServer`, `ToolError`, `Client(InMemoryTransport)`), `POST /tasks` ждёт не дольше `MAX_WAIT_SECONDS=600`, lifespan зовёт `recover_stale`, `run_server` проверяет порт (`port_is_free`, IPv6, SO_REUSEADDR). Автостарт зовёт `python -m agent_dispatch.cli serve` (появится в Task 17).
+
 ### Task 15: HTTP API демона (FastAPI), токен, Host-check, команда serve
 
 **Files:**
 - Create: `agent_dispatch/api/__init__.py`, `agent_dispatch/api/app.py`, `agent_dispatch/api/routes.py`, `agent_dispatch/api/auth.py`, `agent_dispatch/server.py`, `agent_dispatch/serve_state.py`, `tests/test_api.py`, `tests/test_serve_state.py`
 
-- [ ] тесты API (httpx `ASGITransport`, fake-адаптеры): все эндпоинты из таблицы; без токена → 401; неверный `Host` → 421; `/health` без токена работает; `POST /tasks` невалидное тело → 422; `GET /tasks/unknown` → 404; `DELETE` завершённой → 409; `/route` пишет decision с `task_id NULL`; `/export` JSONL; `/executors` показывает `available`; `GET /tasks/{id}` у running-задачи отдаёт `log_tail` из существующего лог-файла
-- [ ] тесты `serve_state`: `write_state(data_dir, pid, port, token)` создаёт файл с правами 0600; `read_state`; `is_alive(state)` false для мёртвого pid; `clear_state`
-- [ ] `create_app(settings, dispatcher, storage, availability)`, lifespan открывает storage и прогревает кэш
-- [ ] `server.py`: `run_server(settings)` через `uvicorn.Server`, генерирует токен `secrets.token_urlsafe(32)`, пишет state, удаляет при выходе; отказ, если state живой
-- [ ] run tests - must pass before next task
+- [x] тесты API (httpx `ASGITransport`, fake-адаптеры): все эндпоинты из таблицы; без токена → 401; неверный `Host` → 421; `/health` без токена работает; `POST /tasks` невалидное тело → 422; `GET /tasks/unknown` → 404; `DELETE` завершённой → 409; `/route` пишет decision с `task_id NULL`; `/export` JSONL; `/executors` показывает `available`; `GET /tasks/{id}` у running-задачи отдаёт `log_tail` из существующего лог-файла
+- [x] тесты `serve_state`: `write_state(data_dir, pid, port, token)` создаёт файл с правами 0600; `read_state`; `is_alive(state)` false для мёртвого pid; `clear_state`
+- [x] `create_app(settings, dispatcher, storage, availability)`, lifespan открывает storage и прогревает кэш
+- [x] `server.py`: `run_server(settings)` через `uvicorn.Server`, генерирует токен `secrets.token_urlsafe(32)`, пишет state, удаляет при выходе; отказ, если state живой
+- [x] run tests - must pass before next task
 
 ### Task 16: MCP-прокси (stdio) и автостарт демона
 
 **Files:**
 - Create: `agent_dispatch/mcp/__init__.py`, `agent_dispatch/mcp/server.py`, `agent_dispatch/mcp/client.py`, `agent_dispatch/mcp/autostart.py`, `tests/test_mcp_server.py`, `tests/test_autostart.py`
 
-- [ ] тесты MCP через in-memory клиент SDK: `list_tools` ровно `route, dispatch, dispatch_to, status` с описаниями; `dispatch` подкладывает `parent_task_id/root_agent/hop` из env `AGENT_DISPATCH_*` (hop = `int(env)`, без env = 0) и `source_agent` из `AGENT_DISPATCH_SOURCE_AGENT`; HTTP замокан respx и получает правильное тело и Bearer; `wait_seconds` по умолчанию `mcp.wait_seconds`; ответ `running` содержит подсказку про `status`; ошибка демона → `isError=True`; за время теста в `sys.stdout` не попадает ничего, кроме MCP-транспорта (перехват `capsys`)
-- [ ] тесты autostart: живой `/health` → `Popen` не вызывался; мёртвый → `Popen` вызван с `stdin=DEVNULL`, `stdout` файл `serve.log`, `stderr=STDOUT`, `start_new_session=True`, затем ожидание `/health` с инжектированными `deadline_seconds=0.2, sleep`; таймаут → `DaemonUnavailable`
-- [ ] `mcp/client.py`: `DispatchClient(state)` над httpx, timeout = `wait_seconds + 30`
-- [ ] `mcp/server.py`: FastMCP `agent-dispatch`, логирование в stderr, четыре tool с описаниями из спеки (когда использовать, не ре-диспатчить делегированное)
-- [ ] `mcp/autostart.py`: `ensure_daemon(settings, deadline_seconds=5.0, sleep=asyncio.sleep, popen=subprocess.Popen)`
-- [ ] run tests - must pass before next task
+- [x] тесты MCP через in-memory клиент SDK: `list_tools` ровно `route, dispatch, dispatch_to, status` с описаниями; `dispatch` подкладывает `parent_task_id/root_agent/hop` из env `AGENT_DISPATCH_*` (hop = `int(env)`, без env = 0) и `source_agent` из `AGENT_DISPATCH_SOURCE_AGENT`; HTTP замокан respx и получает правильное тело и Bearer; `wait_seconds` по умолчанию `mcp.wait_seconds`; ответ `running` содержит подсказку про `status`; ошибка демона → `isError=True`; за время теста в `sys.stdout` не попадает ничего, кроме MCP-транспорта (перехват `capsys`)
+- [x] тесты autostart: живой `/health` → `Popen` не вызывался; мёртвый → `Popen` вызван с `stdin=DEVNULL`, `stdout` файл `serve.log`, `stderr=STDOUT`, `start_new_session=True`, затем ожидание `/health` с инжектированными `deadline_seconds=0.2, sleep`; таймаут → `DaemonUnavailable`
+- [x] `mcp/client.py`: `DispatchClient(state)` над httpx, timeout = `wait_seconds + 30`
+- [x] `mcp/server.py`: FastMCP `agent-dispatch`, логирование в stderr, четыре tool с описаниями из спеки (когда использовать, не ре-диспатчить делегированное)
+- [x] `mcp/autostart.py`: `ensure_daemon(settings, deadline_seconds=5.0, sleep=asyncio.sleep, popen=subprocess.Popen)`
+- [x] run tests - must pass before next task
 
 ### Task 17: CLI (typer): serve, mcp, route, dispatch, status, cancel, executors, feedback, export
 
