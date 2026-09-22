@@ -86,6 +86,42 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
             None,
             id="completed",
         ),
+        pytest.param(
+            # Исполнитель не отчитался и ничего не тронул: работы нет, и без
+            # эскалации задача застревает навсегда.
+            ExecutionResult(
+                status="partial",
+                executor="codex",
+                model=None,
+                summary="raw stdout tail",
+                changed_files=[],
+                meta={"parse_error": "no result block"},
+            ),
+            "no_result",
+            id="partial-without-report-or-changes",
+        ),
+        pytest.param(
+            # Отчёт не разобрался, но работа есть: судить о ней должен вызывающий
+            # по дифу, повторный запуск лёг бы поверх.
+            ExecutionResult(
+                status="partial",
+                executor="codex",
+                model=None,
+                summary="raw stdout tail",
+                changed_files=["src/a.py", "tests/test_a.py"],
+                meta={"parse_error": "no result block"},
+            ),
+            None,
+            id="partial-without-report-but-with-changes",
+        ),
+        pytest.param(
+            # Честный самоотчёт «сделал частично» это не потеря результата.
+            ExecutionResult(
+                status="partial", executor="codex", model=None, summary="did half of it"
+            ),
+            None,
+            id="partial-self-reported",
+        ),
     ],
 )
 def test_should_escalate_returns_expected_reason(result, expected):

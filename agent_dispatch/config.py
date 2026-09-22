@@ -58,6 +58,12 @@ class RoutingSettings(_ConfigModel):
     fallback_executor: str = "codex"
     max_hops: int = Field(2, ge=0)
     max_children: int = Field(2, ge=0)
+    #: Порог уверенности ответа Jev о корпоративных данных. Ответ ниже порога не
+    #: сужает пул до периметра. `noul`-уверенность это |p - 0.5| * 2, поэтому 0.06
+    #: значит «модель не знает». 0 — доверять любому ответу, как было раньше.
+    #: Поднимая порог, вы разрешаете отправлять наружу задачи, которые Jev счёл
+    #: корпоративными неуверенно: это ослабление периметра данных, решение ваше.
+    corporate_min_confidence: float = Field(0.0, ge=0.0, le=1.0)
     exclude_source_agent: bool = True
     default_timeout_seconds: int = Field(1800, ge=0)
     availability_ttl_seconds: int = Field(60, ge=0)

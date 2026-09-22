@@ -11,6 +11,15 @@ def should_escalate(result: ExecutionResult) -> str | None:
         return "needs_escalation"
     if result.tests is not None and result.tests.result == "failed":
         return "tests_failed"
+    if result.status == "partial" and result.meta.get("parse_error") and not result.changed_files:
+        # Исполнитель не отдал отчёт и не тронул ни одного файла: работы нет.
+        # Раньше это был тупик — `partial` не поднимал цепочку, и задача
+        # застревала навсегда, сколько её ни переспрашивай.
+        #
+        # Непустой `changed_files` сюда не попадает намеренно: там работа есть,
+        # просто отчёт не разобрался. Повторный запуск лёг бы поверх неё, а
+        # судить о ней должен вызывающий по дифу.
+        return "no_result"
     return None
 
 

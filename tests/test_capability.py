@@ -48,6 +48,23 @@ def test_missing_tier_falls_upward_then_downward():
     assert select("strong", only_fast).executor == "cheap"
 
 
+def test_corporate_note_carries_the_confidence_so_a_coin_flip_is_visible():
+    selection = select("fast", FULL, corporate=True, corporate_confidence=0.06)
+
+    assert any("confidence 0.06" in note for note in selection.notes)
+
+
+def test_perimeter_without_the_requested_level_says_so_instead_of_silently_downgrading():
+    # Внутри периметра только fast, а задача просит strong: раньше она молча
+    # уезжала на соседний тир, и понять это по решению было нельзя.
+    pool = {"internal": ex("opencode", "fast", corporate=True), "opus": ex("claude", "strong")}
+
+    selection = select("strong", pool, corporate=True)
+
+    assert selection.executor == "internal"
+    assert any("requested level 'strong'" in note for note in selection.notes)
+
+
 def test_corporate_data_restricts_the_pool():
     selection = select("fast", FULL, corporate=True)
     assert selection.executor == "internal"

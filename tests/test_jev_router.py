@@ -194,6 +194,74 @@ async def test_corporate_answer_keeps_the_task_inside_the_perimeter():
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_unsure_corporate_answer_below_the_threshold_does_not_narrow_the_perimeter():
+    # noul 0.53 это уверенность 0.06 — монетка. С поднятым порогом такой ответ
+    # не должен вслепую отсекать весь пул до периметра.
+    s = Settings.model_validate(
+        {
+            "secrets": {"OPENROUTER_API_KEY": "k"},
+            "executors": {"codex": {"adapter": "codex"}},
+            "routing": {"corporate_min_confidence": 0.5},
+        }
+    )
+    candidates = {
+        "external": ExecutorSettings(adapter="claude", tier="strong"),
+        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+    }
+    payload = {
+        "answers": {
+            "capability": {
+                "type": "choice",
+                "choice": "strong",
+                "probabilities": {"strong": 1},
+                "confidence": 0.95,
+            },
+            "corporate_data": {"type": "noul", "noul": 0.53},
+        }
+    }
+    respx.post(s.router.jev.base_url).mock(return_value=httpx.Response(200, json=payload))
+    async with httpx.AsyncClient() as client:
+        result = await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), candidates)
+
+    assert result.executor == "external"
+    assert any("perimeter filter was not applied" in n for n in result.meta["selection_notes"])
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_confident_corporate_answer_still_narrows_the_perimeter_at_the_same_threshold():
+    s = Settings.model_validate(
+        {
+            "secrets": {"OPENROUTER_API_KEY": "k"},
+            "executors": {"codex": {"adapter": "codex"}},
+            "routing": {"corporate_min_confidence": 0.5},
+        }
+    )
+    candidates = {
+        "external": ExecutorSettings(adapter="claude", tier="strong"),
+        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+    }
+    payload = {
+        "answers": {
+            "capability": {
+                "type": "choice",
+                "choice": "strong",
+                "probabilities": {"strong": 1},
+                "confidence": 0.95,
+            },
+            "corporate_data": {"type": "noul", "noul": 0.95},
+        }
+    }
+    respx.post(s.router.jev.base_url).mock(return_value=httpx.Response(200, json=payload))
+    async with httpx.AsyncClient() as client:
+        result = await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), candidates)
+
+    assert result.executor == "internal"
+    assert any("requested level 'strong'" in n for n in result.meta["selection_notes"])
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_judgment_answer_sends_the_task_to_a_reasoning_agent():
     s = settings()
     candidates = {

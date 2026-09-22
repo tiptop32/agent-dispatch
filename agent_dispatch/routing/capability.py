@@ -70,18 +70,26 @@ def _pick(pool: dict[str, ExecutorSettings], tier: str) -> str:
     return next(iter(pool))
 
 
+def _at(confidence: float | None) -> str:
+    return "" if confidence is None else f" (confidence {confidence:.2f})"
+
+
 def select(
     capability: str,
     candidates: dict[str, ExecutorSettings],
     *,
     judgment: bool = False,
     corporate: bool = False,
+    corporate_confidence: float | None = None,
     probabilities: dict[str, float] | None = None,
 ) -> Selection:
     """Выбрать исполнителя под запрошенную capability.
 
     Порядок сужения: периметр корпоративных данных, потребность в суждении, тир.
     Внутри равных побеждает тот, кто идёт раньше в конфиге.
+
+    `corporate_confidence` только попадает в notes: решение сузить периметр
+    принимается снаружи, здесь оно уже готово в `corporate`.
     """
     if not candidates:
         raise ValueError("no candidates")
@@ -91,9 +99,23 @@ def select(
     corporate_pool = {name: s for name, s in pool.items() if s.corporate}
     if corporate and corporate_pool:
         pool = corporate_pool
-        notes.append("task involves corporate data; only in-perimeter executors were considered")
+        notes.append(
+            f"task involves corporate data{_at(corporate_confidence)}; "
+            "only in-perimeter executors were considered"
+        )
+        tiers = {settings.tier for settings in pool.values()}
+        if capability in TIERS and capability not in tiers:
+            # Периметр может не содержать нужного уровня: задача уедет к
+            # соседнему тиру, и об этом надо сказать, а не молча понизить.
+            notes.append(
+                f"no in-perimeter executor at the requested level '{capability}'; "
+                f"available inside the perimeter: {', '.join(sorted(tiers))}"
+            )
     elif corporate:
-        notes.append("task involves corporate data but no in-perimeter executor is available")
+        notes.append(
+            f"task involves corporate data{_at(corporate_confidence)} "
+            "but no in-perimeter executor is available"
+        )
 
     if judgment:
         judgment_pool = {name: s for name, s in pool.items() if s.adapter == JUDGMENT_ADAPTER}

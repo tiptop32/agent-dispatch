@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from agent_dispatch.config import ExecutorSettings, Settings
-from agent_dispatch.models import DispatchRequest, RouteDecision, RouterKind
+from agent_dispatch.models import DispatchRequest, Judgment, RouteDecision, RouterKind
 
 from .base import RouterError
 from .capability import has_corporate, select, tiers_present
@@ -17,6 +17,25 @@ from .questions import build_questions, build_state, parse_answers
 
 class JevRouter:
     name = "jev"
+
+    def _corporate_verdict(self, corporate: Judgment | None) -> tuple[bool, str | None]:
+        """Сужать ли пул до периметра, и что об этом сказать.
+
+        `noul`-ответ вида «скорее да» с уверенностью 0.06 это монетка, а не
+        решение, и отсекать по нему весь пул вслепую нельзя. Порог живёт в
+        `routing.corporate_min_confidence` и по умолчанию равен нулю: ослабление
+        периметра данных должен включить человек, а не дефолт.
+        """
+        if corporate is None or not corporate.value:
+            return False, None
+        threshold = self.settings.routing.corporate_min_confidence
+        if corporate.confidence >= threshold:
+            return True, None
+        return False, (
+            f"corporate_data answered yes but only at confidence {corporate.confidence:.2f}, "
+            f"below routing.corporate_min_confidence={threshold:.2f}: "
+            "the perimeter filter was not applied"
+        )
 
     def __init__(
         self,
@@ -63,13 +82,17 @@ class JevRouter:
                 )
                 judgment = judgments.get("judgment")
                 corporate = judgments.get("corporate_data")
+                narrow, extra_note = self._corporate_verdict(corporate)
                 selection = select(
                     capability,
                     candidates,
                     judgment=bool(judgment and judgment.value),
-                    corporate=bool(corporate and corporate.value),
+                    corporate=narrow,
+                    corporate_confidence=corporate.confidence if corporate else None,
                     probabilities=tier_scores,
                 )
+                if extra_note:
+                    selection.notes.append(extra_note)
                 usage = payload.get("usage") or {}
                 meta: dict[str, Any] = {
                     "jev_id": payload.get("id"),
