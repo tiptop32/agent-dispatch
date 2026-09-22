@@ -113,6 +113,87 @@ def test_remove_keeps_the_branch_when_the_result_was_not_integrated(git_repo: Pa
     assert "agent-dispatch/t" in git(git_repo, "branch", "--list", "agent-dispatch/t")
 
 
+def test_commit_puts_the_work_on_the_branch(git_repo: Path, tmp_path: Path):
+    tree = worktree.create(git_repo, tmp_path / "wt" / "t", "agent-dispatch/t")
+    (tree.path / "a.py").write_text("x = 2\n")
+    (tree.path / "new.py").write_text("y = 3\n")
+
+    sha = worktree.commit(tree, "agent-dispatch: task deadbeef")
+
+    assert sha and len(sha) == 40
+    assert git(tree.path, "rev-parse", "HEAD").strip() == sha
+    assert git(tree.path, "status", "--porcelain").strip() == ""
+    assert git(tree.path, "rev-list", "--count", f"{tree.base}..HEAD").strip() == "1"
+
+
+def test_commit_returns_none_when_the_executor_changed_nothing(git_repo: Path, tmp_path: Path):
+    tree = worktree.create(git_repo, tmp_path / "wt" / "t", "agent-dispatch/t")
+
+    assert worktree.commit(tree, "empty") is None
+    assert git(tree.path, "rev-parse", "HEAD").strip() == tree.base
+
+
+def test_commit_does_not_run_repository_hooks(git_repo: Path, tmp_path: Path):
+    # Служебный коммит на черновой ветке не должен зависеть от pre-commit репы:
+    # тот гоняет тесты и падал бы на любой недоделанной задаче плана.
+    hook = git_repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    tree = worktree.create(git_repo, tmp_path / "wt" / "t", "agent-dispatch/t")
+    (tree.path / "a.py").write_text("x = 2\n")
+
+    assert worktree.commit(tree, "despite the hook") is not None
+
+
+def test_patch_is_the_same_before_and_after_the_commit(git_repo: Path, tmp_path: Path):
+    # Патч отсчитывается от базы, а не от HEAD: иначе промежуточный коммит
+    # съедал бы его целиком и в рабочую копию ничего не возвращалось.
+    tree = worktree.create(git_repo, tmp_path / "wt" / "t", "agent-dispatch/t")
+    (tree.path / "a.py").write_text("x = 2\n")
+    (tree.path / "new.py").write_text("y = 3\n")
+
+    before = worktree.build_patch(tree)
+    worktree.commit(tree, "wip")
+    after = worktree.build_patch(tree)
+
+    assert before == after
+    assert "new.py" in after
+
+
+def test_committed_work_survives_removing_the_worktree(git_repo: Path, tmp_path: Path):
+    tree = worktree.create(git_repo, tmp_path / "wt" / "t", "agent-dispatch/t")
+    (tree.path / "a.py").write_text("x = 2\n")
+    sha = worktree.commit(tree, "wip")
+
+    worktree.remove(tree, keep_branch=True)
+
+    assert not tree.path.exists()
+    assert git(git_repo, "rev-parse", "agent-dispatch/t").strip() == sha
+    assert git(git_repo, "show", f"{sha}:a.py") == "x = 2\n"
+
+
+def test_list_branches_shows_branches_whose_worktree_is_gone(git_repo: Path, tmp_path: Path):
+    attached = worktree.create(git_repo, tmp_path / "wt" / "kept", "agent-dispatch/kept")
+    orphan = worktree.create(git_repo, tmp_path / "wt" / "gone", "agent-dispatch/gone")
+    (orphan.path / "a.py").write_text("x = 2\n")
+    worktree.commit(orphan, "wip")
+    worktree.remove(orphan, keep_branch=True)
+
+    assert worktree.list_branches(git_repo, "agent-dispatch") == ["agent-dispatch/gone"]
+    assert attached.branch not in worktree.list_branches(git_repo, "agent-dispatch")
+
+
+def test_delete_branch_removes_an_orphan(git_repo: Path, tmp_path: Path):
+    tree = worktree.create(git_repo, tmp_path / "wt" / "t", "agent-dispatch/t")
+    (tree.path / "a.py").write_text("x = 2\n")
+    worktree.commit(tree, "wip")
+    worktree.remove(tree, keep_branch=True)
+
+    worktree.delete_branch(git_repo, "agent-dispatch/t")
+
+    assert worktree.list_branches(git_repo, "agent-dispatch") == []
+
+
 def test_list_worktrees_shows_only_ours(git_repo: Path, tmp_path: Path):
     worktree.create(git_repo, tmp_path / "wt" / "mine", "agent-dispatch/mine")
     subprocess.run(

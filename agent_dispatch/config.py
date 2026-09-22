@@ -75,7 +75,10 @@ class ExecutionSettings(_ConfigModel):
     workspace_mode: Literal["in_place", "worktree"] = "in_place"
     worktree_dir: Path | None = None
     branch_prefix: str = "agent-dispatch"
-    integrate: Literal["apply", "manual"] = "apply"
+    #: apply — вернуть результат патчем в рабочую копию; branch — оставить его
+    #: коммитом на ветке задачи, рабочую копию не трогать; manual — оставить и
+    #: ветку, и worktree, и файл патча, решает человек.
+    integrate: Literal["apply", "manual", "branch"] = "apply"
     keep_worktrees: bool = False
 
 

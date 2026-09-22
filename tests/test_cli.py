@@ -278,6 +278,49 @@ def test_serve_state_token_is_sent_as_bearer(tmp_config_dir):
     assert request.calls[0].request.headers["authorization"] == "Bearer from-state"
 
 
+def test_worktrees_lists_trees_and_branches_left_by_branch_mode(tmp_config_dir, git_repo, tmp_path):
+    from agent_dispatch.executors import worktree
+
+    attached = worktree.create(git_repo, tmp_path / "wt" / "kept", "agent-dispatch/kept")
+    orphan = worktree.create(git_repo, tmp_path / "wt" / "gone", "agent-dispatch/gone")
+    (orphan.path / "a.py").write_text("x = 2\n")
+    worktree.commit(orphan, "wip")
+    worktree.remove(orphan, keep_branch=True)
+
+    result = runner.invoke(app, ["worktrees", "--cwd", str(git_repo)])
+
+    assert result.exit_code == 0
+    assert str(attached.path) in result.stdout
+    assert "agent-dispatch/gone" in result.stdout
+    assert "(no worktree)" in result.stdout
+
+
+def test_worktrees_clean_with_delete_branches_removes_orphan_branches(
+    tmp_config_dir, git_repo, tmp_path
+):
+    from agent_dispatch.executors import worktree
+
+    orphan = worktree.create(git_repo, tmp_path / "wt" / "gone", "agent-dispatch/gone")
+    (orphan.path / "a.py").write_text("x = 2\n")
+    worktree.commit(orphan, "wip")
+    worktree.remove(orphan, keep_branch=True)
+
+    result = runner.invoke(
+        app, ["worktrees", "--cwd", str(git_repo), "--clean", "--delete-branches"]
+    )
+
+    assert result.exit_code == 0
+    assert "deleted" in result.stdout
+    assert worktree.list_branches(git_repo, "agent-dispatch") == []
+
+
+def test_worktrees_reports_an_empty_repository(tmp_config_dir, git_repo):
+    result = runner.invoke(app, ["worktrees", "--cwd", str(git_repo)])
+
+    assert result.exit_code == 0
+    assert "no agent-dispatch worktrees or branches" in result.stdout
+
+
 def test_help_lists_all_commands():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0

@@ -260,12 +260,15 @@ def worktrees(
     ),
 ) -> None:
     settings = load_settings()
+    prefix = settings.execution.branch_prefix
     try:
-        trees = worktree.list_worktrees(cwd, settings.execution.branch_prefix)
+        trees = worktree.list_worktrees(cwd, prefix)
+        # Ветки без каталога остаются от `integrate: branch`, их тоже надо показать.
+        orphans = worktree.list_branches(cwd, prefix)
     except worktree.WorktreeError as error:
         raise typer.BadParameter(str(error), param_hint="--cwd") from error
-    if not trees:
-        typer.echo("no agent-dispatch worktrees")
+    if not trees and not orphans:
+        typer.echo("no agent-dispatch worktrees or branches")
         return
     for tree in trees:
         if clean:
@@ -277,6 +280,17 @@ def worktrees(
             typer.echo(f"{tree.path}\tremoved\t{tree.branch}")
         else:
             typer.echo(f"{tree.path}\t{tree.branch}")
+    repo = worktree.repo_root(cwd)
+    for branch in orphans:
+        if clean and not keep_branches:
+            try:
+                worktree.delete_branch(repo, branch)
+            except worktree.WorktreeError as error:
+                typer.echo(f"(no worktree)\tERROR\t{error}")
+                continue
+            typer.echo(f"(no worktree)\tdeleted\t{branch}")
+        else:
+            typer.echo(f"(no worktree)\t{branch}")
 
 
 @app.command(help="Record feedback for a task.")

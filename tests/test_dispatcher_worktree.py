@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -15,12 +16,19 @@ from agent_dispatch.config import (
     Settings,
 )
 from agent_dispatch.dispatch.dispatcher import Dispatcher
+from agent_dispatch.executors import worktree
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import DispatchRequest
 from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
 
 WAIT = 5.0
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout
 
 
 async def _make(tmp_path: Path, **execution):
@@ -104,6 +112,51 @@ async def test_manual_integration_leaves_the_patch_and_does_not_touch_the_workin
     assert (git_repo / "a.py").read_text() == "x = 1\n"
     assert done.result.meta["integrated"] is False
     assert done.result.meta["worktree"] and done.result.meta["branch"]
+    # Патч обязан лежать на диске: режим просит отдать его человеку.
+    assert Path(done.result.meta["patch"]).is_file()  # noqa: ASYNC240
+    assert "a.py" in Path(done.result.meta["patch"]).read_text()  # noqa: ASYNC240
+
+
+@pytest.mark.asyncio
+async def test_result_is_committed_on_the_task_branch(tmp_path, git_repo):
+    _, _, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].on_execute = _writes("x = 2\n")
+
+    record = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    sha = done.result.meta["commit"]
+    assert len(sha) == 40
+    assert _git(git_repo, "show", f"{sha}:a.py") == "x = 2\n"
+
+
+@pytest.mark.asyncio
+async def test_branch_mode_keeps_the_branch_and_leaves_the_working_copy_alone(tmp_path, git_repo):
+    _, _, adapters, dispatcher = await _make(tmp_path, integrate="branch")
+    adapters["codex"].on_execute = _writes("x = 2\n")
+
+    record = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    meta = done.result.meta
+    assert meta["integrated"] is False
+    assert (git_repo / "a.py").read_text() == "x = 1\n"
+    # Каталог убран, результат остался коммитом на ветке.
+    assert "worktree" not in meta
+    assert _git(git_repo, "rev-parse", meta["branch"]).strip() == meta["commit"]
+    assert _git(git_repo, "show", f"{meta['commit']}:a.py") == "x = 2\n"
+    assert worktree.list_branches(git_repo, "agent-dispatch") == [meta["branch"]]
+
+
+@pytest.mark.asyncio
+async def test_empty_run_leaves_no_branch_behind(tmp_path, git_repo):
+    _, _, _, dispatcher = await _make(tmp_path, integrate="branch")
+
+    record = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    assert done.result.meta["integrated"] is True
+    assert worktree.list_branches(git_repo, "agent-dispatch") == []
 
 
 @pytest.mark.asyncio

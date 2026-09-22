@@ -20,6 +20,9 @@
 - Jev выбирает уровень работы (`capability`: fast/balanced/strong), а не имя модели: имена неразличимы для модели и дают плоское распределение. Соответствие уровня и исполнителя живёт в `routing/capability.py` и поле `tier` конфига.
 - `corporate: true` у исполнителя это периметр данных, а не цена: он выигрывает у `judgment` при выборе.
 - В режиме `execution.workspace_mode: worktree` исполнитель работает в отдельном git worktree от HEAD, а результат возвращается патчем; lock на `cwd` берётся только на время интеграции.
+- Исполнитель не коммитит (запрещено в Task Package), коммитит демон: `worktree.commit` на ветке задачи, с `--no-verify`. Хуки репозитория на служебном коммите не гоняются осознанно — pre-commit с полным прогоном тестов падал бы на недоделанной задаче. Гейт — коммит вызывающего после ревью дифа.
+- `worktree.build_patch` считает диф от `Worktree.base`, а не от HEAD: после промежуточного коммита `diff --cached HEAD` вернул бы пустоту (есть тест на равенство патча до и после коммита).
+- `integrate: branch` оставляет ветку без worktree. Такие ветки показывает `worktree.list_branches`, иначе они копились бы незаметно.
 - `config.example.yaml` равен `agent_dispatch/config_default.yaml` (есть тест).
 - Фикстуры: `tests/fixtures/jev/` (живые ответы Jev), `tests/fixtures/agent_output/` (живые выводы claude/codex/opencode), fake-CLI в `tests/fakes/`. Session-фикстура прогревает fake-скрипты (первый exec на macOS медленный).
 - Codex strict-schema: `schemas/agent_result.strict.schema.json`, обычную схему Codex отвергает.

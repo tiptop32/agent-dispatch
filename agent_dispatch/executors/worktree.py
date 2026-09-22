@@ -25,12 +25,28 @@ class Worktree:
     path: Path
     branch: str
     repo: Path
+    #: Коммит, от которого отпочковано дерево. Патч считается от него, а не от
+    #: HEAD, поэтому он одинаков и до промежуточного коммита, и после него.
+    #: Пустая строка у деревьев, найденных через `list_worktrees`: там базу взять
+    #: неоткуда, и патч возвращается к отсчёту от HEAD.
+    base: str = ""
 
 
 def _git(args: list[str], cwd: str | Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args], cwd=cwd, env=git_env(), capture_output=True, text=True, check=False
     )
+
+
+def _identity(cwd: str | Path) -> list[str]:
+    """`-c user.*`, только когда личность коммитера в репозитории не настроена.
+
+    Демон коммитит в чужих репозиториях: если у пользователя личность задана,
+    коммит должен остаться за ним, а не за AgentDispatch.
+    """
+    if _git(["config", "user.email"], cwd).stdout.strip():
+        return []
+    return ["-c", "user.name=AgentDispatch", "-c", "user.email=agent-dispatch@localhost"]
 
 
 def repo_root(cwd: str | Path) -> Path:
@@ -47,19 +63,49 @@ def create(cwd: str | Path, directory: Path, branch: str) -> Worktree:
     result = _git(["worktree", "add", "-b", branch, str(directory), "HEAD"], root)
     if result.returncode != 0:
         raise WorktreeError(result.stderr.strip() or "git worktree add failed")
-    return Worktree(path=directory, branch=branch, repo=root)
+    base = _git(["rev-parse", "HEAD"], directory)
+    return Worktree(path=directory, branch=branch, repo=root, base=base.stdout.strip())
+
+
+def commit(worktree: Worktree, message: str) -> str | None:
+    """Закоммитить работу исполнителя на ветку worktree. SHA, либо None если нечего.
+
+    Коммит делает результат долговечным: он переживает и неудачную интеграцию, и
+    уборку каталога, а `git worktree remove` перестаёт зависеть от `--force`.
+
+    Хуки не запускаются намеренно. Это служебный коммит на черновой ветке, а
+    pre-commit репозитория обычно гоняет полный прогон тестов и падал бы на любой
+    честно недоделанной задаче плана. Настоящий гейт — коммит вызывающего после
+    того, как он прочитал диф.
+    """
+    add = _git(["add", "-A"], worktree.path)
+    if add.returncode != 0:
+        raise WorktreeError(add.stderr.strip() or "git add failed")
+    if _git(["diff", "--cached", "--quiet"], worktree.path).returncode == 0:
+        return None
+    result = _git(
+        [*_identity(worktree.path), "commit", "--no-verify", "-m", message], worktree.path
+    )
+    if result.returncode != 0:
+        raise WorktreeError(result.stderr.strip() or "git commit failed")
+    head = _git(["rev-parse", "HEAD"], worktree.path)
+    if head.returncode != 0:
+        raise WorktreeError(head.stderr.strip() or "git rev-parse failed")
+    return head.stdout.strip()
 
 
 def build_patch(worktree: Worktree) -> str:
     """Все изменения worktree одним патчем, включая новые файлы.
 
-    Файлы добавляются в индекс worktree, поэтому `diff --cached` видит и
-    неотслеживаемые; индекс worktree свой и на исходную копию не влияет.
+    Файлы добавляются в индекс worktree, поэтому диф видит и неотслеживаемые;
+    индекс worktree свой и на исходную копию не влияет. Отсчёт идёт от базового
+    коммита, а не от HEAD, поэтому патч одинаков до промежуточного коммита и
+    после: `diff --cached HEAD` после коммита вернул бы пустоту.
     """
     add = _git(["add", "-A"], worktree.path)
     if add.returncode != 0:
         raise WorktreeError(add.stderr.strip() or "git add failed")
-    diff = _git(["diff", "--cached", "--binary", "HEAD"], worktree.path)
+    diff = _git(["diff", "--binary", worktree.base or "HEAD"], worktree.path)
     if diff.returncode != 0:
         raise WorktreeError(diff.stderr.strip() or "git diff failed")
     return diff.stdout
@@ -83,6 +129,27 @@ def remove(worktree: Worktree, *, keep_branch: bool) -> None:
         raise WorktreeError(result.stderr.strip() or "git worktree remove failed")
     if not keep_branch:
         _git(["branch", "-D", worktree.branch], worktree.repo)
+
+
+def delete_branch(repo: Path, branch: str) -> None:
+    result = _git(["branch", "-D", branch], repo)
+    if result.returncode != 0:
+        raise WorktreeError(result.stderr.strip() or "git branch -D failed")
+
+
+def list_branches(cwd: str | Path, prefix: str) -> list[str]:
+    """Ветки AgentDispatch, у которых уже нет worktree.
+
+    Их оставляет режим `integrate: branch`: каталог убран, результат живёт
+    коммитом на ветке. Без этого списка такие ветки копились бы незаметно.
+    """
+    root = repo_root(cwd)
+    result = _git(["branch", "--list", f"{prefix}/*", "--format=%(refname:short)"], root)
+    if result.returncode != 0:
+        raise WorktreeError(result.stderr.strip() or "git branch failed")
+    attached = {tree.branch for tree in list_worktrees(root, prefix)}
+    names = (line.strip() for line in result.stdout.splitlines())
+    return [name for name in names if name and name not in attached]
 
 
 def list_worktrees(cwd: str | Path, prefix: str) -> list[Worktree]:

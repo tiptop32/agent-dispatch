@@ -34,7 +34,7 @@ execution:
   workspace_mode: in_place    # worktree: каждому исполнителю свой git worktree
   worktree_dir: null          # по умолчанию <data_dir>/worktrees
   branch_prefix: agent-dispatch
-  integrate: apply            # apply: вернуть патч в рабочую копию; manual: оставить ветку
+  integrate: apply            # apply: патч в рабочую копию; branch: только ветка; manual: ничего не трогать
   keep_worktrees: false
 
 executors:

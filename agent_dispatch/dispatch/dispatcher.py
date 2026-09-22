@@ -488,33 +488,52 @@ class Dispatcher:
         result: ExecutionResult,
         task_id: str,
     ) -> None:
-        """Перенести результат из worktree в рабочую копию и прибрать за собой.
+        """Закоммитить результат на ветке worktree и перенести его в рабочую копию.
 
-        Патч применяется под тем же lock, что и обычный запуск in_place, иначе две
-        параллельные интеграции наложатся друг на друга. Если патч не лёг, worktree
-        и ветка остаются: их видно в `agent-dispatch worktrees`.
+        Промежуточный коммит делает работу исполнителя долговечной: она переживает
+        и неудачную интеграцию, и уборку каталога. Патч применяется под тем же lock,
+        что и обычный запуск in_place, иначе две параллельные интеграции наложатся
+        друг на друга. Если патч не лёг, worktree и ветка остаются: их видно в
+        `agent-dispatch worktrees`.
         """
         result.meta["worktree"] = str(tree.path)
         result.meta["branch"] = tree.branch
         execution = self.settings.execution
+        try:
+            sha = await asyncio.to_thread(
+                worktree.commit, tree, f"agent-dispatch: task {task_id[:8]}"
+            )
+        except worktree.WorktreeError as exc:
+            # Работа цела в worktree, поэтому дерево остаётся вместе с ней.
+            result.meta["integrated"] = False
+            result.meta["integration_error"] = str(exc)
+            return
+        if sha is None:
+            result.meta["integrated"] = True
+            if not execution.keep_worktrees:
+                await self._drop_worktree(tree, keep_branch=False, result=result)
+            return
+        result.meta["commit"] = sha
         try:
             patch = await asyncio.to_thread(worktree.build_patch, tree)
         except worktree.WorktreeError as exc:
             result.meta["integrated"] = False
             result.meta["integration_error"] = str(exc)
             return
-        if not patch.strip():
-            result.meta["integrated"] = True
-            if not execution.keep_worktrees:
-                await self._drop_worktree(tree, keep_branch=False, result=result)
-            return
-        if execution.integrate != "apply":
-            result.meta["integrated"] = False
-            return
         patch_path = self.settings.server.data_dir / "patches" / f"{task_id}.patch"
         await asyncio.to_thread(patch_path.parent.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(patch_path.write_text, patch)
         result.meta["patch"] = str(patch_path)
+        if execution.integrate == "branch":
+            # Ветка с коммитом и есть результат: рабочую копию не трогаем,
+            # каталог можно убрать, работа останется на ветке.
+            result.meta["integrated"] = False
+            if not execution.keep_worktrees:
+                await self._drop_worktree(tree, keep_branch=True, result=result)
+            return
+        if execution.integrate != "apply":
+            result.meta["integrated"] = False
+            return
         try:
             async with self._cwd_lock(req.cwd):
                 await asyncio.to_thread(worktree.apply_patch, req.cwd, patch_path)
