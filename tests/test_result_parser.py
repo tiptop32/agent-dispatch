@@ -129,3 +129,25 @@ def test_normalize_meta_always_contains_exit_and_duration():
 def test_normalize_missing_tests_is_none():
     raw = {"status": "completed", "summary": "ok"}
     assert normalize(raw, outcome(), None, "codex", None).tests is None
+
+
+def test_normalize_coerces_natural_language_tests_result():
+    raw = {
+        "status": "completed",
+        "summary": "ok",
+        "tests": {"command": "pytest", "result": "1 passed"},
+    }
+    result = normalize(raw, ProcessOutcome(0, "", "", False, 1), ["a.py"], "claude", None)
+    assert result.status == "completed"
+    assert result.tests is not None and result.tests.result == "passed"
+    assert result.meta["coerced"] == ["tests.result: '1 passed' -> passed"]
+
+
+def test_normalize_coerces_failed_wording():
+    raw = {
+        "status": "partial",
+        "summary": "x",
+        "tests": {"command": "pytest", "result": "2 failed, 1 passed"},
+    }
+    result = normalize(raw, ProcessOutcome(0, "", "", False, 1), [], "claude", None)
+    assert result.tests is not None and result.tests.result == "failed"

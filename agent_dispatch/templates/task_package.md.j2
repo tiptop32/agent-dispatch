@@ -24,5 +24,8 @@ $ git diff --stat
 This task was delegated by {{ source_agent }} via AgentDispatch (hop {{ hop }} of {{ max_hops }}).
 {% if hop + 1 >= max_hops %}Do NOT delegate further: the hop limit is reached.{% else %}You may split this task into at most {{ max_children }} independent subtasks and delegate each with the AgentDispatch `dispatch` tool; the router picks the best agent for each. Do not delegate the whole task as-is. Subtasks share this working tree: give each a disjoint `files` list.{% endif %}
 
+# Rules
+Do not commit or push: leave all changes in the working tree, the caller reviews and commits.
+
 # Result format
 {{ result_instructions }}

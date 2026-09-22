@@ -64,6 +64,9 @@ def normalize(
             changed_files=changed_files or [],
             meta=meta,
         )
+    raw, coerced = _coerce(raw)
+    if coerced:
+        meta["coerced"] = coerced
     errors = validate_agent_result(raw)
     if errors:
         meta["parse_error"] = "; ".join(errors)
@@ -89,3 +92,25 @@ def normalize(
         needs_escalation=raw.get("needs_escalation", False),
         meta=meta,
     )
+
+
+def _coerce(raw: dict) -> tuple[dict, list[str]]:
+    """Мягко привести поля, которые модели пишут на естественном языке.
+
+    `tests.result` вроде «1 passed» или «all tests failed» превращается в enum;
+    список приведений возвращается для `meta.coerced`, чтобы телеметрия видела,
+    что агент не соблюдал формат.
+    """
+    coerced: list[str] = []
+    tests = raw.get("tests")
+    if isinstance(tests, dict) and isinstance(tests.get("result"), str):
+        value = tests["result"].strip().lower()
+        if value not in ("passed", "failed", "not_run"):
+            mapped = "not_run"
+            if "fail" in value or "error" in value:
+                mapped = "failed"
+            elif "pass" in value or value in ("ok", "green", "success"):
+                mapped = "passed"
+            raw = {**raw, "tests": {**tests, "result": mapped}}
+            coerced.append(f"tests.result: {tests['result']!r} -> {mapped}")
+    return raw, coerced
