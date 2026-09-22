@@ -483,46 +483,48 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [x] `is_git_repo`, `snapshot`, `diff`
 - [x] run tests - must pass before next task
 
+➕ run C (codex-flow 20260921-183427-525f): адаптеры написаны по живым фикстурам трёх CLI; Codex требует strict-схему (`schemas/agent_result.strict.schema.json`); `check()` через общий `check_cli_version` с `child_env`; `child_env(None)` режет секреты по маске. OpenCode: у провайдера openrouter в `~/.config/opencode/opencode.json` пустой apiKey, `opencode/kimi` даёт 401, пока ключ не задан.
+
 ### Task 10: База адаптеров, registry, Claude-адаптер
 
 **Files:**
 - Create: `agent_dispatch/executors/base.py`, `agent_dispatch/executors/registry.py`, `agent_dispatch/executors/claude.py`, `tests/test_adapter_claude.py`, `tests/test_registry.py`, `tests/fakes/claude_ok.sh`, `tests/fakes/claude_noblock.sh`, `tests/fakes/version_only.sh`, `tests/fixtures/agent_output/claude_print_json.txt`
 
-- [ ] записать один живой `claude -p --output-format json` ответ на тривиальную задачу в `claude_print_json.txt` (без секретов), fake-CLI печатает ровно эту форму
-- [ ] тесты: argv ровно `<fake> -p --output-format json --add-dir <cwd> <extra_args>`; промпт в stdin; `check()` парсит `--version`; `completed` с `changed_files` из git; `claude_noblock` → `partial`; timeout 0.2 с → `failed`, `error="timeout"`; `model` заполняется из `modelUsage`, если поле есть, иначе `None`; env дочернего процесса содержит `AGENT_DISPATCH_*` и не содержит `OPENROUTER_API_KEY`
-- [ ] `base.py`: `ExecutorAdapter` Protocol, `RunContext`
-- [ ] `registry.py`: `build_adapters(settings)`, `AvailabilityCache(ttl_seconds, clock=time.monotonic)` с `check_all()`, `unavailable() -> set[str]`; тесты кэша с инжектированными часами
-- [ ] `claude.py`
-- [ ] run tests - must pass before next task
+- [x] записать один живой `claude -p --output-format json` ответ на тривиальную задачу в `claude_print_json.txt` (без секретов), fake-CLI печатает ровно эту форму
+- [x] тесты: argv ровно `<fake> -p --output-format json --add-dir <cwd> <extra_args>`; промпт в stdin; `check()` парсит `--version`; `completed` с `changed_files` из git; `claude_noblock` → `partial`; timeout 0.2 с → `failed`, `error="timeout"`; `model` заполняется из `modelUsage`, если поле есть, иначе `None`; env дочернего процесса содержит `AGENT_DISPATCH_*` и не содержит `OPENROUTER_API_KEY`
+- [x] `base.py`: `ExecutorAdapter` Protocol, `RunContext`
+- [x] `registry.py`: `build_adapters(settings)`, `AvailabilityCache(ttl_seconds, clock=time.monotonic)` с `check_all()`, `unavailable() -> set[str]`; тесты кэша с инжектированными часами
+- [x] `claude.py`
+- [x] run tests - must pass before next task
 
 ### Task 11: Codex-адаптер
 
 **Files:**
 - Create: `agent_dispatch/executors/codex.py`, `tests/test_adapter_codex.py`, `tests/fakes/codex_ok.sh`, `tests/fakes/codex_bad_schema.sh`, `tests/fakes/codex_fail.sh`
 
-- [ ] тесты: argv ровно `<fake> exec --json -C <cwd> --output-schema <schema> -o <last.json> <extra_args> -`; промпт в stdin; `codex_ok` пишет JSON в файл после `-o` → `completed`; `codex_bad_schema` (лишнее поле) → `partial` с `parse_error`; `codex_fail` exit 1 → `failed`; файл `-o` отсутствует при exit 0 → `partial`; временные файлы схемы и `-o` удаляются
-- [ ] `codex.py`
-- [ ] run tests - must pass before next task
+- [x] тесты: argv ровно `<fake> exec --json -C <cwd> --output-schema <schema> -o <last.json> <extra_args> -`; промпт в stdin; `codex_ok` пишет JSON в файл после `-o` → `completed`; `codex_bad_schema` (лишнее поле) → `partial` с `parse_error`; `codex_fail` exit 1 → `failed`; файл `-o` отсутствует при exit 0 → `partial`; временные файлы схемы и `-o` удаляются
+- [x] `codex.py`
+- [x] run tests - must pass before next task
 
 ### Task 12: OpenCode-адаптер
 
 **Files:**
 - Create: `agent_dispatch/executors/opencode.py`, `tests/test_adapter_opencode.py`, `tests/fakes/opencode_ok.sh`, `tests/fakes/opencode_noblock.sh`, `tests/fixtures/agent_output/opencode_run_json.txt`
 
-- [ ] записать один живой `opencode run --format json` вывод в фикстуру (без секретов), fake печатает эту форму
-- [ ] тесты: argv ровно `<fake> run --format json --dir <cwd> --model <model> <extra_args> <prompt>`; `model` из конфига попадает в результат; текст ассистента извлекается из событий → `completed`; `opencode_noblock` → `partial`; `check()` через `--version`
-- [ ] `opencode.py`, парсер событий `--format json` (только тип «text assistant», остальное игнорируется)
-- [ ] run tests - must pass before next task
+- [x] записать один живой `opencode run --format json` вывод в фикстуру (без секретов), fake печатает эту форму
+- [x] тесты: argv ровно `<fake> run --format json --dir <cwd> --model <model> <extra_args> <prompt>`; `model` из конфига попадает в результат; текст ассистента извлекается из событий → `completed`; `opencode_noblock` → `partial`; `check()` через `--version`
+- [x] `opencode.py`, парсер событий `--format json` (только тип «text assistant», остальное игнорируется)
+- [x] run tests - must pass before next task
 
 ### Task 13: Телеметрия SQLite
 
 **Files:**
 - Create: `agent_dispatch/telemetry/__init__.py`, `agent_dispatch/telemetry/storage.py`, `agent_dispatch/telemetry/schema.sql`, `tests/test_storage.py`
 
-- [ ] тесты: создание БД в tmp, `user_version = 1`; `insert_task`/`update_task`/`get_task` round-trip `TaskRecord`; `task_exists`; `add_decision` с `task_id=None` для `/route`; `add_event`; `export(since)` отдаёт по строке на задачу с вложенными `decision` и `events`, плюс строки `{task: null, decision}`; повторный `open` идемпотентен; 20 конкурентных записей не теряются
-- [ ] `count_children(parent_task_id) -> int` (все статусы, кроме `cancelled`)
-- [ ] `Storage(path)`: `open()`, схема из `schema.sql`, WAL, `asyncio.Lock` на запись, методы выше
-- [ ] run tests - must pass before next task
+- [x] тесты: создание БД в tmp, `user_version = 1`; `insert_task`/`update_task`/`get_task` round-trip `TaskRecord`; `task_exists`; `add_decision` с `task_id=None` для `/route`; `add_event`; `export(since)` отдаёт по строке на задачу с вложенными `decision` и `events`, плюс строки `{task: null, decision}`; повторный `open` идемпотентен; 20 конкурентных записей не теряются
+- [x] `count_children(parent_task_id) -> int` (все статусы, кроме `cancelled`)
+- [x] `Storage(path)`: `open()`, схема из `schema.sql`, WAL, `asyncio.Lock` на запись, методы выше
+- [x] run tests - must pass before next task
 
 ### Task 14: Dispatcher: state machine, семафор корневых задач, lock по cwd, cancel
 
