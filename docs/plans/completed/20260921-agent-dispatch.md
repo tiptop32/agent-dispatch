@@ -604,24 +604,26 @@ Tools `route`, `dispatch`, `dispatch_to`, `status`. Каждый вызов: с�
 - [x] `cases.jsonl`: 20 задач `{task, context, files, constraints, expected_executor, rationale}`; примерно 6 claude, 7 codex, 7 opencode
 - [x] `evals/routing/__main__.py`: живой роутер через `POST /route` живого демона, accuracy, отчёт `evals/reports/routing-<date>.json`, матрица ошибок, exit 1 при accuracy < 0.8; флаг `--router claude_local`
 - [x] `evals/smoke/__main__.py`: копирует `repo_template` в tmp, `git init` + commit, три задачи через `dispatch_to` на каждом enabled executor через живой демон, проверяет `completed`, `changed_files` непустой, `pytest` зелёный; `--executors codex,claude`
-- [ ] прогнать оба eval вживую, вписать результат с датой в `evals/README.md`
+- [x] прогнать оба eval вживую, вписать результат с датой в `evals/README.md`
 - [x] run gate tests - must pass before next task
 
+➕ Task 21 (2026-09-22, вживую): headless-права подтверждены (claude -p с `--allowedTools` выполняет Bash без TTY, opencode run без подтверждений, codex со strict-схемой); happy path через демон на всех трёх исполнителях; guards `max_hops`/`unknown_parent` и auth (401/421) проверены по HTTP; автостарт демона из `route` работает; routing eval 95% (19/20), smoke 9/9. Найдено и исправлено: Codex пытался коммитить (Task Package теперь запрещает), Claude писал `"1 passed"` вместо enum (мягкое приведение), `set - dict` в evals.smoke main, шаблон smoke содержал баг для всех задач.
+
 ### Task 21: Verify acceptance criteria
-- [ ] живая проверка headless-прав: `claude -p` с `extra_args` из дефолта выполняет `pytest` без TTY; `opencode run` выполняет команду без подтверждения; если нет, поправить дефолтные `extra_args`/README и обновить план (➕)
-- [ ] happy path раздела 19 спеки руками: из Codex вызвать `dispatch` в temp-репе, получить результат, `AGENT_DISPATCH_HOP=1` в env дочернего процесса, запись в SQLite
-- [ ] цикл: дочерний агент при `max_hops=1` получает `failed, reason=max_hops`
-- [ ] `route` из CLI и из MCP на одном запросе дают одинаковые `executor` и `router`
-- [ ] ключи не появляются в: `serve.log`, `logs/<task_id>.log`, `export`, `doctor`, `status`; `grep -r sk-or- ~/.local/share/agent-dispatch` пуст
-- [ ] `uv run pytest tests/ -q` < 5 с, `uv run ruff check .` чистый, `uv run python -m evals.routing` ≥ 0.8
-- [ ] pre-commit хук (включая detect-secrets) работает на тестовом коммите
+- [x] живая проверка headless-прав: `claude -p` с `extra_args` из дефолта выполняет `pytest` без TTY; `opencode run` выполняет команду без подтверждения; если нет, поправить дефолтные `extra_args`/README и обновить план (➕)
+- [x] happy path раздела 19 спеки руками: из Codex вызвать `dispatch` в temp-репе, получить результат, `AGENT_DISPATCH_HOP=1` в env дочернего процесса, запись в SQLite
+- [x] цикл: дочерний агент при `max_hops=1` получает `failed, reason=max_hops`
+- [x] `route` из CLI и из MCP на одном запросе дают одинаковые `executor` и `router`
+- [x] ключи не появляются в: `serve.log`, `logs/<task_id>.log`, `export`, `doctor`, `status`; `grep -r sk-or- ~/.local/share/agent-dispatch` пуст
+- [x] `uv run pytest tests/ -q` < 5 с, `uv run ruff check .` чистый, `uv run python -m evals.routing` ≥ 0.8
+- [x] pre-commit хук (включая detect-secrets) работает на тестовом коммите
 
 ### Task 22: [Final] Документация и подключение
-- [ ] `README.md` на русском: что это, установка (`uv tool install .`), конфиг с примером, команды CLI, подключение MCP к Claude Code (`claude mcp add agent-dispatch -e AGENT_DISPATCH_SOURCE_AGENT=claude -- agent-dispatch mcp`), Codex (`~/.codex/config.toml` `[mcp_servers.agent-dispatch]` с `tool_timeout_sec`), OpenCode (`opencode.json` `mcp`), как поднять MCP-таймауты и `wait_seconds`, текст правила для агентов из раздела 16 спеки, как читать телеметрию, как добавить новый executor (только config.yaml)
-- [ ] `docs/architecture.md`: схема, порядок guards, hop-протокол с трассировкой, контракт Jev с примером запроса и ответа, формат result-блока, замечание про уход `task/context` во внешний роутер
-- [ ] тест `tests/test_config_example.py`: `config.example.yaml` в корне равен `agent_dispatch/config_default.yaml`
-- [ ] `CLAUDE.md` репы: как запускать тесты и evals, где фикстуры, правило «Jev не делает side effects», правило «ключи не в os.environ»
-- [ ] move this plan to `docs/plans/completed/`
+- [x] `README.md` на русском: что это, установка (`uv tool install .`), конфиг с примером, команды CLI, подключение MCP к Claude Code (`claude mcp add agent-dispatch -e AGENT_DISPATCH_SOURCE_AGENT=claude -- agent-dispatch mcp`), Codex (`~/.codex/config.toml` `[mcp_servers.agent-dispatch]` с `tool_timeout_sec`), OpenCode (`opencode.json` `mcp`), как поднять MCP-таймауты и `wait_seconds`, текст правила для агентов из раздела 16 спеки, как читать телеметрию, как добавить новый executor (только config.yaml)
+- [x] `docs/architecture.md`: схема, порядок guards, hop-протокол с трассировкой, контракт Jev с примером запроса и ответа, формат result-блока, замечание про уход `task/context` во внешний роутер
+- [x] тест `tests/test_config_example.py`: `config.example.yaml` в корне равен `agent_dispatch/config_default.yaml`
+- [x] `CLAUDE.md` репы: как запускать тесты и evals, где фикстуры, правило «Jev не делает side effects», правило «ключи не в os.environ»
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
