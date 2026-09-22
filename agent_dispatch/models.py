@@ -40,6 +40,19 @@ class TaskStatus(StrEnum):
 
 TerminalStatus = Literal["completed", "partial", "failed", "needs_context", "needs_escalation"]
 
+#: Статусы, после которых задача больше не меняется. Единственное определение:
+#: демон, CLI и HTTP-слой должны видеть один и тот же набор.
+FINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.completed,
+        TaskStatus.partial,
+        TaskStatus.failed,
+        TaskStatus.needs_context,
+        TaskStatus.needs_escalation,
+        TaskStatus.cancelled,
+    }
+)
+
 
 class RouterKind(StrEnum):
     jev = "jev"

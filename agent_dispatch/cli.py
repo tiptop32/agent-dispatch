@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Awaitable
 from typing import Any
 
 import typer
@@ -15,7 +14,7 @@ from agent_dispatch.executors import worktree
 from agent_dispatch.mcp import autostart
 from agent_dispatch.mcp import server as mcp_server
 from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
-from agent_dispatch.models import DispatchRequest, SourceAgent, TaskStatus, TaskView
+from agent_dispatch.models import FINAL_STATUSES, DispatchRequest, SourceAgent, TaskView
 from agent_dispatch.server import run_server
 
 app = typer.Typer(
@@ -26,14 +25,6 @@ app = typer.Typer(
     ),
     no_args_is_help=True,
 )
-_FINAL_STATUSES = {
-    TaskStatus.completed,
-    TaskStatus.partial,
-    TaskStatus.failed,
-    TaskStatus.needs_context,
-    TaskStatus.needs_escalation,
-    TaskStatus.cancelled,
-}
 
 
 def _daemon_error(detail: str | None = None) -> None:
@@ -57,11 +48,6 @@ async def _open_client(settings: Settings, wait: int, start: bool) -> DispatchCl
     return DispatchClient(state, timeout=wait + 30)
 
 
-def _client(settings: Settings, wait: int) -> DispatchClient:
-    """Return a client for an already running daemon."""
-    return asyncio.run(_open_client(settings, wait, False))
-
-
 async def _call(
     settings: Settings,
     wait: int,
@@ -77,6 +63,12 @@ async def _call(
         _daemon_error(str(exc))
 
 
+def _daemon_call(operation: str, *args: object, start: bool = False) -> Any:
+    """Одно обращение к демону: настройки, клиент, вызов операции."""
+    settings = load_settings()
+    return asyncio.run(_call(settings, settings.mcp.wait_seconds, operation, *args, start=start))
+
+
 async def _dispatch_and_wait(
     settings: Settings,
     request: DispatchRequest,
@@ -90,7 +82,7 @@ async def _dispatch_and_wait(
     async with client:
         view = await client.submit(request)
         while True:
-            if view.status in _FINAL_STATUSES:
+            if view.status in FINAL_STATUSES:
                 views.append(view)
                 seen.add(view.task_id)
                 escalated_to = view.result.meta.get("escalated_to") if view.result else None
@@ -114,10 +106,6 @@ async def _dispatch_and_wait(
 
 def _within_wait(started: float, wait: int) -> bool:
     return wait > 0 and time.monotonic() - started < wait
-
-
-def _run(coro: Awaitable[Any]) -> Any:
-    return asyncio.run(coro)
 
 
 def _request(
@@ -163,7 +151,7 @@ def _print_task(view: TaskView, as_json: bool) -> None:
     typer.echo(f"executor: {executor}")
     typer.echo(f"changed_files: {','.join(result.changed_files) if result else ''}")
     typer.echo(f"summary: {result.summary if result else ''}")
-    if view.status not in _FINAL_STATUSES:
+    if view.status not in FINAL_STATUSES:
         typer.echo(f"still running: agent-dispatch status {view.task_id}")
 
 
@@ -186,16 +174,7 @@ def route(
     constraints: list[str] | None = typer.Option(None, "--constraint"),  # noqa: B008
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    settings = load_settings()
-    decision = _run(
-        _call(
-            settings,
-            settings.mcp.wait_seconds,
-            "route",
-            _request(task, cwd, context, files, constraints),
-            start=True,
-        )
-    )
+    decision = _daemon_call("route", _request(task, cwd, context, files, constraints), start=True)
     if as_json:
         typer.echo(decision.model_dump_json(indent=2))
         return
@@ -223,10 +202,9 @@ def dispatch(
     no_escalation: bool = typer.Option(False, "--no-escalation"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    settings = load_settings()
-    views = _run(
+    views = asyncio.run(
         _dispatch_and_wait(
-            settings,
+            load_settings(),
             _request(
                 task,
                 cwd,
@@ -253,20 +231,17 @@ def dispatch(
 
 @app.command(help="Show the status of a task.")
 def status(task_id: str, as_json: bool = typer.Option(False, "--json")) -> None:
-    settings = load_settings()
-    _print_task(_run(_call(settings, settings.mcp.wait_seconds, "status", task_id)), as_json)
+    _print_task(_daemon_call("status", task_id), as_json)
 
 
 @app.command(help="Cancel a task.")
 def cancel(task_id: str) -> None:
-    settings = load_settings()
-    _print_task(_run(_call(settings, settings.mcp.wait_seconds, "cancel", task_id)), False)
+    _print_task(_daemon_call("cancel", task_id), False)
 
 
 @app.command("executors", help="List configured executors.")
 def list_executors() -> None:
-    settings = load_settings()
-    rows = _run(_call(settings, settings.mcp.wait_seconds, "executors"))
+    rows = _daemon_call("executors")
     typer.echo("name\tadapter\tmodel\tenabled\tavailable\tversion/error")
     for row in rows:
         version_or_error = row.get("version") or row.get("error") or "-"
@@ -310,9 +285,7 @@ def feedback(
     outcome: str = typer.Option(...),
     note: str | None = typer.Option(None),
 ) -> None:
-    settings = load_settings()
-    response = _run(_call(settings, settings.mcp.wait_seconds, "feedback", task_id, outcome, note))
-    typer.echo(json.dumps(response))
+    typer.echo(json.dumps(_daemon_call("feedback", task_id, outcome, note)))
 
 
 @app.command("export", help="Export task records as JSONL.")
@@ -322,8 +295,7 @@ def export_data(
 ) -> None:
     if output_format != "jsonl":
         raise typer.BadParameter("only jsonl is supported", param_hint="--format")
-    settings = load_settings()
-    typer.echo(_run(_call(settings, settings.mcp.wait_seconds, "export", since)), nl=False)
+    typer.echo(_daemon_call("export", since), nl=False)
 
 
 @app.command(help="Run local and optional online health checks.")
@@ -331,7 +303,7 @@ def doctor(
     online: bool = typer.Option(False, "--online"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    checks = _run(doctor_module.run_checks(load_settings(), online))
+    checks = asyncio.run(doctor_module.run_checks(load_settings(), online))
     if as_json:
         typer.echo(json.dumps([check.model_dump() for check in checks]))
     else:

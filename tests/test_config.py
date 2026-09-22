@@ -138,6 +138,20 @@ def test_env_file_accepts_export_quotes_and_preserves_value_spaces(tmp_path: Pat
     assert secrets["SPACED"].get_secret_value() == "  value  "
 
 
+def test_env_file_ignores_indentation_before_key(tmp_path: Path) -> None:
+    # Отступ слева не должен становиться частью ключа: до правки «  export A=1»
+    # давал ключ «export A», и секрет с таким именем никогда не находился.
+    env_file = tmp_path / "env"
+    env_file.write_text("  export INDENTED=1\n\tTABBED=2\n   # комментарий с отступом\n")
+
+    secrets = load_env_file(env_file)
+
+    assert {name: value.get_secret_value() for name, value in secrets.items()} == {
+        "INDENTED": "1",
+        "TABBED": "2",
+    }
+
+
 def test_loading_env_file_does_not_modify_process_environment(
     tmp_config_dir: Path,
 ) -> None:

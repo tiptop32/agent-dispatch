@@ -5,7 +5,13 @@ from uuid import uuid4
 
 import pytest
 
-from agent_dispatch.models import DispatchRequest, ExecutionResult, RouteDecision, TaskRecord
+from agent_dispatch.models import (
+    DispatchRequest,
+    ExecutionResult,
+    RouteDecision,
+    TaskRecord,
+    TaskStatus,
+)
 from agent_dispatch.telemetry import Storage
 
 
@@ -83,7 +89,9 @@ async def test_update_changes_status_result_and_duration(storage: Storage):
     finish = start + timedelta(milliseconds=125)
     updated = task.model_copy(
         update={
-            "status": "completed",
+            # model_copy не валидирует: статус кладём уже как enum, иначе в базу
+            # уедет сырая строка.
+            "status": TaskStatus.completed,
             "result": ExecutionResult(
                 status="completed", executor="codex", model=None, summary="done"
             ),

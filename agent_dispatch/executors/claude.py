@@ -1,38 +1,18 @@
 from __future__ import annotations
 
 import json
-import subprocess
 
-from agent_dispatch.config import ExecutorSettings
-from agent_dispatch.executors import workspace
 from agent_dispatch.executors.base import (
+    BaseExecutorAdapter,
     RunContext,
-    check_cli_version,
-    cwd_error_result,
-    default_base_env,
 )
-from agent_dispatch.executors.process import run_cli
+from agent_dispatch.executors.process import ProcessOutcome, run_cli
 from agent_dispatch.executors.result_parser import extract_result_block, normalize
-from agent_dispatch.models import Availability, ExecutionResult, Usage
+from agent_dispatch.models import ExecutionResult, Usage
 
 
-class ClaudeAdapter:
-    def __init__(
-        self, name: str, settings: ExecutorSettings, base_env: dict[str, str] | None = None
-    ):
-        self.name = name
-        self.settings = settings
-        self.command = settings.resolved_command
-        self.base_env = base_env if base_env is not None else default_base_env()
-
-    async def check(self) -> Availability:
-        return await check_cli_version(self.name, self.command, self.base_env)
-
+class ClaudeAdapter(BaseExecutorAdapter):
     async def execute(self, ctx: RunContext) -> ExecutionResult:
-        try:
-            before = workspace.snapshot(ctx.cwd)
-        except subprocess.CalledProcessError:
-            return cwd_error_result(self.name, self.settings.model, ctx.cwd, ctx.log_path)
         argv = [
             self.command,
             "-p",
@@ -43,29 +23,15 @@ class ClaudeAdapter:
             *(["--model", self.settings.model] if self.settings.model else []),
             *self.settings.extra_args,
         ]
-        try:
-            outcome = await run_cli(
-                argv,
-                cwd=ctx.cwd,
-                env=ctx.env,
-                stdin=ctx.prompt,
-                timeout_seconds=ctx.timeout_seconds,
-                log_path=ctx.log_path,
-            )
-        except OSError as exc:
-            return ExecutionResult(
-                status="failed",
-                executor=self.name,
-                model=self.settings.model,
-                summary="",
-                error=f"cannot start {self.command}: {exc}",
-                meta={"log_path": str(ctx.log_path)},
-            )
-        try:
-            after = workspace.snapshot(ctx.cwd)
-        except subprocess.CalledProcessError:
-            return cwd_error_result(self.name, self.settings.model, ctx.cwd, ctx.log_path)
-        changed = workspace.diff(before, after)
+        return await self._execute_common(
+            ctx,
+            argv,
+            stdin=ctx.prompt,
+            parse_result=self._parse_result,
+            run_cli_fn=run_cli,
+        )
+
+    def _parse_result(self, outcome: ProcessOutcome, changed: list[str]) -> ExecutionResult:
         model = self.settings.model
         usage = None
         raw = None
@@ -103,5 +69,4 @@ class ClaudeAdapter:
             )
         if usage is not None:
             result = result.model_copy(update={"usage": usage})
-        result = result.model_copy(update={"meta": {**result.meta, "log_path": str(ctx.log_path)}})
         return result

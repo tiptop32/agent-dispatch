@@ -8,7 +8,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_dispatch.models import DispatchRequest, ExecutionResult, RouteDecision, TaskRecord
+from agent_dispatch.models import (
+    DispatchRequest,
+    ExecutionResult,
+    RouteDecision,
+    TaskRecord,
+)
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -55,29 +60,29 @@ class Storage:
             self._conn = None
 
     @staticmethod
-    def _task_values(task: TaskRecord) -> tuple[Any, ...]:
+    def _task_values(task: TaskRecord) -> dict[str, Any]:
         decision = task.decision
         result = task.result
-        return (
-            task.task_id,
-            task.parent_task_id,
-            task.escalated_from,
-            getattr(task.root_agent, "value", task.root_agent),
-            getattr(task.source_agent, "value", task.source_agent),
-            task.hop,
-            task.request.cwd,
-            getattr(task.status, "value", task.status),
-            decision.executor if decision else None,
-            result.model if result else None,
-            task.request.model_dump_json(),
-            decision.model_dump_json() if decision else None,
-            result.model_dump_json() if result else None,
-            task.log_path,
-            _dt(task.created_at),
-            _dt(task.started_at),
-            _dt(task.finished_at),
-            None,
-        )
+        return {
+            "task_id": task.task_id,
+            "parent_task_id": task.parent_task_id,
+            "escalated_from": task.escalated_from,
+            "root_agent": task.root_agent.value,
+            "source_agent": task.source_agent.value,
+            "hop": task.hop,
+            "cwd": task.request.cwd,
+            "status": task.status.value,
+            "executor": decision.executor if decision else None,
+            "model": result.model if result else None,
+            "request_json": task.request.model_dump_json(),
+            "decision_json": decision.model_dump_json() if decision else None,
+            "result_json": result.model_dump_json() if result else None,
+            "log_path": task.log_path,
+            "created_at": _dt(task.created_at),
+            "started_at": _dt(task.started_at),
+            "finished_at": _dt(task.finished_at),
+            "duration_ms": None,
+        }
 
     def _task_from_row(self, row: sqlite3.Row) -> TaskRecord:
         decision = (
@@ -107,9 +112,12 @@ class Storage:
 
     async def insert_task(self, task: TaskRecord) -> None:
         async with self._write_lock:
+            values = self._task_values(task)
+            columns = tuple(values)
             self._db.execute(
-                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                self._task_values(task),
+                f"INSERT INTO tasks ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(values.values()),
             )
             self._db.commit()
 
@@ -118,14 +126,13 @@ class Storage:
         duration = None
         if task.started_at and task.finished_at:
             duration = max(0, int((task.finished_at - task.started_at).total_seconds() * 1000))
+        values["duration_ms"] = duration
+        update_values = {key: value for key, value in values.items() if key != "task_id"}
         async with self._write_lock:
             cur = self._db.execute(
-                "UPDATE tasks SET parent_task_id=?, escalated_from=?, root_agent=?, "
-                "source_agent=?, "
-                "hop=?, cwd=?, status=?, executor=?, model=?, request_json=?, decision_json=?, "
-                "result_json=?, log_path=?, created_at=?, started_at=?, finished_at=?, "
-                "duration_ms=? WHERE task_id=?",
-                values[1:17] + (duration, values[0]),
+                f"UPDATE tasks SET {', '.join(f'{column}=?' for column in update_values)} "
+                "WHERE task_id=?",
+                tuple(update_values.values()) + (values["task_id"],),
             )
             if cur.rowcount == 0:
                 self._db.rollback()
@@ -263,7 +270,7 @@ class Storage:
             scores=json.loads(row["scores_json"]),
             router=row["router"],
             reason=row["guard_reason"],
-            judgments={k: v for k, v in json.loads(row["judgments_json"]).items()},
+            judgments=json.loads(row["judgments_json"]),
             latency_ms=row["latency_ms"],
             cost_usd=row["cost_usd"],
         )

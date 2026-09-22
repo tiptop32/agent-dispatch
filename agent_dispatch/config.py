@@ -145,10 +145,11 @@ def load_env_file(path: Path) -> dict[str, SecretStr]:
     if not path.is_file():
         return secrets
     for raw_line in path.read_text().splitlines():
-        if raw_line.lstrip().startswith("#"):
-            continue
-        line = raw_line
-        if not line:
+        # Отступ слева срезается до разбора: иначе у «  export FOO=bar» ключом
+        # становится «export FOO». Справа не трогаем, пробелы в конце значения
+        # значимы.
+        line = raw_line.lstrip()
+        if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
             line = line[7:]

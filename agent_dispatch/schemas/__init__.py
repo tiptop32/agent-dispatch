@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +13,14 @@ def load_agent_result_schema() -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+@lru_cache(maxsize=1)
+def _agent_result_validator() -> Draft202012Validator:
+    """Валидатор строится один раз: схема разбирается на каждый результат исполнителя."""
+    return Draft202012Validator(load_agent_result_schema())
+
+
 def validate_agent_result(obj: Any) -> list[str]:
-    schema = load_agent_result_schema()
-    return [error.message for error in Draft202012Validator(schema).iter_errors(obj)]
+    return [error.message for error in _agent_result_validator().iter_errors(obj)]
 
 
 def load_agent_result_strict_schema() -> dict[str, Any]:

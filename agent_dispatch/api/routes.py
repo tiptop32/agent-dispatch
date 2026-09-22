@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from agent_dispatch import __version__
-from agent_dispatch.models import DispatchRequest, TaskRecord, TaskStatus, TaskView
+from agent_dispatch.models import FINAL_STATUSES, DispatchRequest, TaskRecord, TaskView
 
 
 class FeedbackRequest(BaseModel):
@@ -87,7 +87,7 @@ def build_router() -> APIRouter:
         deps = _deps(request)
         record = await deps.dispatcher.submit(req)
         record = await deps.dispatcher.wait(record.task_id, min(req.wait_seconds, MAX_WAIT_SECONDS))
-        response.status_code = 200 if record.status in _FINAL else 202
+        response.status_code = 200 if record.status in FINAL_STATUSES else 202
         return to_view(record)
 
     @router.get("/tasks/{task_id}")
@@ -129,14 +129,6 @@ def build_router() -> APIRouter:
     return router
 
 
-_FINAL = {
-    TaskStatus.completed,
-    TaskStatus.partial,
-    TaskStatus.failed,
-    TaskStatus.needs_context,
-    TaskStatus.needs_escalation,
-    TaskStatus.cancelled,
-}
 _SINCE_RE = re.compile(r"^(\d+)([smhd])$")
 
 

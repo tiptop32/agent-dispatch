@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from agent_dispatch.config import ExecutorSettings
+from agent_dispatch.executors import workspace
 from agent_dispatch.executors.env import child_env
-from agent_dispatch.executors.process import run_cli
+from agent_dispatch.executors.process import ProcessOutcome, run_cli
 from agent_dispatch.models import Availability, ExecutionResult
 
 
@@ -29,6 +33,64 @@ class ExecutorAdapter(Protocol):
     async def check(self) -> Availability: ...
 
     async def execute(self, ctx: RunContext) -> ExecutionResult: ...
+
+
+class BaseExecutorAdapter:
+    def __init__(
+        self, name: str, settings: ExecutorSettings, base_env: dict[str, str] | None = None
+    ):
+        self.name = name
+        self.settings = settings
+        self.command = settings.resolved_command
+        self.base_env = base_env if base_env is not None else default_base_env()
+
+    async def check(self) -> Availability:
+        return await check_cli_version(self.name, self.command, self.base_env)
+
+    async def _execute_common(
+        self,
+        ctx: RunContext,
+        argv: list[str],
+        *,
+        stdin: str | None,
+        parse_result: Callable[[ProcessOutcome, list[str]], ExecutionResult],
+        run_cli_fn: Callable[..., Awaitable[ProcessOutcome]],
+    ) -> ExecutionResult:
+        """Общий цикл CLI-адаптера: snapshot, запуск, snapshot, разбор вывода.
+
+        `run_cli_fn` передаётся каждым адаптером из его собственного модуля, а не
+        берётся отсюда по умолчанию: тесты подменяют `run_cli` именно в модуле
+        адаптера, и дефолт здесь молча уводил бы вызов мимо подмены.
+        """
+        try:
+            before = workspace.snapshot(ctx.cwd)
+        except subprocess.CalledProcessError:
+            return cwd_error_result(self.name, self.settings.model, ctx.cwd, ctx.log_path)
+        try:
+            outcome = await run_cli_fn(
+                argv,
+                cwd=ctx.cwd,
+                env=ctx.env,
+                stdin=stdin,
+                timeout_seconds=ctx.timeout_seconds,
+                log_path=ctx.log_path,
+            )
+        except OSError as exc:
+            return ExecutionResult(
+                status="failed",
+                executor=self.name,
+                model=self.settings.model,
+                summary="",
+                error=f"cannot start {self.command}: {exc}",
+                meta={"log_path": str(ctx.log_path)},
+            )
+        try:
+            after = workspace.snapshot(ctx.cwd)
+        except subprocess.CalledProcessError:
+            return cwd_error_result(self.name, self.settings.model, ctx.cwd, ctx.log_path)
+        changed = workspace.diff(before, after)
+        result = parse_result(outcome, changed)
+        return result.model_copy(update={"meta": {**result.meta, "log_path": str(ctx.log_path)}})
 
 
 def default_base_env() -> dict[str, str]:

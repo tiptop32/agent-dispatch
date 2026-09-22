@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
+from collections.abc import AsyncIterator, Coroutine
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,6 +17,7 @@ from agent_dispatch.executors.base import ExecutorAdapter, RunContext
 from agent_dispatch.executors.env import child_env
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
+    FINAL_STATUSES,
     DispatchRequest,
     ExecutionResult,
     GuardEvent,
@@ -28,14 +32,19 @@ from agent_dispatch.routing.decision import decide_with_fallback
 from agent_dispatch.routing.guards import candidates, pre_guards
 from agent_dispatch.telemetry.storage import Storage
 
-_FINAL = {
-    TaskStatus.completed,
-    TaskStatus.partial,
-    TaskStatus.failed,
-    TaskStatus.needs_context,
-    TaskStatus.needs_escalation,
-    TaskStatus.cancelled,
-}
+
+@dataclass
+class Routing:
+    """Итог маршрутизации: кому отдать задачу и что по дороге сказали guard'ы.
+
+    `guard` это причина, по которой решение принято не роутером: отказ (задачу
+    надо провалить) либо явный выбор исполнителя пользователем.
+    """
+
+    decision: RouteDecision
+    guard: GuardEvent | None = None
+    events: list[GuardEvent] = field(default_factory=list)
+    candidates: list[str] = field(default_factory=list)
 
 
 class Dispatcher:
@@ -52,7 +61,9 @@ class Dispatcher:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._events: dict[str, asyncio.Event] = {}
         self._semaphore = asyncio.Semaphore(settings.server.max_concurrent_tasks)
-        self._cwd_locks: dict[str, asyncio.Lock] = {}
+        # Lock на рабочую копию вместе со счётчиком тех, кто его держит или ждёт:
+        # запись живёт ровно столько, сколько нужна.
+        self._cwd_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         # Cleanup-таски из done-колбэка: shutdown их дожидается, иначе они
         # могут обратиться к уже закрытому storage.
         self._cleanup: set[asyncio.Task[None]] = set()
@@ -60,6 +71,12 @@ class Dispatcher:
     @staticmethod
     def _now() -> datetime:
         return datetime.now(UTC)
+
+    def _notify(self, task_id: str) -> None:
+        """Разбудить того, кто ждёт эту задачу в `wait`."""
+        event = self._events.get(task_id)
+        if event is not None:
+            event.set()
 
     async def submit(self, req: DispatchRequest, escalated_from: str | None = None) -> TaskRecord:
         task_id = uuid.uuid4().hex
@@ -83,15 +100,14 @@ class Dispatcher:
             finished_at=None,
         )
         await self.storage.insert_task(record)
-        event = asyncio.Event()
-        self._events[task_id] = event
+        self._events[task_id] = asyncio.Event()
         self._tasks[task_id] = asyncio.create_task(self._run(task_id))
         self._tasks[task_id].add_done_callback(
             lambda worker, tid=task_id: self._track_cleanup(self._on_worker_done(tid, worker))
         )
         return record
 
-    def _track_cleanup(self, coro) -> None:
+    def _track_cleanup(self, coro: Coroutine[None, None, None]) -> None:
         task = asyncio.create_task(coro)
         self._cleanup.add(task)
         task.add_done_callback(self._cleanup.discard)
@@ -110,15 +126,13 @@ class Dispatcher:
         visited = {record.task_id}
         while True:
             remaining = deadline - time.monotonic()
-            if record.status not in _FINAL and remaining > 0:
+            if record.status not in FINAL_STATUSES and remaining > 0:
                 event = self._events.get(record.task_id)
                 if event is not None:
-                    try:
+                    with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(event.wait(), remaining)
-                    except TimeoutError:
-                        pass
                 record = await self.get(record.task_id) or record
-            if record.status not in _FINAL:
+            if record.status not in FINAL_STATUSES:
                 return record
             child_id = record.result.meta.get("escalated_to") if record.result else None
             if not child_id:
@@ -133,7 +147,7 @@ class Dispatcher:
         record = await self.get(task_id)
         if record is None:
             raise KeyError(task_id)
-        if record.status in _FINAL:
+        if record.status in FINAL_STATUSES:
             raise ValueError(f"task already finished: {task_id}")
         worker = self._tasks.get(task_id)
         if worker:
@@ -142,9 +156,7 @@ class Dispatcher:
             record.status = TaskStatus.cancelled
             record.finished_at = self._now()
             await self.storage.update_task(record)
-            event = self._events.get(task_id)
-            if event:
-                event.set()
+            self._notify(task_id)
         return await self.wait(task_id, wait_seconds)
 
     async def recover_stale(self) -> int:
@@ -169,15 +181,12 @@ class Dispatcher:
         return count
 
     async def route_only(self, req: DispatchRequest) -> tuple[RouteDecision, list[GuardEvent]]:
-        decision, event, events, names = await self._decide(req)
-        if event:
-            events = [event]
-        await self.storage.add_decision(None, decision, names)
-        return decision, events
+        routing = await self._route(req)
+        await self.storage.add_decision(None, routing.decision, routing.candidates)
+        # Сработавший guard объясняет решение целиком: события роутеров к нему не относятся.
+        return routing.decision, [routing.guard] if routing.guard else routing.events
 
-    async def _decide(
-        self, req: DispatchRequest, *, is_escalation: bool = False
-    ) -> tuple[RouteDecision, GuardEvent | None, list[GuardEvent], list[str]]:
+    async def _route(self, req: DispatchRequest, *, is_escalation: bool = False) -> Routing:
         await self.availability.check_all()
         parent_exists = (
             await self.storage.task_exists(req.parent_task_id) if req.parent_task_id else False
@@ -192,42 +201,31 @@ class Dispatcher:
         names = candidates(
             self.settings, self.availability.unavailable(), req.source_agent, req.hop
         )
-        events: list[GuardEvent] = []
-        guard: GuardEvent | None = None
         if isinstance(verdict, GuardEvent):
-            guard = verdict
-            decision = RouteDecision(
-                executor=self.settings.routing.fallback_executor,
-                confidence=0,
-                scores={},
-                router=RouterKind.fallback,
-                reason=verdict.reason,
-            )
-        elif isinstance(verdict, RouteDecision):
-            decision = verdict
+            return Routing(self._fallback_decision(verdict.reason), verdict, [], names)
+        if isinstance(verdict, RouteDecision):
             guard = GuardEvent(
                 reason=GuardReason.user_override,
                 detail="user executor override",
-                executor=decision.executor,
+                executor=verdict.executor,
             )
-        elif not names:
-            event = GuardEvent(reason=GuardReason.unavailable, detail="no available executors")
-            decision = RouteDecision(
-                executor=self.settings.routing.fallback_executor,
-                confidence=0,
-                scores={},
-                router=RouterKind.fallback,
-                reason=event.reason,
-            )
-            guard = event
-        else:
-            decision, events = await decide_with_fallback(
-                req,
-                {n: self.settings.executors[n] for n in names},
-                self.settings,
-                self.routers,
-            )
-        return decision, guard, events, names
+            return Routing(verdict, guard, [], names)
+        if not names:
+            guard = GuardEvent(reason=GuardReason.unavailable, detail="no available executors")
+            return Routing(self._fallback_decision(guard.reason), guard, [], names)
+        decision, events = await decide_with_fallback(
+            req, {n: self.settings.executors[n] for n in names}, self.settings, self.routers
+        )
+        return Routing(decision, None, events, names)
+
+    def _fallback_decision(self, reason: GuardReason) -> RouteDecision:
+        return RouteDecision(
+            executor=self.settings.routing.fallback_executor,
+            confidence=0,
+            scores={},
+            router=RouterKind.fallback,
+            reason=reason,
+        )
 
     async def shutdown(self) -> None:
         workers = list(self._tasks.values())
@@ -243,10 +241,9 @@ class Dispatcher:
 
     async def _on_worker_done(self, task_id: str, worker: asyncio.Task[None]) -> None:
         self._tasks.pop(task_id, None)
-        event = self._events.get(task_id)
         try:
             record = await self.storage.get_task(task_id)
-            if record and record.status not in _FINAL:
+            if record and record.status not in FINAL_STATUSES:
                 record.status = TaskStatus.cancelled if worker.cancelled() else TaskStatus.failed
                 record.finished_at = self._now()
                 record.result = ExecutionResult(
@@ -261,202 +258,223 @@ class Dispatcher:
                 await self.storage.update_task(record)
                 await self.storage.add_event(task_id, "exit", {"status": record.status.value})
         finally:
-            if event:
-                event.set()
+            self._notify(task_id)
             self._events.pop(task_id, None)
 
-    async def _guard_failure(self, record: TaskRecord, event: GuardEvent) -> None:
+    async def _guard_failure(self, record: TaskRecord, guard: GuardEvent) -> None:
         result = ExecutionResult(
             status="failed",
             executor="",
             model=None,
             summary="",
-            error=event.detail,
-            meta={"guard": event.reason.value},
+            error=guard.detail,
+            meta={"guard": guard.reason.value},
         )
         record.status, record.result, record.finished_at = TaskStatus.failed, result, self._now()
-        await self.storage.add_event(record.task_id, "guard", event.model_dump(mode="json"))
+        await self.storage.add_event(record.task_id, "guard", guard.model_dump(mode="json"))
         await self.storage.update_task(record)
-        event = self._events.get(record.task_id)
-        if event:
-            event.set()
+        self._notify(record.task_id)
 
     async def _run(self, task_id: str) -> None:
         record = await self.storage.get_task(task_id)
         if record is None:
             return
         try:
-            record.status = TaskStatus.routing
-            await self.storage.update_task(record)
-            req = record.request
-            decision, guard, events, names = await self._decide(
-                req, is_escalation=record.escalated_from is not None
-            )
-            if guard and guard.reason != GuardReason.user_override:
-                await self._guard_failure(record, guard)
+            prepared = await self._prepare(record)
+            if prepared is None:
                 return
-            if guard is not None:
-                events.append(guard)
-            if record.escalated_from is not None:
-                decision = decision.model_copy(
-                    update={"router": RouterKind.fallback, "reason": GuardReason.escalated}
-                )
-            record.decision = decision
-            await self.storage.add_decision(task_id, decision, names)
-            for event in events:
-                await self.storage.add_event(task_id, "guard", event.model_dump(mode="json"))
-            adapter = self.adapters.get(decision.executor)
-            if adapter is None:
-                await self._guard_failure(
-                    record,
-                    GuardEvent(
-                        reason=GuardReason.unavailable,
-                        detail=f"executor unavailable: {decision.executor}",
-                        executor=decision.executor,
-                    ),
-                )
-                return
-            mode = req.workspace_mode or self.settings.execution.workspace_mode
-            lock_cm = _NullAsyncContext()
-            sem_cm = _NullAsyncContext()
-            if req.hop == 0:
-                sem_cm = self._semaphore
-            # В режиме worktree исполнители не делят дерево, поэтому lock нужен
-            # только на время переноса результата обратно в рабочую копию.
-            if req.hop == 0 and mode == "in_place":
-                lock_cm = self._cwd_lock(req.cwd)
-            async with sem_cm:
-                async with lock_cm:
-                    tree = None
-                    if mode == "worktree":
-                        tree = await asyncio.to_thread(self._create_worktree, req, task_id)
-                        await self.storage.add_event(
-                            task_id,
-                            "worktree",
-                            {"path": str(tree.path), "branch": tree.branch},
-                        )
-                    work_dir = str(tree.path) if tree else req.cwd
-                    package = await asyncio.to_thread(
-                        build_task_package,
-                        req,
-                        self.settings,
-                        str(tree.path) if tree else None,
-                        tree.branch if tree else None,
-                    )
-                    prompt = await asyncio.to_thread(
-                        render_prompt,
-                        package,
-                        self.settings.executors[decision.executor].adapter,
-                        self.settings,
-                    )
-                    record.status, record.started_at = TaskStatus.running, self._now()
-                    await self.storage.update_task(record)
-                    await self.storage.add_event(
-                        task_id,
-                        "spawn",
-                        {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
-                    )
-                    ctx = RunContext(
-                        cwd=work_dir,
-                        timeout_seconds=req.timeout_seconds
-                        or self.settings.routing.default_timeout_seconds,
-                        env=child_env(
-                            self.settings,
-                            {
-                                "AGENT_DISPATCH_TASK_ID": task_id,
-                                "AGENT_DISPATCH_ROOT_AGENT": record.root_agent.value,
-                                "AGENT_DISPATCH_HOP": str(req.hop + 1),
-                            },
-                        ),
-                        log_path=Path(record.log_path),
-                        task_id=task_id,
-                        prompt=prompt,
-                    )
-                    try:
-                        result = await adapter.execute(ctx)
-                    except asyncio.CancelledError:
-                        record.status, record.finished_at = TaskStatus.cancelled, self._now()
-                        await self.storage.add_event(task_id, "cancel", {})
-                        await self.storage.update_task(record)
-                        event = self._events.get(task_id)
-                        if event:
-                            event.set()
-                        raise
-                    except Exception as exc:
-                        result = ExecutionResult(
-                            status="failed",
-                            executor=decision.executor,
-                            model=None,
-                            summary="",
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                    if tree is not None:
-                        await self._finish_worktree(req, tree, result, task_id)
-                    record.result = result
-                    record.status, record.finished_at = TaskStatus(result.status), self._now()
-                    reason = should_escalate(result) if req.allow_escalation else None
-                    if reason is not None:
-                        tried = await self._escalation_chain(record)
-                        nxt = next_executor(decision.executor, self.settings, tried)
-                        if nxt is None:
-                            result.meta["escalation_chain"] = tried
-                            if result.status != "failed":
-                                result.status = "failed"
-                                result.error = f"escalation exhausted: {reason}"
-                                record.status = TaskStatus.failed
-                        else:
-                            await self.storage.add_event(
-                                task_id,
-                                "escalate",
-                                {"from": decision.executor, "to": nxt, "reason": reason},
-                            )
-                            child = await self.submit(
-                                req.model_copy(update={"executor": nxt}),
-                                escalated_from=task_id,
-                            )
-                            result.meta["escalated_to"] = child.task_id
-                    await self.storage.add_event(
-                        task_id,
-                        "exit",
-                        {"status": result.status, "changed_files": len(result.changed_files)},
-                    )
-                    await self.storage.update_task(record)
-                    event = self._events.get(task_id)
-                    if event:
-                        event.set()
+            decision, adapter = prepared
+            await self._execute(record, decision, adapter)
         except asyncio.CancelledError:
-            if record.status not in _FINAL:
-                record.status, record.finished_at = TaskStatus.cancelled, self._now()
-                await self.storage.add_event(task_id, "cancel", {})
-                await self.storage.update_task(record)
-                event = self._events.get(task_id)
-                if event:
-                    event.set()
+            await self._mark_cancelled(record)
             raise
         except Exception as exc:
-            result = ExecutionResult(
-                status="failed",
-                executor=record.decision.executor if record.decision else "",
-                model=None,
-                summary="",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            record.result, record.status, record.finished_at = (
-                result,
-                TaskStatus.failed,
-                self._now(),
-            )
-            await self.storage.add_event(task_id, "exit", {"status": "failed"})
-            await self.storage.update_task(record)
-            event = self._events.get(task_id)
-            if event:
-                event.set()
-        finally:
-            self._release_cwd_lock(record.request)
+            await self._mark_failed(record, exc)
 
-    def _cwd_lock(self, cwd: str) -> asyncio.Lock:
-        key = str(Path(cwd).resolve())
-        return self._cwd_locks.setdefault(key, asyncio.Lock())
+    async def _prepare(self, record: TaskRecord) -> tuple[RouteDecision, ExecutorAdapter] | None:
+        """Маршрутизация и guard'ы. None значит, что задача уже закрыта отказом."""
+        record.status = TaskStatus.routing
+        await self.storage.update_task(record)
+        routing = await self._route(record.request, is_escalation=record.escalated_from is not None)
+        if routing.guard and routing.guard.reason != GuardReason.user_override:
+            await self._guard_failure(record, routing.guard)
+            return None
+        decision = routing.decision
+        if record.escalated_from is not None:
+            decision = decision.model_copy(
+                update={"router": RouterKind.fallback, "reason": GuardReason.escalated}
+            )
+        record.decision = decision
+        await self.storage.add_decision(record.task_id, decision, routing.candidates)
+        for event in routing.events + ([routing.guard] if routing.guard else []):
+            await self.storage.add_event(record.task_id, "guard", event.model_dump(mode="json"))
+        adapter = self.adapters.get(decision.executor)
+        if adapter is None:
+            await self._guard_failure(
+                record,
+                GuardEvent(
+                    reason=GuardReason.unavailable,
+                    detail=f"executor unavailable: {decision.executor}",
+                    executor=decision.executor,
+                ),
+            )
+            return None
+        return decision, adapter
+
+    async def _execute(
+        self, record: TaskRecord, decision: RouteDecision, adapter: ExecutorAdapter
+    ) -> None:
+        req, task_id = record.request, record.task_id
+        mode = req.workspace_mode or self.settings.execution.workspace_mode
+        semaphore = self._semaphore if req.hop == 0 else contextlib.nullcontext()
+        # В режиме worktree исполнители не делят дерево, поэтому lock нужен
+        # только на время переноса результата обратно в рабочую копию.
+        lock = (
+            self._cwd_lock(req.cwd)
+            if req.hop == 0 and mode == "in_place"
+            else contextlib.nullcontext()
+        )
+        async with semaphore, lock:
+            tree = None
+            if mode == "worktree":
+                tree = await asyncio.to_thread(self._create_worktree, req, task_id)
+                await self.storage.add_event(
+                    task_id, "worktree", {"path": str(tree.path), "branch": tree.branch}
+                )
+            ctx = await self._build_context(record, decision, tree)
+            record.status, record.started_at = TaskStatus.running, self._now()
+            await self.storage.update_task(record)
+            await self.storage.add_event(
+                task_id, "spawn", {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd}
+            )
+            try:
+                result = await adapter.execute(ctx)
+            except Exception as exc:
+                result = ExecutionResult(
+                    status="failed",
+                    executor=decision.executor,
+                    model=None,
+                    summary="",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            if tree is not None:
+                await self._finish_worktree(req, tree, result, task_id)
+            await self._finalize(record, decision, result)
+
+    async def _build_context(
+        self, record: TaskRecord, decision: RouteDecision, tree: worktree.Worktree | None
+    ) -> RunContext:
+        """Task Package и prompt под адаптер выбранного исполнителя."""
+        req = record.request
+        package = await asyncio.to_thread(
+            build_task_package,
+            req,
+            self.settings,
+            str(tree.path) if tree else None,
+            tree.branch if tree else None,
+        )
+        prompt = await asyncio.to_thread(
+            render_prompt,
+            package,
+            self.settings.executors[decision.executor].adapter,
+            self.settings,
+        )
+        return RunContext(
+            cwd=str(tree.path) if tree else req.cwd,
+            timeout_seconds=req.timeout_seconds or self.settings.routing.default_timeout_seconds,
+            env=child_env(
+                self.settings,
+                {
+                    "AGENT_DISPATCH_TASK_ID": record.task_id,
+                    "AGENT_DISPATCH_ROOT_AGENT": record.root_agent.value,
+                    "AGENT_DISPATCH_HOP": str(req.hop + 1),
+                },
+            ),
+            log_path=Path(record.log_path),
+            task_id=record.task_id,
+            prompt=prompt,
+        )
+
+    async def _finalize(
+        self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
+    ) -> None:
+        """Записать результат, при необходимости эскалировать, разбудить ожидающих."""
+        record.result = result
+        record.status, record.finished_at = TaskStatus(result.status), self._now()
+        reason = should_escalate(result) if record.request.allow_escalation else None
+        if reason is not None:
+            await self._escalate(record, decision, result, reason)
+        await self.storage.add_event(
+            record.task_id,
+            "exit",
+            {"status": result.status, "changed_files": len(result.changed_files)},
+        )
+        await self.storage.update_task(record)
+        self._notify(record.task_id)
+
+    async def _escalate(
+        self,
+        record: TaskRecord,
+        decision: RouteDecision,
+        result: ExecutionResult,
+        reason: str,
+    ) -> None:
+        """Отдать задачу следующему исполнителю цепочки, либо закрыть её отказом."""
+        tried = await self._escalation_chain(record)
+        nxt = next_executor(decision.executor, self.settings, tried)
+        if nxt is None:
+            result.meta["escalation_chain"] = tried
+            if result.status != "failed":
+                result.status = "failed"
+                result.error = f"escalation exhausted: {reason}"
+                record.status = TaskStatus.failed
+            return
+        await self.storage.add_event(
+            record.task_id,
+            "escalate",
+            {"from": decision.executor, "to": nxt, "reason": reason},
+        )
+        child = await self.submit(
+            record.request.model_copy(update={"executor": nxt}), escalated_from=record.task_id
+        )
+        result.meta["escalated_to"] = child.task_id
+
+    async def _mark_cancelled(self, record: TaskRecord) -> None:
+        if record.status in FINAL_STATUSES:
+            return
+        record.status, record.finished_at = TaskStatus.cancelled, self._now()
+        await self.storage.add_event(record.task_id, "cancel", {})
+        await self.storage.update_task(record)
+        self._notify(record.task_id)
+
+    async def _mark_failed(self, record: TaskRecord, exc: BaseException) -> None:
+        record.result = ExecutionResult(
+            status="failed",
+            executor=record.decision.executor if record.decision else "",
+            model=None,
+            summary="",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        record.status, record.finished_at = TaskStatus.failed, self._now()
+        await self.storage.add_event(record.task_id, "exit", {"status": "failed"})
+        await self.storage.update_task(record)
+        self._notify(record.task_id)
+
+    @contextlib.asynccontextmanager
+    async def _cwd_lock(self, cwd: str) -> AsyncIterator[None]:
+        """Lock на рабочую копию; запись снимается, когда её больше никто не ждёт."""
+        key = str(Path(cwd).resolve())  # noqa: ASYNC240
+        lock, waiters = self._cwd_locks.get(key, (asyncio.Lock(), 0))
+        self._cwd_locks[key] = (lock, waiters + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, waiters = self._cwd_locks[key]
+            if waiters <= 1:
+                self._cwd_locks.pop(key, None)
+            else:
+                self._cwd_locks[key] = (lock, waiters - 1)
 
     def _create_worktree(self, req: DispatchRequest, task_id: str) -> worktree.Worktree:
         base = self.settings.execution.worktree_dir or (self.settings.server.data_dir / "worktrees")
@@ -542,20 +560,3 @@ class Dispatcher:
                 break
         chain.reverse()
         return chain
-
-    def _release_cwd_lock(self, req: DispatchRequest) -> None:
-        """Убрать lock cwd из словаря, если он свободен и его никто не ждёт."""
-        if req.hop != 0:
-            return
-        key = str(Path(req.cwd).resolve())  # noqa: ASYNC240
-        lock = self._cwd_locks.get(key)
-        if lock and not lock.locked() and not lock._waiters:  # type: ignore[attr-defined]
-            self._cwd_locks.pop(key, None)
-
-
-class _NullAsyncContext:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_args):
-        return False

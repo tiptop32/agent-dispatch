@@ -7,21 +7,32 @@ from dataclasses import dataclass
 
 from fastapi import FastAPI
 
+from agent_dispatch.config import Settings
+from agent_dispatch.dispatch.dispatcher import Dispatcher
+from agent_dispatch.executors.registry import AvailabilityCache
+from agent_dispatch.telemetry.storage import Storage
+
 from .auth import install_auth
 from .routes import build_router
 
 
 @dataclass
 class AppDeps:
-    settings: object
-    dispatcher: object
-    storage: object
-    availability: object
+    settings: Settings
+    dispatcher: Dispatcher
+    storage: Storage
+    availability: AvailabilityCache
     token: str
     started_at: float
 
 
-def create_app(settings, dispatcher, storage, availability, token: str) -> FastAPI:
+def create_app(
+    settings: Settings,
+    dispatcher: Dispatcher,
+    storage: Storage,
+    availability: AvailabilityCache,
+    token: str,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await storage.open()

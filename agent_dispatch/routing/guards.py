@@ -3,6 +3,7 @@ from __future__ import annotations
 from agent_dispatch.config import Settings
 from agent_dispatch.executors.workspace import is_git_repo
 from agent_dispatch.models import (
+    ConfidenceTier,
     DispatchRequest,
     GuardEvent,
     GuardReason,
@@ -81,7 +82,7 @@ def single_candidate_decision(name: str) -> RouteDecision:
     )
 
 
-def classify_confidence(confidence: float, settings: Settings) -> str:
+def classify_confidence(confidence: float, settings: Settings) -> ConfidenceTier:
     """Насколько решению можно доверять.
 
     `autonomous` — можно выполнять как есть, `advisory` — стоит посмотреть самому,

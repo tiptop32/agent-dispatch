@@ -13,7 +13,13 @@ from agent_dispatch.api import create_app
 from agent_dispatch.config import ExecutorSettings, RoutingSettings, ServerSettings, Settings
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.executors.registry import AvailabilityCache
-from agent_dispatch.models import DispatchRequest, ExecutionResult, RouteDecision, RouterKind
+from agent_dispatch.models import (
+    DispatchRequest,
+    ExecutionResult,
+    RouteDecision,
+    RouterKind,
+    TaskStatus,
+)
 from agent_dispatch.serve_state import ServeState, is_alive, write_state
 from agent_dispatch.server import run_server
 from agent_dispatch.telemetry.storage import Storage
@@ -265,7 +271,7 @@ async def test_lifespan_recovers_stale_task(api):
     worker.cancel()
     await asyncio.gather(worker, return_exceptions=True)
     stale = await storage.get_task(record.task_id)
-    stale.status = "running"
+    stale.status = TaskStatus.running
     await storage.update_task(stale)
     app = client._transport.app
     async with app.router.lifespan_context(app):
