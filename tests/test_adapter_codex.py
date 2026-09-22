@@ -93,6 +93,14 @@ async def test_codex_non_git_cwd_fails_before_cli(tmp_path):
 
 @pytest.mark.asyncio
 async def test_codex_timeout_cleans_temp_dir(git_repo, tmp_path):
+    import tempfile
+
+    # Смотрим только на каталоги, появившиеся во время этого вызова: в системном tmp
+    # могут жить каталоги настоящих задач, если демон работает параллельно с тестами.
+    def temp_dirs() -> set[Path]:
+        return set(Path(tempfile.gettempdir()).glob("agent-dispatch-codex-*"))
+
+    before = await asyncio.to_thread(temp_dirs)
     adapter = CodexAdapter(
         "codex", ExecutorSettings(adapter="codex", command=str(ROOT / "fakes/sleep_forever.sh"))
     )
@@ -100,11 +108,7 @@ async def test_codex_timeout_cleans_temp_dir(git_repo, tmp_path):
         ctx(git_repo, tmp_path).model_copy(update={"timeout_seconds": 0.2})
     )
     assert result.status == "failed"
-    import tempfile
-
-    assert not await asyncio.to_thread(
-        lambda: list(Path(tempfile.gettempdir()).glob("agent-dispatch-codex-*"))
-    )
+    assert await asyncio.to_thread(temp_dirs) - before == set()
 
 
 @pytest.mark.asyncio

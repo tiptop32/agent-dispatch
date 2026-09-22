@@ -64,7 +64,7 @@ def main() -> None:
     parser.add_argument("--report-dir", default="evals/reports")
     parser.add_argument("--timeout", type=int, default=900)
     args = parser.parse_args()
-    invalid = set(args.tasks.split(",")) - TASKS
+    invalid = set(args.tasks.split(",")) - set(TASKS)
     if invalid:
         parser.error(f"unknown tasks: {sorted(invalid)}")
     raise SystemExit(asyncio.run(run(args)))

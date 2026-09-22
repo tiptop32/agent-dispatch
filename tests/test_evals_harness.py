@@ -315,3 +315,23 @@ def test_verify_docstring_rejects_renamed_function(tmp_path):
     verdict = verify(repo, _view(), "docstring")
     assert not verdict.ok
     assert "missing docstring on add()" in verdict.reasons
+
+
+def test_smoke_main_rejects_unknown_task_and_accepts_known(monkeypatch, capsys):
+    import evals.smoke.__main__ as smoke_main
+
+    monkeypatch.setattr("sys.argv", ["smoke", "--tasks", "fix,bogus"])
+    with pytest.raises(SystemExit) as exc:
+        smoke_main.main()
+    assert exc.value.code == 2
+    assert "unknown tasks" in capsys.readouterr().err
+
+    async def fake_run(args):
+        assert args.tasks == "fix,docstring"
+        return 0
+
+    monkeypatch.setattr(smoke_main, "run", fake_run)
+    monkeypatch.setattr("sys.argv", ["smoke", "--tasks", "fix,docstring"])
+    with pytest.raises(SystemExit) as exc:
+        smoke_main.main()
+    assert exc.value.code == 0
