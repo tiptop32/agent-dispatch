@@ -1,0 +1,98 @@
+{
+  "model": "typesafe/jev-1.13",
+  "state": {
+    "task": "tests/test_x.py fails after the refactor; find the bug in src/x.py and fix it",
+    "context": "The suite passed before the parser refactor.",
+    "files": [
+      "src/x.py",
+      "tests/test_x.py"
+    ],
+    "constraints": [
+      "do not change the public API"
+    ],
+    "source_agent": "codex"
+  },
+  "questions": {
+    "capability": {
+      "type": "choice",
+      "instructions": "What level of coding capability does this task demand from the agent that will implement it?",
+      "criteria": {
+        "balanced": "Ordinary engineering inside one repository: a bug fix from a failing test, a small feature, a local refactor, tests written by example."
+      }
+    },
+    "judgment": {
+      "type": "noul",
+      "instructions": "Does this task require resolving trade-offs or ambiguous requirements, rather than only executing a clear specification?"
+    },
+    "difficulty": {
+      "type": "score",
+      "instructions": "How hard is this coding task?",
+      "criteria": [
+        {
+          "label": "trivial",
+          "description": "one-line or config change"
+        },
+        {
+          "label": "moderate",
+          "description": "localized bug fix in one module"
+        },
+        {
+          "label": "hard",
+          "description": "cross-module reasoning or design decisions"
+        }
+      ]
+    },
+    "task_type": {
+      "type": "choice",
+      "instructions": "What kind of task is this?",
+      "criteria": {
+        "bugfix": "fix a defect or failing test",
+        "feature": "add new behavior",
+        "refactor": "restructure without changing behavior",
+        "docs": "documentation or comments",
+        "test": "add or fix tests only",
+        "ops": "build, CI, config, tooling"
+      }
+    },
+    "risk": {
+      "type": "score",
+      "instructions": "How risky is this change for the codebase?",
+      "criteria": [
+        {
+          "label": "low",
+          "description": "isolated change, easy to revert"
+        },
+        {
+          "label": "medium",
+          "description": "touches shared code or behavior"
+        },
+        {
+          "label": "high",
+          "description": "public API, data, or infrastructure"
+        }
+      ]
+    },
+    "ambiguity": {
+      "type": "score",
+      "instructions": "How clearly is the task specified?",
+      "criteria": [
+        {
+          "label": "clear",
+          "description": "fully specified"
+        },
+        {
+          "label": "some",
+          "description": "minor open questions"
+        },
+        {
+          "label": "vague",
+          "description": "goal or scope unclear"
+        }
+      ]
+    },
+    "decomposable": {
+      "type": "noul",
+      "instructions": "Can this task be split into independent subtasks handled in parallel?"
+    }
+  }
+}

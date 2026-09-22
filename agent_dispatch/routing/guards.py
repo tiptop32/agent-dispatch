@@ -81,10 +81,24 @@ def single_candidate_decision(name: str) -> RouteDecision:
     )
 
 
+def classify_confidence(confidence: float, settings: Settings) -> str:
+    """Насколько решению можно доверять.
+
+    `autonomous` — можно выполнять как есть, `advisory` — стоит посмотреть самому,
+    `fallback` — решение не несёт информации и подменяется запасным исполнителем.
+    """
+    if confidence >= settings.routing.autonomous_confidence:
+        return "autonomous"
+    if confidence >= settings.routing.min_confidence:
+        return "advisory"
+    return "fallback"
+
+
 def post_guards(
     decision: RouteDecision, settings: Settings, candidates: list[str]
 ) -> tuple[RouteDecision, list[GuardEvent]]:
     result = decision.model_copy(deep=True)
+    result.confidence_tier = classify_confidence(result.confidence, settings)
     events: list[GuardEvent] = []
     ranked = sorted(result.scores.items(), key=lambda item: item[1], reverse=True)
     top1 = ranked[0][0] if ranked else result.executor

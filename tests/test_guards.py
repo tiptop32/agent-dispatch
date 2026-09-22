@@ -198,4 +198,8 @@ def test_post_ok_no_mutation_or_events():
         router=RouterKind.jev, executor="claude", confidence=1, scores={"claude": 0.9, "codex": 0.1}
     )
     out, events = post_guards(d, settings(), ["claude", "codex"])
-    assert out == d and out is not d and not events
+    assert out is not d and not events
+    assert out.executor == d.executor and out.scores == d.scores
+    # Уверенный выбор помечается как autonomous, но не подменяется.
+    assert out.confidence_tier == "autonomous"
+    assert out.model_copy(update={"confidence_tier": None}) == d

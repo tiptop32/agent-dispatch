@@ -79,6 +79,7 @@ class DispatchRequest(_Model):
     parent_task_id: str | None = None
     root_agent: SourceAgent | None = None
     hop: int = Field(0, ge=0)
+    workspace_mode: Literal["in_place", "worktree"] | None = None
 
     @field_validator("files")
     @classmethod
@@ -103,12 +104,19 @@ class GuardEvent(_Model):
     executor: str | None = None
 
 
+ConfidenceTier = Literal["autonomous", "advisory", "fallback"]
+
+
 class RouteDecision(_Model):
     executor: str
     confidence: float
     scores: dict[str, float]
     router: RouterKind
     reason: GuardReason | None = None
+    #: Какой уровень работы запросил роутер: fast, balanced, strong.
+    capability: str | None = None
+    #: Насколько решению можно доверять: autonomous, advisory, fallback.
+    confidence_tier: ConfidenceTier | None = None
     judgments: dict[str, Judgment] = Field(default_factory=dict)
     latency_ms: int = 0
     cost_usd: float | None = None

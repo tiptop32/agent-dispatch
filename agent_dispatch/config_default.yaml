@@ -20,7 +20,8 @@ router:
     model: null
 
 routing:
-  min_confidence: 0.60
+  min_confidence: 0.60        # ниже: решение не несёт информации, идёт fallback_executor
+  autonomous_confidence: 0.85  # выше: решению можно доверять без присмотра
   min_margin: 0.10
   fallback_executor: codex
   max_hops: 2
@@ -29,18 +30,27 @@ routing:
   default_timeout_seconds: 1800
   availability_ttl_seconds: 60
 
+execution:
+  workspace_mode: in_place    # worktree: каждому исполнителю свой git worktree
+  worktree_dir: null          # по умолчанию <data_dir>/worktrees
+  branch_prefix: agent-dispatch
+  integrate: apply            # apply: вернуть патч в рабочую копию; manual: оставить ветку
+  keep_worktrees: false
+
 executors:
   claude:
     adapter: claude
     command: claude
     extra_args: ["--permission-mode", "acceptEdits", "--allowedTools", "Bash,Edit,Write,Read,Glob,Grep"]
     enabled: true
+    tier: strong
     description: "Claude Code: strongest reasoning, multi-file refactors, ambiguous or design-heavy tasks; most expensive"
   codex:
     adapter: codex
     command: codex
     extra_args: ["--sandbox", "workspace-write"]
     enabled: true
+    tier: balanced
     description: "OpenAI Codex CLI: autonomous bug fixing and test-driven fixes in a single repo; medium cost"
   opencode/kimi:
     adapter: opencode
@@ -48,6 +58,7 @@ executors:
     model: openrouter/kimi-k2.5
     extra_args: []
     enabled: true
+    tier: fast
     description: "OpenCode with Kimi K2.5: cheap, good for small well-specified edits, docs, boilerplate"
 
 escalation:

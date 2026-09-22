@@ -17,6 +17,9 @@
 - Env дочерних CLI также без `CLAUDECODE`/`CLAUDE_CODE_*`, иначе `claude -p` отказывается работать вложенно.
 - Инкремент hop только в демоне (`AGENT_DISPATCH_HOP = hop + 1`); прокси передаёт значение без изменений.
 - Исполнители и модели задаются только в config.yaml (`executors`, `escalation`); в коде нет списка моделей.
+- Jev выбирает уровень работы (`capability`: fast/balanced/strong), а не имя модели: имена неразличимы для модели и дают плоское распределение. Соответствие уровня и исполнителя живёт в `routing/capability.py` и поле `tier` конфига.
+- `corporate: true` у исполнителя это периметр данных, а не цена: он выигрывает у `judgment` при выборе.
+- В режиме `execution.workspace_mode: worktree` исполнитель работает в отдельном git worktree от HEAD, а результат возвращается патчем; lock на `cwd` берётся только на время интеграции.
 - `config.example.yaml` равен `agent_dispatch/config_default.yaml` (есть тест).
 - Фикстуры: `tests/fixtures/jev/` (живые ответы Jev), `tests/fixtures/agent_output/` (живые выводы claude/codex/opencode), fake-CLI в `tests/fakes/`. Session-фикстура прогревает fake-скрипты (первый exec на macOS медленный).
 - Codex strict-schema: `schemas/agent_result.strict.schema.json`, обычную схему Codex отвергает.

@@ -129,7 +129,7 @@ async def test_jev_check_calls_router_online(tmp_config_dir):
         return_value=httpx.Response(200, json=json.loads(JEV_RESPONSE.read_text()))
     )
     checks = await run_checks(settings, online=True)
-    assert checks[-1].ok and checks[-1].detail.startswith("ok executor=codex ")
+    assert checks[-1].ok and checks[-1].detail.startswith("ok executor=")
 
 
 @pytest.mark.asyncio

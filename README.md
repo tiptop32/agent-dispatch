@@ -119,12 +119,34 @@ AgentDispatch не обязателен для каждого запроса: э
 
 1. Task Package: `task`, `cwd`, `context`, `files`, `constraints`, `success_criteria`. Режим `context_mode` (`prompt`, `prompt+summary`, `full`) задаёт, сколько контекста уходит исполнителю. История чата не передаётся никогда.
 2. Кандидаты: включённые исполнители минус недоступные минус исполнитель того же типа, что и вызывающий агент (только на hop 0).
-3. Один запрос к Jev с вопросами `executor` (choice по описаниям из конфига), `difficulty`, `task_type`, `risk`, `ambiguity`, `decomposable`. Ответ содержит вероятности и confidence.
-4. Post-guards: `confidence < min_confidence` или отрыв от второго кандидата меньше `min_margin` → `fallback_executor`.
-5. Запуск адаптера в `cwd`. `changed_files` считаются по `git status` до и после, а не со слов агента.
-6. Результат нормализуется в `ExecutionResult`: `status` (`completed | partial | failed | needs_context | needs_escalation`), `summary`, `changed_files`, `tests`, `confidence`, `usage`.
+3. Один запрос к Jev. Несущий вопрос это `capability`: какого уровня работы требует задача (`fast`, `balanced`, `strong`). Имена моделей Jev не показываются. Рядом идут `judgment` (нужно ли разрешать компромиссы, а не просто исполнять), `corporate_data` (данные не должны покидать периметр; спрашивается, только если есть исполнитель с `corporate: true`), `difficulty`, `task_type`, `risk`, `ambiguity`, `decomposable`.
+4. Исполнителя подбирает код: `corporate` сужает пул до внутреннего периметра, `judgment` отдаёт задачу рассуждающему агенту, дальше выбирается кандидат нужного `tier` (при отсутствии такого берётся ближайший вверх, затем вниз), при равенстве побеждает тот, кто идёт в конфиге выше.
+5. Post-guards: `confidence >= autonomous_confidence` это `autonomous`, между ним и `min_confidence` это `advisory` (решение выполняется, но помечено как слабое), ниже `min_confidence` или отрыв меньше `min_margin` → `fallback_executor`.
+6. Запуск адаптера в рабочем каталоге. `changed_files` считаются по `git status` до и после, а не со слов агента.
+7. Результат нормализуется в `ExecutionResult`: `status` (`completed | partial | failed | needs_context | needs_escalation`), `summary`, `changed_files`, `tests`, `confidence`, `usage`.
 
-Если Jev недоступен, работает `claude_local` (тот же выбор через `claude -p`), а если и он недоступен, `fallback_executor`.
+Если Jev недоступен, работает `claude_local` (выбор исполнителя по описаниям через `claude -p`), а если и он недоступен, `fallback_executor`.
+
+Почему не спрашивать у Jev имя модели: вендорские описания моделей неразличимы, и распределение получается плоским. На одних и тех же 20 размеченных задачах выбор по имени исполнителя давал среднюю уверенность 0.93 при 4 кандидатах и 0.35-0.60 при 10, а вопрос о capability даёт 0.975 и не зависит от числа моделей (проверено на 3 и на 11 кандидатах: 0.932 против 0.934). Добавление модели больше не ухудшает маршрутизацию.
+
+### Рабочий каталог исполнителя
+
+По умолчанию (`execution.workspace_mode: in_place`) исполнитель правит вашу рабочую копию, и задачи в один репозиторий выстраиваются в очередь по `cwd`.
+
+В режиме `worktree` каждая задача получает свой `git worktree` от HEAD на ветке `<branch_prefix>/<task_id>`: параллельные сабагенты не затаптывают друг друга и не видят незакоммиченных правок вызывающего агента. После успешного прогона изменения возвращаются в рабочую копию патчем (`git apply --3way`), worktree и ветка удаляются. Если патч не лёг (вы правили те же строки), worktree и ветка остаются, путь к патчу лежит в `result.meta.patch`, а `result.meta.integrated` равно `false`.
+
+```yaml
+execution:
+  workspace_mode: worktree
+  integrate: apply      # manual: оставить ветку, ничего не применять
+  keep_worktrees: false
+```
+
+```bash
+agent-dispatch worktrees                      # что осталось после неудачных интеграций
+agent-dispatch worktrees --clean              # убрать деревья, ветки сохранить
+agent-dispatch worktrees --clean --delete-branches
+```
 
 ### Сабагенты и hop-протокол
 
@@ -141,12 +163,17 @@ executors:
   opencode/deepseek:
     adapter: opencode
     model: openrouter/deepseek-v3
+    tier: fast
     description: "OpenCode with DeepSeek: cheap, good for well-specified edits"
 escalation:
   opencode/deepseek: [codex, claude]
 ```
 
-`description` это и есть то, по чему Jev выбирает. Если routing accuracy падает, правьте описания, а не код.
+`tier` (`fast`, `balanced`, `strong`) это то, по чему исполнитель находится: Jev называет нужный уровень, код выбирает кандидата этого уровня. Внутри одного `tier` побеждает тот, кто идёт в конфиге выше, поэтому дешёвые варианты ставьте первыми.
+
+`corporate: true` помечает исполнителя внутри периметра. Если Jev отвечает, что задача касается корпоративных данных, выбор сужается до таких исполнителей; если ни одного нет, это попадает в `meta.selection_notes` решения, а не замалчивается.
+
+`description` больше не влияет на выбор Jev: он используется резервным роутером `claude_local` и выводится в `agent-dispatch executors`.
 
 Права исполнителей задаются `extra_args`. У `claude` по умолчанию `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,Read,Glob,Grep`, иначе он не сможет запустить тесты в headless-режиме. Кодекс идёт с `--sandbox workspace-write`.
 

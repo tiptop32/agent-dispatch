@@ -74,9 +74,7 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
         return checks
 
     started = time.monotonic()
-    candidates = {
-        name: executor.description for name, executor in settings.enabled_executors().items()
-    }
+    candidates = settings.enabled_executors()
     try:
         async with httpx.AsyncClient() as client:
             router = (

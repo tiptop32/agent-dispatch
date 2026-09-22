@@ -1,9 +1,14 @@
 import pytest
 
-from agent_dispatch.config import Settings
+from agent_dispatch.config import ExecutorSettings, Settings
 from agent_dispatch.models import DispatchRequest
 from agent_dispatch.routing.base import RouterError
 from agent_dispatch.routing.claude_local import ClaudeLocalRouter
+
+CANDIDATES = {
+    "codex": ExecutorSettings(adapter="codex", description="d"),
+    "claude": ExecutorSettings(adapter="claude", description="c"),
+}
 
 
 @pytest.mark.asyncio
@@ -18,9 +23,7 @@ async def test_claude_local_ok():
             "executors": {"codex": {"adapter": "codex"}, "claude": {"adapter": "claude"}},
         }
     )
-    result = await ClaudeLocalRouter(s).decide(
-        DispatchRequest(task="x", cwd="."), {"codex": "d", "claude": "c"}
-    )
+    result = await ClaudeLocalRouter(s).decide(DispatchRequest(task="x", cwd="."), CANDIDATES)
     assert result.executor == "codex"
 
 
@@ -34,7 +37,10 @@ async def test_claude_local_bad():
         }
     )
     with pytest.raises(RouterError):
-        await ClaudeLocalRouter(s).decide(DispatchRequest(task="x", cwd="."), {"codex": "d"})
+        await ClaudeLocalRouter(s).decide(
+            DispatchRequest(task="x", cwd="."),
+            {"codex": ExecutorSettings(adapter="codex", description="d")},
+        )
 
 
 @pytest.mark.asyncio
@@ -46,7 +52,10 @@ async def test_claude_local_confidence_and_router():
             "executors": {"codex": {"adapter": "codex"}},
         }
     )
-    result = await ClaudeLocalRouter(s).decide(DispatchRequest(task="x", cwd="."), {"codex": "d"})
+    result = await ClaudeLocalRouter(s).decide(
+        DispatchRequest(task="x", cwd="."),
+        {"codex": ExecutorSettings(adapter="codex", description="d")},
+    )
     assert result.router == "claude_local" and result.confidence == 0.8
 
 
@@ -60,7 +69,10 @@ async def test_claude_local_unknown_executor():
         }
     )
     with pytest.raises(RouterError, match="unknown executor"):
-        await ClaudeLocalRouter(s).decide(DispatchRequest(task="x", cwd="."), {"claude": "c"})
+        await ClaudeLocalRouter(s).decide(
+            DispatchRequest(task="x", cwd="."),
+            {"claude": ExecutorSettings(adapter="claude", description="c")},
+        )
 
 
 @pytest.mark.asyncio
@@ -73,7 +85,10 @@ async def test_claude_local_invalid_json():
         }
     )
     with pytest.raises(RouterError, match="invalid claude response"):
-        await ClaudeLocalRouter(s).decide(DispatchRequest(task="x", cwd="."), {"codex": "d"})
+        await ClaudeLocalRouter(s).decide(
+            DispatchRequest(task="x", cwd="."),
+            {"codex": ExecutorSettings(adapter="codex", description="d")},
+        )
 
 
 @pytest.mark.asyncio
@@ -89,7 +104,10 @@ async def test_claude_local_env_keeps_home_and_removes_secret(tmp_path, monkeypa
             "executors": {"codex": {"adapter": "codex"}},
         }
     )
-    await ClaudeLocalRouter(s).decide(DispatchRequest(task="x", cwd="."), {"codex": "d"})
+    await ClaudeLocalRouter(s).decide(
+        DispatchRequest(task="x", cwd="."),
+        {"codex": ExecutorSettings(adapter="codex", description="d")},
+    )
     env = capture.read_text()
     assert "HOME=" in env and "OPENROUTER_API_KEY=" not in env
     # Маркер вложенной сессии Claude Code не должен доходить до claude -p.
@@ -108,7 +126,10 @@ async def test_claude_local_unwritable_log_dir_is_router_error(tmp_path):
         }
     )
     with pytest.raises(RouterError):
-        await ClaudeLocalRouter(s).decide(DispatchRequest(task="x", cwd="."), {"codex": "d"})
+        await ClaudeLocalRouter(s).decide(
+            DispatchRequest(task="x", cwd="."),
+            {"codex": ExecutorSettings(adapter="codex", description="d")},
+        )
 
 
 @pytest.mark.asyncio
@@ -121,4 +142,7 @@ async def test_claude_local_missing_command_is_router_error():
         }
     )
     with pytest.raises(RouterError, match="cannot start"):
-        await ClaudeLocalRouter(s).decide(DispatchRequest(task="x", cwd="."), {"codex": "d"})
+        await ClaudeLocalRouter(s).decide(
+            DispatchRequest(task="x", cwd="."),
+            {"codex": ExecutorSettings(adapter="codex", description="d")},
+        )

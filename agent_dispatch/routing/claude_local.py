@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 
-from agent_dispatch.config import Settings
+from agent_dispatch.config import ExecutorSettings, Settings
 from agent_dispatch.executors.env import child_env
 from agent_dispatch.executors.process import run_cli
 from agent_dispatch.models import DispatchRequest, RouteDecision, RouterKind
@@ -17,10 +17,13 @@ class ClaudeLocalRouter:
     def __init__(self, settings: Settings):
         self.settings = settings
 
-    async def decide(self, req: DispatchRequest, candidates: dict[str, str]) -> RouteDecision:
+    async def decide(
+        self, req: DispatchRequest, candidates: dict[str, ExecutorSettings]
+    ) -> RouteDecision:
         cfg = self.settings.router.claude_local
         prompt = "Choose the best executor for this coding task.\n" + "\n".join(
-            f"- {k}: {v}" for k, v in candidates.items()
+            f"- {name}: {settings.description or settings.tier}"
+            for name, settings in candidates.items()
         )
         prompt += f"\nTask: {req.task}\nRespond with JSON only: "
         prompt += '{"executor": "<name>", "scores": {"<name>": <0..1>}}'

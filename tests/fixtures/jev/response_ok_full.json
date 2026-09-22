@@ -1,1 +1,113 @@
-{"model":"typesafe/jev-1.13-20260917","answers":{"executor":{"type":"choice","choice":"codex","probabilities":{"opencode/kimi":0.02,"claude":0.0,"codex":0.98},"confidence":0.97},"difficulty":{"type":"score","score":1,"legend":{"0":{"label":"trivial","description":"one-line or config change"},"1":{"label":"moderate","description":"localized bug fix in one module"},"2":{"label":"hard","description":"cross-module reasoning or design decisions"}},"probabilities":{"0":0.0,"1":0.99,"2":0.01},"confidence":0.99},"task_type":{"type":"choice","choice":"bugfix","probabilities":{"ops":0,"test":0,"docs":0,"bugfix":1,"feature":0,"refactor":0},"confidence":1},"risk":{"type":"score","score":0.9,"legend":{"0":{"label":"low","description":"isolated change, easy to revert"},"1":{"label":"medium","description":"touches shared code or behavior"},"2":{"label":"high","description":"public API, data, or infrastructure"}},"probabilities":{"0":0.14,"1":0.82,"2":0.04},"confidence":0.72},"ambiguity":{"type":"score","score":0.79,"legend":{"0":{"label":"clear","description":"fully specified"},"1":{"label":"some","description":"minor open questions"},"2":{"label":"vague","description":"goal or scope unclear"}},"probabilities":{"0":0.3,"1":0.61,"2":0.09},"confidence":0.6},"decomposable":{"type":"noul","noul":0.28}},"usage":{"input_tokens":850,"output_tokens":166,"cost":3.57e-05},"id":"gen-dec-1790010001-full","provider":"TypeSafe"}
+{
+  "model": "typesafe/jev-1.13-20260917",
+  "answers": {
+    "capability": {
+      "type": "choice",
+      "choice": "balanced",
+      "probabilities": {
+        "balanced": 1
+      },
+      "confidence": 1
+    },
+    "judgment": {
+      "type": "noul",
+      "noul": 0.31
+    },
+    "difficulty": {
+      "type": "score",
+      "score": 1,
+      "legend": {
+        "0": {
+          "label": "trivial",
+          "description": "one-line or config change"
+        },
+        "1": {
+          "label": "moderate",
+          "description": "localized bug fix in one module"
+        },
+        "2": {
+          "label": "hard",
+          "description": "cross-module reasoning or design decisions"
+        }
+      },
+      "probabilities": {
+        "0": 0.01,
+        "1": 0.99,
+        "2": 0
+      },
+      "confidence": 0.99
+    },
+    "task_type": {
+      "type": "choice",
+      "choice": "bugfix",
+      "probabilities": {
+        "feature": 0,
+        "refactor": 0,
+        "ops": 0,
+        "bugfix": 1,
+        "test": 0,
+        "docs": 0
+      },
+      "confidence": 1
+    },
+    "risk": {
+      "type": "score",
+      "score": 0.67,
+      "legend": {
+        "0": {
+          "label": "low",
+          "description": "isolated change, easy to revert"
+        },
+        "1": {
+          "label": "medium",
+          "description": "touches shared code or behavior"
+        },
+        "2": {
+          "label": "high",
+          "description": "public API, data, or infrastructure"
+        }
+      },
+      "probabilities": {
+        "0": 0.37,
+        "1": 0.59,
+        "2": 0.04
+      },
+      "confidence": 0.38
+    },
+    "ambiguity": {
+      "type": "score",
+      "score": 0.57,
+      "legend": {
+        "0": {
+          "label": "clear",
+          "description": "fully specified"
+        },
+        "1": {
+          "label": "some",
+          "description": "minor open questions"
+        },
+        "2": {
+          "label": "vague",
+          "description": "goal or scope unclear"
+        }
+      },
+      "probabilities": {
+        "0": 0.45,
+        "1": 0.53,
+        "2": 0.02
+      },
+      "confidence": 0.3
+    },
+    "decomposable": {
+      "type": "noul",
+      "noul": 0.39
+    }
+  },
+  "usage": {
+    "input_tokens": 872,
+    "output_tokens": 165,
+    "cost": 3.6624e-05
+  },
+  "id": "gen-dec-fixture",
+  "provider": "TypeSafe"
+}

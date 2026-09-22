@@ -1,15 +1,13 @@
 {
   "model": "typesafe/jev-1.13-20260917",
   "answers": {
-    "executor": {
+    "capability": {
       "type": "choice",
-      "choice": "codex",
+      "choice": "balanced",
       "probabilities": {
-        "opencode/kimi": 0,
-        "codex": 1,
-        "claude": 0
+        "balanced": 1
       },
-      "confidence": 0.99
+      "confidence": 1
     },
     "difficulty": {
       "type": "score",
@@ -29,18 +27,17 @@
         }
       },
       "probabilities": {
-        "0": 0,
+        "0": 0.01,
         "1": 0.99,
-        "2": 0.01
+        "2": 0
       },
-      "confidence": 0.98
+      "confidence": 0.99
     }
   },
   "usage": {
-    "input_tokens": 695,
-    "output_tokens": 71,
-    "cost": 2.919e-05
+    "input_tokens": 872,
+    "output_tokens": 165,
+    "cost": 3.6624e-05
   },
-  "id": "gen-dec-1790003970-s8m57TOYXD1bfJKescR5",
-  "provider": "TypeSafe"
+  "id": "gen-dec-fixture"
 }

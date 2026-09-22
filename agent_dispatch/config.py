@@ -53,6 +53,7 @@ class RouterSettings(_ConfigModel):
 
 class RoutingSettings(_ConfigModel):
     min_confidence: float = 0.60
+    autonomous_confidence: float = 0.85
     min_margin: float = 0.10
     fallback_executor: str = "codex"
     max_hops: int = Field(2, ge=0)
@@ -60,6 +61,22 @@ class RoutingSettings(_ConfigModel):
     exclude_source_agent: bool = True
     default_timeout_seconds: int = Field(1800, ge=0)
     availability_ttl_seconds: int = Field(60, ge=0)
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> RoutingSettings:
+        if self.autonomous_confidence < self.min_confidence:
+            raise ValueError("autonomous_confidence must be >= min_confidence")
+        return self
+
+
+class ExecutionSettings(_ConfigModel):
+    """Где исполнитель правит файлы: прямо в рабочей копии или в git worktree."""
+
+    workspace_mode: Literal["in_place", "worktree"] = "in_place"
+    worktree_dir: Path | None = None
+    branch_prefix: str = "agent-dispatch"
+    integrate: Literal["apply", "manual"] = "apply"
+    keep_worktrees: bool = False
 
 
 class ExecutorSettings(_ConfigModel):
@@ -69,6 +86,10 @@ class ExecutorSettings(_ConfigModel):
     extra_args: list[str] = Field(default_factory=list)
     enabled: bool = True
     description: str = ""
+    #: Уровень работы, который executor закрывает. По нему его находит решение Jev.
+    tier: Literal["fast", "balanced", "strong"] = "balanced"
+    #: Исполнитель внутри корпоративного периметра: данные не уходят наружу.
+    corporate: bool = False
 
     @model_validator(mode="after")
     def validate_adapter(self) -> ExecutorSettings:
@@ -86,6 +107,7 @@ class Settings(_ConfigModel):
     mcp: McpSettings = Field(default_factory=McpSettings)
     router: RouterSettings = Field(default_factory=RouterSettings)
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     executors: dict[str, ExecutorSettings] = Field(default_factory=dict)
     escalation: dict[str, list[str]] = Field(default_factory=dict)
     secrets: dict[str, SecretStr] = Field(default_factory=dict)

@@ -7,10 +7,11 @@ from typing import Any
 
 import httpx
 
-from agent_dispatch.config import Settings
+from agent_dispatch.config import ExecutorSettings, Settings
 from agent_dispatch.models import DispatchRequest, RouteDecision, RouterKind
 
 from .base import RouterError
+from .capability import has_corporate, select, tiers_present
 from .questions import build_questions, build_state, parse_answers
 
 
@@ -25,15 +26,19 @@ class JevRouter:
     ):
         self.settings, self.client, self.sleep = settings, client, sleep
 
-    async def decide(self, req: DispatchRequest, candidates: dict[str, str]) -> RouteDecision:
+    async def decide(
+        self, req: DispatchRequest, candidates: dict[str, ExecutorSettings]
+    ) -> RouteDecision:
         cfg = self.settings.router.jev
         api_key = self.settings.secret(cfg.api_key_env)
         if not api_key:
             raise RouterError(f"missing API key: {cfg.api_key_env}")
+        capabilities = tiers_present(candidates)
+        ask_corporate = has_corporate(candidates)
         body = {
             "model": cfg.model,
             "state": build_state(req),
-            "questions": build_questions(candidates),
+            "questions": build_questions(capabilities, ask_corporate=ask_corporate),
         }
         headers = {"Authorization": f"Bearer {api_key}"}
         started = time.monotonic()
@@ -53,19 +58,36 @@ class JevRouter:
                     payload = response.json()
                 except ValueError as exc:
                     raise RouterError("invalid JSON from router") from exc
-                executor, confidence, scores, judgments = parse_answers(
-                    payload.get("answers", {}), list(candidates)
+                capability, confidence, tier_scores, judgments = parse_answers(
+                    payload.get("answers", {}), capabilities
+                )
+                judgment = judgments.get("judgment")
+                corporate = judgments.get("corporate_data")
+                selection = select(
+                    capability,
+                    candidates,
+                    judgment=bool(judgment and judgment.value),
+                    corporate=bool(corporate and corporate.value),
+                    probabilities=tier_scores,
                 )
                 usage = payload.get("usage") or {}
+                meta: dict[str, Any] = {
+                    "jev_id": payload.get("id"),
+                    "model": payload.get("model", cfg.model),
+                    "capability_scores": tier_scores,
+                }
+                if selection.notes:
+                    meta["selection_notes"] = selection.notes
                 return RouteDecision(
                     router=RouterKind.jev,
-                    executor=executor,
+                    executor=selection.executor,
+                    capability=capability,
                     confidence=confidence,
-                    scores=scores,
+                    scores=selection.scores,
                     judgments=judgments,
                     latency_ms=int((time.monotonic() - started) * 1000),
                     cost_usd=usage.get("cost"),
-                    meta={"jev_id": payload.get("id"), "model": payload.get("model", cfg.model)},
+                    meta=meta,
                 )
             except RouterError:
                 raise

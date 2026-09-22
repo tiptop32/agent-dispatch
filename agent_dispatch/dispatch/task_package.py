@@ -8,6 +8,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from pydantic import BaseModel, ConfigDict
 
 from agent_dispatch.config import Settings
+from agent_dispatch.executors.workspace import git_env
 from agent_dispatch.models import ContextMode, DispatchRequest
 
 AdapterKind = Literal["claude", "codex", "opencode"]
@@ -18,21 +19,33 @@ class TaskPackage(BaseModel):
     request: DispatchRequest
     git_status: str | None = None
     git_diff_stat: str | None = None
+    #: Рабочий каталог исполнителя, если это не сам cwd запроса.
+    worktree: str | None = None
+    branch: str | None = None
 
 
 def _git(cwd: str, args: list[str]) -> str:
-    result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        ["git", *args], cwd=cwd, env=git_env(), capture_output=True, text=True, check=False
+    )
     return result.stdout
 
 
-def build_task_package(req: DispatchRequest, settings: Settings) -> TaskPackage:
+def build_task_package(
+    req: DispatchRequest,
+    settings: Settings,
+    worktree: str | None = None,
+    branch: str | None = None,
+) -> TaskPackage:
     if req.context_mode == ContextMode.full:
         return TaskPackage(
             request=req,
             git_status=_git(req.cwd, ["status", "--short"]),
             git_diff_stat=_git(req.cwd, ["diff", "--stat"]),
+            worktree=worktree,
+            branch=branch,
         )
-    return TaskPackage(request=req)
+    return TaskPackage(request=req, worktree=worktree, branch=branch)
 
 
 def _bullets(value: list[str]) -> str:
@@ -57,7 +70,10 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         instructions = 'End your final message with a fenced block tagged `agent-dispatch-result` containing a JSON object with fields: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation. Example:\n```agent-dispatch-result\n{"status": "completed", "summary": "...", "changed_files": [], "tests": {"command": "pytest", "result": "passed"}, "confidence": 0.9, "needs_escalation": false}\n```'  # noqa: E501
     return env.get_template("task_package.md.j2").render(
         task=req.task,
-        cwd=req.cwd,
+        cwd=package.worktree or req.cwd,
+        repo=req.cwd,
+        worktree=bool(package.worktree),
+        branch=package.branch,
         context=req.context,
         files=req.files,
         constraints=req.constraints,

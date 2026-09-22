@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from agent_dispatch.config import ExecutorSettings
 from agent_dispatch.models import DispatchRequest, RouteDecision
 
 
@@ -12,4 +13,6 @@ class RouterError(Exception):
 class Router(Protocol):
     name: str
 
-    async def decide(self, req: DispatchRequest, candidates: dict[str, str]) -> RouteDecision: ...
+    async def decide(
+        self, req: DispatchRequest, candidates: dict[str, ExecutorSettings]
+    ) -> RouteDecision: ...

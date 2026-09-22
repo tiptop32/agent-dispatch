@@ -34,6 +34,17 @@ def warm_fake_cli() -> None:
         proc.wait()
 
 
+@pytest.fixture(autouse=True)
+def clean_git_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Убрать GIT_* из окружения тестов.
+
+    Gate-набор запускается из pre-commit, где выставлены GIT_DIR и GIT_INDEX_FILE.
+    Унаследованные, они уводят git-вызовы тестов в основную репозиторию.
+    """
+    for key in [name for name in os.environ if name.startswith("GIT_")]:
+        monkeypatch.delenv(key, raising=False)
+
+
 @pytest.fixture
 def tmp_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Изолированные config.yaml, env и data_dir. Ничего из ~/.config не читается."""

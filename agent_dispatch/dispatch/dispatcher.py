@@ -9,6 +9,7 @@ from pathlib import Path
 from agent_dispatch.config import Settings
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import build_task_package, render_prompt
+from agent_dispatch.executors import worktree
 from agent_dispatch.executors.base import ExecutorAdapter, RunContext
 from agent_dispatch.executors.env import child_env
 from agent_dispatch.executors.registry import AvailabilityCache
@@ -222,7 +223,7 @@ class Dispatcher:
         else:
             decision, events = await decide_with_fallback(
                 req,
-                {n: self.settings.executors[n].description for n in names},
+                {n: self.settings.executors[n] for n in names},
                 self.settings,
                 self.routers,
             )
@@ -315,15 +316,33 @@ class Dispatcher:
                     ),
                 )
                 return
+            mode = req.workspace_mode or self.settings.execution.workspace_mode
             lock_cm = _NullAsyncContext()
             sem_cm = _NullAsyncContext()
             if req.hop == 0:
                 sem_cm = self._semaphore
-                key = str(Path(req.cwd).resolve())  # noqa: ASYNC240
-                lock_cm = self._cwd_locks.setdefault(key, asyncio.Lock())
+            # В режиме worktree исполнители не делят дерево, поэтому lock нужен
+            # только на время переноса результата обратно в рабочую копию.
+            if req.hop == 0 and mode == "in_place":
+                lock_cm = self._cwd_lock(req.cwd)
             async with sem_cm:
                 async with lock_cm:
-                    package = await asyncio.to_thread(build_task_package, req, self.settings)
+                    tree = None
+                    if mode == "worktree":
+                        tree = await asyncio.to_thread(self._create_worktree, req, task_id)
+                        await self.storage.add_event(
+                            task_id,
+                            "worktree",
+                            {"path": str(tree.path), "branch": tree.branch},
+                        )
+                    work_dir = str(tree.path) if tree else req.cwd
+                    package = await asyncio.to_thread(
+                        build_task_package,
+                        req,
+                        self.settings,
+                        str(tree.path) if tree else None,
+                        tree.branch if tree else None,
+                    )
                     prompt = await asyncio.to_thread(
                         render_prompt,
                         package,
@@ -338,7 +357,7 @@ class Dispatcher:
                         {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
                     )
                     ctx = RunContext(
-                        cwd=req.cwd,
+                        cwd=work_dir,
                         timeout_seconds=req.timeout_seconds
                         or self.settings.routing.default_timeout_seconds,
                         env=child_env(
@@ -371,6 +390,8 @@ class Dispatcher:
                             summary="",
                             error=f"{type(exc).__name__}: {exc}",
                         )
+                    if tree is not None:
+                        await self._finish_worktree(req, tree, result, task_id)
                     record.result = result
                     record.status, record.finished_at = TaskStatus(result.status), self._now()
                     reason = should_escalate(result) if req.allow_escalation else None
@@ -432,6 +453,78 @@ class Dispatcher:
                 event.set()
         finally:
             self._release_cwd_lock(record.request)
+
+    def _cwd_lock(self, cwd: str) -> asyncio.Lock:
+        key = str(Path(cwd).resolve())
+        return self._cwd_locks.setdefault(key, asyncio.Lock())
+
+    def _create_worktree(self, req: DispatchRequest, task_id: str) -> worktree.Worktree:
+        base = self.settings.execution.worktree_dir or (self.settings.server.data_dir / "worktrees")
+        branch = f"{self.settings.execution.branch_prefix}/{task_id[:8]}"
+        return worktree.create(req.cwd, Path(base).expanduser() / task_id, branch)
+
+    async def _finish_worktree(
+        self,
+        req: DispatchRequest,
+        tree: worktree.Worktree,
+        result: ExecutionResult,
+        task_id: str,
+    ) -> None:
+        """Перенести результат из worktree в рабочую копию и прибрать за собой.
+
+        Патч применяется под тем же lock, что и обычный запуск in_place, иначе две
+        параллельные интеграции наложатся друг на друга. Если патч не лёг, worktree
+        и ветка остаются: их видно в `agent-dispatch worktrees`.
+        """
+        result.meta["worktree"] = str(tree.path)
+        result.meta["branch"] = tree.branch
+        execution = self.settings.execution
+        try:
+            patch = await asyncio.to_thread(worktree.build_patch, tree)
+        except worktree.WorktreeError as exc:
+            result.meta["integrated"] = False
+            result.meta["integration_error"] = str(exc)
+            return
+        if not patch.strip():
+            result.meta["integrated"] = True
+            if not execution.keep_worktrees:
+                await self._drop_worktree(tree, keep_branch=False, result=result)
+            return
+        if execution.integrate != "apply":
+            result.meta["integrated"] = False
+            return
+        patch_path = self.settings.server.data_dir / "patches" / f"{task_id}.patch"
+        await asyncio.to_thread(patch_path.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(patch_path.write_text, patch)
+        result.meta["patch"] = str(patch_path)
+        try:
+            async with self._cwd_lock(req.cwd):
+                await asyncio.to_thread(worktree.apply_patch, req.cwd, patch_path)
+        except worktree.WorktreeError as exc:
+            result.meta["integrated"] = False
+            result.meta["integration_error"] = str(exc)
+            await self.storage.add_event(
+                task_id, "integrate", {"ok": False, "error": str(exc)[:500]}
+            )
+            return
+        result.meta["integrated"] = True
+        await self.storage.add_event(
+            task_id, "integrate", {"ok": True, "files": len(result.changed_files)}
+        )
+        if not execution.keep_worktrees:
+            await self._drop_worktree(tree, keep_branch=False, result=result)
+
+    async def _drop_worktree(
+        self, tree: worktree.Worktree, *, keep_branch: bool, result: ExecutionResult
+    ) -> None:
+        try:
+            await asyncio.to_thread(worktree.remove, tree, keep_branch=keep_branch)
+        except worktree.WorktreeError as exc:
+            result.meta["worktree_cleanup_error"] = str(exc)
+            return
+        result.meta.pop("worktree", None)
+        if not keep_branch:
+            result.meta.pop("branch", None)
 
     async def _escalation_chain(self, record: TaskRecord) -> list[str]:
         chain: list[str] = []

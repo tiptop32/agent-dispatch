@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from agent_dispatch.config import Settings
+from agent_dispatch.config import ExecutorSettings, Settings
 from agent_dispatch.models import (
     DispatchRequest,
     GuardEvent,
@@ -18,7 +18,10 @@ from .jev import JevRouter
 
 
 async def decide_with_fallback(
-    req: DispatchRequest, candidates: dict[str, str], settings: Settings, routers: list[Router]
+    req: DispatchRequest,
+    candidates: dict[str, ExecutorSettings],
+    settings: Settings,
+    routers: list[Router],
 ) -> tuple[RouteDecision, list[GuardEvent]]:
     names = list(candidates)
     if len(names) == 1:

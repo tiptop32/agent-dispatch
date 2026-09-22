@@ -71,7 +71,7 @@ async def _run_in_process(cases, args, settings, routers):
             f"no candidate executors for source_agent={args.source_agent}: "
             "enable executors in config.yaml or pick another --source-agent"
         )
-    candidate_map = {name: settings.executors[name].description for name in candidate_names}
+    candidate_map = {name: settings.executors[name] for name in candidate_names}
     for case in cases:
         request = build_request(case, args.source_agent)
         started = time.perf_counter()

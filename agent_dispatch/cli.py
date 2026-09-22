@@ -11,6 +11,7 @@ import typer
 from agent_dispatch import doctor as doctor_module
 from agent_dispatch import serve_state
 from agent_dispatch.config import Settings, load_settings
+from agent_dispatch.executors import worktree
 from agent_dispatch.mcp import autostart
 from agent_dispatch.mcp import server as mcp_server
 from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
@@ -199,9 +200,13 @@ def route(
         typer.echo(decision.model_dump_json(indent=2))
         return
     typer.echo(f"executor: {decision.executor}")
-    typer.echo(f"confidence: {decision.confidence:.2f}")
+    if decision.capability:
+        typer.echo(f"capability: {decision.capability}")
+    typer.echo(f"confidence: {decision.confidence:.2f} ({decision.confidence_tier or '-'})")
     typer.echo(f"router: {decision.router}")
     typer.echo(f"reason: {decision.reason or '-'}")
+    for note in decision.meta.get("selection_notes", []):
+        typer.echo(f"note: {note}")
 
 
 @app.command(help="Dispatch a coding task to an executor.")
@@ -269,6 +274,34 @@ def list_executors() -> None:
             f"{row['name']}\t{row['adapter']}\t{row.get('model') or '-'}\t"
             f"{row['enabled']}\t{row.get('available')}\t{version_or_error}"
         )
+
+
+@app.command("worktrees", help="List or clean up AgentDispatch worktrees of a repository.")
+def worktrees(
+    cwd: str = typer.Option(".", help="Any path inside the repository."),
+    clean: bool = typer.Option(False, "--clean", help="Remove the listed worktrees."),
+    keep_branches: bool = typer.Option(
+        True, "--keep-branches/--delete-branches", help="Keep branches when cleaning."
+    ),
+) -> None:
+    settings = load_settings()
+    try:
+        trees = worktree.list_worktrees(cwd, settings.execution.branch_prefix)
+    except worktree.WorktreeError as error:
+        raise typer.BadParameter(str(error), param_hint="--cwd") from error
+    if not trees:
+        typer.echo("no agent-dispatch worktrees")
+        return
+    for tree in trees:
+        if clean:
+            try:
+                worktree.remove(tree, keep_branch=keep_branches)
+            except worktree.WorktreeError as error:
+                typer.echo(f"{tree.path}\tERROR\t{error}")
+                continue
+            typer.echo(f"{tree.path}\tremoved\t{tree.branch}")
+        else:
+            typer.echo(f"{tree.path}\t{tree.branch}")
 
 
 @app.command(help="Record feedback for a task.")

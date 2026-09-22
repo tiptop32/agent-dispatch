@@ -61,8 +61,10 @@ Endpoint `POST https://openrouter.ai/api/alpha/decisions`, модель `typesaf
   "model": "typesafe/jev-1.13",
   "state": {"task": "...", "context": "...", "files": [], "constraints": [], "source_agent": "codex"},
   "questions": {
-    "executor":   {"type": "choice", "instructions": "Which coding agent should execute this task?",
-                   "criteria": {"claude": "<description из конфига>", "codex": "...", "opencode/kimi": "..."}},
+    "capability": {"type": "choice", "instructions": "What level of coding capability does this task demand...",
+                   "criteria": {"fast": "...", "balanced": "...", "strong": "..."}},
+    "judgment":   {"type": "noul", "instructions": "Does this task require resolving trade-offs..."},
+    "corporate_data": {"type": "noul", "instructions": "...must not be sent to an external model provider?"},
     "difficulty": {"type": "score", "instructions": "How hard is this coding task?",
                    "criteria": [{"label": "trivial", "description": "..."}, {"label": "moderate", "description": "..."}, {"label": "hard", "description": "..."}]},
     "task_type":  {"type": "choice", "instructions": "...", "criteria": {"bugfix": "...", "feature": "...", "refactor": "...", "docs": "...", "test": "...", "ops": "..."}},
@@ -77,10 +79,14 @@ Endpoint `POST https://openrouter.ai/api/alpha/decisions`, модель `typesaf
 
 - `instructions` обязателен у каждого вопроса, иначе 400 с zod-путём.
 - У `choice` `criteria` это map `label -> description`, у `score` упорядоченный массив `{label, description}`.
-- Ответ: `answers.executor = {choice, probabilities, confidence}`, `answers.<score> = {score, legend, probabilities, confidence}`, `answers.<noul> = {noul: p}`, `usage = {input_tokens, output_tokens, cost}`.
+- Ответ: `answers.capability = {choice, probabilities, confidence}`, `answers.<score> = {score, legend, probabilities, confidence}`, `answers.<noul> = {noul: p}`, `usage = {input_tokens, output_tokens, cost}`.
 - Стоимость решения около $0.00003, латентность около 1 с. Jev не виден в `GET /api/v1/models`.
 
-Только `executor` влияет на маршрут. Остальные judgments пишутся в телеметрию для анализа routing accuracy. Jev не делает side effects: он никогда не запускает исполнителя.
+На маршрут влияют `capability`, `judgment` и `corporate_data`; конкретного исполнителя по ним подбирает `routing/capability.py` из `tier` и `corporate` в конфиге. Остальные judgments пишутся в телеметрию. Jev не делает side effects: он никогда не запускает исполнителя.
+
+Вопрос об уровне работы вместо имени модели держит уверенность независимой от размера реестра: на 8 задачах 3 и 11 кандидатов дали среднюю 0.932 и 0.934, тогда как выбор по имени при 10 кандидатах падал до 0.35-0.60.
+
+Уверенность делится на три полосы: `autonomous` (>= `routing.autonomous_confidence`), `advisory` (>= `min_confidence`) и `fallback` (ниже). Полоса лежит в `RouteDecision.confidence_tier`, подмена исполнителя происходит только в `fallback`.
 
 Замечание: `state` (`task`, `context`, `files`, `constraints`) уходит на OpenRouter даже для задач, которые потом пойдут в корпоративную модель, подключённую через OpenCode. Если это ограничение, отправляйте такие задачи через `dispatch_to`, где Jev не вызывается.
 

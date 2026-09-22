@@ -3,12 +3,23 @@ import subprocess
 from pathlib import Path
 
 
+def git_env() -> dict[str, str]:
+    """Окружение без GIT_*.
+
+    Демон может быть запущен из git-хука, где выставлены GIT_DIR и
+    GIT_INDEX_FILE. Унаследованные, они увели бы любую git-команду в чужую
+    репозиторию вместо рабочего каталога задачи.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
 def is_git_repo(cwd: str | Path) -> bool:
     """Return whether ``cwd`` is inside a work tree."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
             cwd=cwd,
+            env=git_env(),
             capture_output=True,
             text=True,
             check=False,
@@ -23,6 +34,7 @@ def snapshot(cwd: str | Path) -> set[str]:
     result = subprocess.run(
         ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
         cwd=cwd,
+        env=git_env(),
         capture_output=True,
         check=True,
     )
