@@ -28,8 +28,18 @@ class Verdict:
     reasons: list[str]
 
 
-def prepare_repo(template: Path, destination: Path) -> Path:
+BUGGY_CALC = "def add(a, b):\n    return a - b\n"
+
+
+def prepare_repo(template: Path, destination: Path, *, inject_bug: bool = False) -> Path:
+    """Копия шаблона с git-коммитом.
+
+    Шаблон корректен; баг в add() (вычитание вместо сложения) вносится только
+    для задачи fix, иначе docstring/rename проваливались бы по pytest по построению.
+    """
     shutil.copytree(template, destination)
+    if inject_bug:
+        (destination / "smoke_target/calc.py").write_text(BUGGY_CALC)
     subprocess.run(["git", "init"], cwd=destination, check=True, capture_output=True)
     subprocess.run(["git", "add", "."], cwd=destination, check=True, capture_output=True)
     subprocess.run(

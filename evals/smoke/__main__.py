@@ -26,7 +26,9 @@ async def run(args: argparse.Namespace) -> int:
             for task in tasks:
                 with tempfile.TemporaryDirectory(prefix="agent-dispatch-smoke-") as raw:
                     repo = Path(raw) / "repo"
-                    prepare_repo(Path(__file__).parent / "repo_template", repo)
+                    prepare_repo(
+                        Path(__file__).parent / "repo_template", repo, inject_bug=task == "fix"
+                    )
                     view = await client.submit(
                         DispatchRequest(
                             task=TASKS[task],

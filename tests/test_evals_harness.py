@@ -100,7 +100,7 @@ def test_prepare_repo_creates_commit_and_files(tmp_path):
         capture_output=True,
         text=True,
     )
-    assert pytest_run.returncode != 0  # The template deliberately contains the bug.
+    assert pytest_run.returncode == 0  # Шаблон корректен, баг вносится только для fix.
     status = subprocess.run(
         ["git", "status", "--porcelain"], cwd=destination, capture_output=True, text=True
     )
@@ -115,14 +115,14 @@ def _view(status="completed", changed_files=None):
 
 
 def test_verify_fix_passes_after_fix(tmp_path):
-    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo")
+    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo", inject_bug=True)
     (repo / "smoke_target/calc.py").write_text("def add(a, b):\n    return a + b\n")
     verdict = verify(repo, _view(), "fix")
     assert verdict.ok, verdict.reasons
 
 
 def test_verify_fix_with_empty_path(tmp_path, monkeypatch):
-    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo")
+    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo", inject_bug=True)
     (repo / "smoke_target/calc.py").write_text("def add(a, b):\n    return a + b\n")
     monkeypatch.setenv("PATH", "")
     verdict = verify(repo, _view(), "fix")
@@ -130,7 +130,7 @@ def test_verify_fix_with_empty_path(tmp_path, monkeypatch):
 
 
 def test_verify_fix_ignores_tampered_agent_test_and_checks_calc(tmp_path):
-    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo")
+    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo", inject_bug=True)
     (repo / "smoke_target/calc.py").write_text("def add(a, b):\n    return a - b\n")
     (repo / "tests/test_calc.py").write_text(
         "from smoke_target.calc import add\n\ndef test_add():\n    assert add(2, 3) == -1\n"
@@ -141,7 +141,7 @@ def test_verify_fix_ignores_tampered_agent_test_and_checks_calc(tmp_path):
 
 
 def test_verify_failed_view_is_not_ok(tmp_path):
-    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo")
+    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo", inject_bug=True)
     verdict = verify(repo, _view(status="failed"), "fix")
     assert not verdict.ok
     assert "status=failed" in verdict.reasons
@@ -289,7 +289,7 @@ def test_smoke_tasks_are_complete():
 
 
 def test_verify_broken_calc_is_failed_verdict_not_exception(tmp_path):
-    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo")
+    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo", inject_bug=True)
     (repo / "smoke_target/calc.py").write_text("def add(a, b:\n    return a + b\n")
     verdict = verify(repo, _view(), "fix")
     assert not verdict.ok
@@ -335,3 +335,19 @@ def test_smoke_main_rejects_unknown_task_and_accepts_known(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc:
         smoke_main.main()
     assert exc.value.code == 0
+
+
+def test_prepare_repo_injects_bug_only_on_request(tmp_path):
+    clean = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "clean")
+    buggy = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "buggy", inject_bug=True)
+    assert "a + b" in (clean / "smoke_target/calc.py").read_text()
+    assert "a - b" in (buggy / "smoke_target/calc.py").read_text()
+
+
+def test_verify_docstring_on_clean_template_with_docstring_is_ok(tmp_path):
+    repo = prepare_repo(Path("evals/smoke/repo_template"), tmp_path / "repo")
+    (repo / "smoke_target/calc.py").write_text(
+        'def add(a, b):\n    """Return the sum of a and b."""\n    return a + b\n'
+    )
+    verdict = verify(repo, _view(), "docstring")
+    assert verdict.ok, verdict.reasons
