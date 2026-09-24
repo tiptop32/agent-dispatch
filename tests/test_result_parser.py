@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from agent_dispatch.executors.process import ProcessOutcome
 from agent_dispatch.executors.result_parser import extract_result_block, normalize
 
@@ -91,6 +93,13 @@ def test_normalize_timeout_is_failed_with_timeout_error():
     assert result.error == "timeout"
 
 
+def test_normalize_stalled_is_failed_with_idle_error():
+    result = normalize(None, outcome(stalled=True, idle_seconds=0.5), None, "codex", None)
+    assert result.status == "failed"
+    assert result.error.startswith("stalled: no output for")
+    assert result.meta["idle_timeout_seconds"] == 0.5
+
+
 def test_normalize_git_changed_files_override_agent_files():
     raw = {"status": "completed", "summary": "ok", "changed_files": ["raw.py"]}
     assert normalize(raw, outcome(), ["a.py"], "codex", None).changed_files == ["a.py"]
@@ -109,6 +118,32 @@ def test_normalize_none_git_changed_files_uses_agent_files():
 def test_normalize_invalid_status_is_partial_with_parse_error():
     raw = {"status": "running", "summary": "still working"}
     result = normalize(raw, outcome(), None, "codex", None)
+    assert result.status == "partial"
+    assert result.meta["parse_error"]
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["success", "SUCCEEDED", "successful", "done", "complete", "ok"],
+)
+def test_normalize_coerces_success_status_synonyms(status):
+    result = normalize({"status": status, "summary": "ok"}, outcome(), None, "codex", None)
+
+    assert result.status == "completed"
+    assert result.meta["coerced"] == [f"status: {status!r} -> completed"]
+
+
+@pytest.mark.parametrize("status", ["error", "FAILURE", "fail"])
+def test_normalize_coerces_failure_status_synonyms(status):
+    result = normalize({"status": status, "summary": "bad"}, outcome(), None, "codex", None)
+
+    assert result.status == "failed"
+    assert result.meta["coerced"] == [f"status: {status!r} -> failed"]
+
+
+def test_normalize_unknown_status_still_is_partial_with_parse_error():
+    result = normalize({"status": "banana", "summary": "unknown"}, outcome(), None, "codex", None)
+
     assert result.status == "partial"
     assert result.meta["parse_error"]
 

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -36,6 +37,41 @@ async def test_run_cli_returns_nonzero_exit_code(tmp_path: Path) -> None:
     )
 
     assert outcome.exit_code == 3
+
+
+async def test_run_cli_idle_watchdog_stalls_silent_process(tmp_path: Path) -> None:
+    outcome = await run_cli(
+        [sys.executable, "-c", "import time; print('start', flush=True); time.sleep(30)"],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        stdin=None,
+        timeout_seconds=10,
+        idle_timeout_seconds=0.5,
+        grace_seconds=0.1,
+        log_path=tmp_path / "process.log",
+    )
+    assert outcome.stalled is True
+    assert outcome.timed_out is False
+    assert outcome.exit_code is None
+    assert outcome.duration_ms < 5000
+
+
+async def test_run_cli_idle_watchdog_allows_regular_output(tmp_path: Path) -> None:
+    outcome = await run_cli(
+        [
+            sys.executable,
+            "-c",
+            "import time; [print(i, flush=True) or time.sleep(.2) for i in range(8)]",
+        ],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        stdin=None,
+        timeout_seconds=10,
+        idle_timeout_seconds=0.5,
+        log_path=tmp_path / "process.log",
+    )
+    assert outcome.stalled is False
+    assert outcome.exit_code == 0
 
 
 async def test_run_cli_timeout_marks_process_timed_out(tmp_path: Path) -> None:

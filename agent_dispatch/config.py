@@ -91,6 +91,9 @@ class ExecutionSettings(_ConfigModel):
     #: ветку, и worktree, и файл патча, решает человек.
     integrate: Literal["apply", "manual", "branch"] = "apply"
     keep_worktrees: bool = False
+    #: Убить executor, если он столько секунд ничего не пишет в stdout/stderr;
+    #: 0 отключает. Жёсткий routing.default_timeout_seconds всё равно действует.
+    idle_timeout_seconds: int = Field(900, ge=0)
 
 
 class ExecutorSettings(_ConfigModel):

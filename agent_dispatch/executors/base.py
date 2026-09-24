@@ -21,6 +21,7 @@ class RunContext(BaseModel):
 
     cwd: str
     timeout_seconds: float
+    idle_timeout_seconds: float | None = None
     env: dict[str, str]
     log_path: Path
     task_id: str
@@ -36,6 +37,11 @@ class ExecutorAdapter(Protocol):
 
 
 class BaseExecutorAdapter:
+    #: CLI пишет события по ходу работы. Сторож молчания (`idle_timeout_seconds`)
+    #: имеет смысл только для таких: CLI, который печатает всё одним куском в
+    #: конце, он убивал бы на любой задаче длиннее лимита.
+    streams_output: bool = True
+
     def __init__(
         self, name: str, settings: ExecutorSettings, base_env: dict[str, str] | None = None
     ):
@@ -73,6 +79,7 @@ class BaseExecutorAdapter:
                 env=ctx.env,
                 stdin=stdin,
                 timeout_seconds=ctx.timeout_seconds,
+                idle_timeout_seconds=ctx.idle_timeout_seconds if self.streams_output else None,
                 log_path=ctx.log_path,
             )
         except OSError as exc:

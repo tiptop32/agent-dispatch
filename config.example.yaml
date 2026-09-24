@@ -38,6 +38,7 @@ execution:
   branch_prefix: agent-dispatch
   integrate: apply            # apply: патч в рабочую копию; branch: только ветка; manual: ничего не трогать
   keep_worktrees: false
+  idle_timeout_seconds: 900
 
 executors:
   claude:

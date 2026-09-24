@@ -152,3 +152,22 @@ async def test_codex_passes_model_flag_when_configured(git_repo, tmp_path):
     await adapter.execute(ctx(git_repo, tmp_path, FAKE_CAPTURE=str(cap)))
     args = (tmp_path / "cap.argv").read_text().splitlines()
     assert args[-3:] == ["-m", "gpt-5.6-luna", "-"]
+
+
+@pytest.mark.asyncio
+async def test_codex_passes_the_idle_limit_because_it_streams_events(
+    git_repo, tmp_path, monkeypatch
+):
+    from agent_dispatch.executors import codex as module
+    from agent_dispatch.executors.process import ProcessOutcome
+
+    seen = {}
+
+    async def fake(*args, **kwargs):
+        seen.update(kwargs)
+        return ProcessOutcome(exit_code=0, stdout="", stderr="", timed_out=False, duration_ms=1)
+
+    monkeypatch.setattr(module, "run_cli", fake)
+    context = ctx(git_repo, tmp_path).model_copy(update={"idle_timeout_seconds": 900})
+    await CodexAdapter("codex", ExecutorSettings(adapter="codex", command="codex")).execute(context)
+    assert seen["idle_timeout_seconds"] == 900

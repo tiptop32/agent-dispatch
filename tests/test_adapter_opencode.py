@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -6,8 +7,25 @@ import pytest
 from agent_dispatch.config import ExecutorSettings
 from agent_dispatch.executors.base import RunContext
 from agent_dispatch.executors.opencode import OpenCodeAdapter
+from agent_dispatch.executors.process import ProcessOutcome
 
 ROOT = Path(__file__).parent
+
+
+def parse_stdout(stdout: str):
+    adapter = OpenCodeAdapter(
+        "opencode", ExecutorSettings(adapter="opencode", command="opencode", model="m")
+    )
+    return adapter._parse_result(ProcessOutcome(0, stdout, "", False, 12), [])
+
+
+def stream(*events: dict) -> str:
+    return "\n".join(json.dumps(event) for event in events)
+
+
+VALID_RESULT = (
+    '```agent-dispatch-result\n{"status":"completed","summary":"ok","changed_files":[]}\n```'
+)
 
 
 def ctx(repo, tmp_path, **env):
@@ -82,6 +100,63 @@ def test_opencode_requires_model():
     settings = ExecutorSettings.model_construct(adapter="opencode", model=None)
     with pytest.raises(ValueError, match="opencode executor requires model"):
         OpenCodeAdapter("opencode", settings)
+
+
+def test_opencode_joins_text_events_with_newlines_before_parsing_result():
+    result = parse_stdout(
+        stream(
+            {"type": "text", "part": {"text": "Готово."}},
+            {"type": "text", "part": {"text": VALID_RESULT}},
+        )
+    )
+
+    assert result.status == "completed"
+
+
+def test_opencode_permission_rejection_without_result_is_failed():
+    result = parse_stdout(
+        stream(
+            {
+                "type": "tool_use",
+                "part": {
+                    "type": "tool",
+                    "tool": "read",
+                    "state": {
+                        "status": "error",
+                        "input": {"filePath": "/Users/me/other-repo/file.py"},
+                        "error": "The user rejected permission to use this specific tool call.",
+                    },
+                },
+            }
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error == ("opencode permission rejected: read: /Users/me/other-repo/file.py")
+
+
+def test_opencode_permission_rejection_with_result_is_reported_in_meta():
+    command = "cp -R /abs/.ref .ref && ls .ref"
+    result = parse_stdout(
+        stream(
+            {
+                "type": "tool_use",
+                "part": {
+                    "type": "tool",
+                    "tool": "bash",
+                    "state": {
+                        "status": "error",
+                        "input": {"command": command},
+                        "error": "The user rejected permission to use this specific tool call.",
+                    },
+                },
+            },
+            {"type": "text", "part": {"text": VALID_RESULT}},
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.meta["permission_rejected"] == [f"bash: {command}"]
 
 
 @pytest.mark.asyncio

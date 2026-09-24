@@ -43,6 +43,7 @@ class OpenCodeAdapter(BaseExecutorAdapter):
 
     def _parse_result(self, outcome: ProcessOutcome, changed: list[str]) -> ExecutionResult:
         text_parts = []
+        permission_rejections = []
         input_tokens = output_tokens = 0
         cost = 0.0
         error_message = None
@@ -55,6 +56,28 @@ class OpenCodeAdapter(BaseExecutorAdapter):
                 continue
             if event.get("type") == "text" and isinstance(event.get("part"), dict):
                 text_parts.append(str(event["part"].get("text", "")))
+            elif event.get("type") == "tool_use" and isinstance(event.get("part"), dict):
+                part = event["part"]
+                state = part.get("state")
+                if isinstance(state, dict):
+                    error = state.get("error")
+                    if (
+                        state.get("status") == "error"
+                        and isinstance(error, str)
+                        and "rejected permission" in error.lower()
+                    ):
+                        inputs = state.get("input")
+                        if not isinstance(inputs, dict):
+                            inputs = {}
+                        detail = next(
+                            (
+                                inputs[key]
+                                for key in ("command", "filePath", "path")
+                                if inputs.get(key) is not None
+                            ),
+                            "",
+                        )
+                        permission_rejections.append(f"{part.get('tool', '')}: {str(detail)[:120]}")
             elif event.get("type") == "step_finish" and isinstance(event.get("part"), dict):
                 part = event["part"]
                 tokens = part.get("tokens") or {}
@@ -63,12 +86,29 @@ class OpenCodeAdapter(BaseExecutorAdapter):
                 cost += float(part.get("cost", 0) or 0)
             elif event.get("type") == "error":
                 error_message = ((event.get("error") or {}).get("data") or {}).get("message")
-        text = "".join(text_parts)
-        result = normalize(
-            extract_result_block(text), outcome, changed, self.name, self.settings.model
-        )
+        text = "\n".join(text_parts)
+        raw = extract_result_block(text)
+        result = normalize(raw, outcome, changed, self.name, self.settings.model)
         if error_message:
             result = result.model_copy(update={"status": "failed", "error": error_message})
+        if permission_rejections:
+            if raw is None:
+                result = result.model_copy(
+                    update={
+                        "status": "failed",
+                        "error": "opencode permission rejected: "
+                        + "; ".join(permission_rejections),
+                    }
+                )
+            else:
+                result = result.model_copy(
+                    update={
+                        "meta": {
+                            **result.meta,
+                            "permission_rejected": permission_rejections,
+                        }
+                    }
+                )
         if input_tokens or output_tokens or cost:
             result = result.model_copy(
                 update={

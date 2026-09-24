@@ -13,6 +13,8 @@ class ProcessOutcome:
     stderr: str
     timed_out: bool
     duration_ms: int
+    stalled: bool = False
+    idle_seconds: float | None = None
 
 
 async def run_cli(
@@ -24,6 +26,7 @@ async def run_cli(
     timeout_seconds: float,
     log_path: Path,
     grace_seconds: float = 10.0,
+    idle_timeout_seconds: float | None = None,
 ) -> ProcessOutcome:
     """Run a CLI process, streaming output and terminating its process group."""
     started_at = time.monotonic()
@@ -45,10 +48,13 @@ async def run_cli(
 
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
+    last_output_at = time.monotonic()
 
     async def read_stream(stream: asyncio.StreamReader, chunks: list[bytes], prefix: str) -> None:
+        nonlocal last_output_at
         with log_path.open("a") as log_file:
             while data := await stream.read(65536):
+                last_output_at = time.monotonic()
                 chunks.append(data)
                 text = data.decode(errors="replace")
                 log_file.write(f"{prefix}{text}")
@@ -99,12 +105,27 @@ async def run_cli(
             await asyncio.gather(*tasks, return_exceptions=True)
 
     timed_out = False
+    stalled = False
+    idle_limit = idle_timeout_seconds if idle_timeout_seconds and idle_timeout_seconds > 0 else None
+    process_wait = asyncio.create_task(process.wait())
     try:
-        try:
-            await asyncio.wait_for(process.wait(), timeout=timeout_seconds)
-        except TimeoutError:
-            timed_out = True
-            await terminate_group()
+        deadline = time.monotonic() + timeout_seconds
+        while not process_wait.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                await terminate_group()
+                break
+            poll = min(remaining, 1.0)
+            if idle_limit is not None:
+                poll = min(poll, max(idle_limit / 4, 0.001))
+            try:
+                await asyncio.wait_for(asyncio.shield(process_wait), timeout=poll)
+            except TimeoutError:
+                if idle_limit is not None and time.monotonic() - last_output_at >= idle_limit:
+                    stalled = True
+                    await terminate_group()
+                    break
         await wait_for_io()
     except asyncio.CancelledError:
         await terminate_group()
@@ -113,13 +134,18 @@ async def run_cli(
     finally:
         if process.returncode is None:
             await terminate_group()
+        if not process_wait.done():
+            process_wait.cancel()
+            await asyncio.gather(process_wait, return_exceptions=True)
 
     stdout = b"".join(stdout_chunks).decode(errors="replace")
     stderr = b"".join(stderr_chunks).decode(errors="replace")
     return ProcessOutcome(
-        exit_code=None if timed_out else process.returncode,
+        exit_code=None if timed_out or stalled else process.returncode,
         stdout=stdout,
         stderr=stderr,
         timed_out=timed_out,
         duration_ms=int((time.monotonic() - started_at) * 1000),
+        stalled=stalled,
+        idle_seconds=idle_limit,
     )

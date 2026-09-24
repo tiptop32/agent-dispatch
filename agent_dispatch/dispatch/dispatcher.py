@@ -419,6 +419,7 @@ class Dispatcher:
         return RunContext(
             cwd=str(tree.path) if tree else req.cwd,
             timeout_seconds=req.timeout_seconds or self.settings.routing.default_timeout_seconds,
+            idle_timeout_seconds=self.settings.execution.idle_timeout_seconds or None,
             env=child_env(
                 self.settings,
                 {

@@ -155,7 +155,10 @@ execution:
   workspace_mode: worktree
   integrate: apply      # branch: отдать результат веткой; manual: ничего не трогать
   keep_worktrees: false
+  idle_timeout_seconds: 900  # остановить executor без вывода; 0 отключает
 ```
+
+`execution.idle_timeout_seconds` завершает executor, если он не пишет в stdout/stderr указанное число секунд. Ноль отключает watchdog, но жёсткий `routing.default_timeout_seconds` всё равно действует.
 
 ```bash
 agent-dispatch worktrees                      # деревья и ветки без дерева (от integrate: branch)

@@ -34,6 +34,18 @@ def normalize(
     model: str | None,
 ) -> ExecutionResult:
     meta = {"exit_code": outcome.exit_code, "duration_ms": outcome.duration_ms}
+    if getattr(outcome, "stalled", False):
+        seconds = getattr(outcome, "idle_seconds", None) or 0
+        meta["idle_timeout_seconds"] = seconds
+        return ExecutionResult(
+            status="failed",
+            executor=executor,
+            model=model,
+            summary=_tail(outcome.stdout),
+            changed_files=changed_files or [],
+            error=f"stalled: no output for {int(seconds)}s",
+            meta=meta,
+        )
     if outcome.timed_out:
         return ExecutionResult(
             status="failed",
@@ -97,11 +109,28 @@ def normalize(
 def _coerce(raw: dict) -> tuple[dict, list[str]]:
     """Мягко привести поля, которые модели пишут на естественном языке.
 
-    `tests.result` вроде «1 passed» или «all tests failed» превращается в enum;
+    Синонимы `status` и `tests.result` вроде «1 passed» превращаются в enum;
     список приведений возвращается для `meta.coerced`, чтобы телеметрия видела,
     что агент не соблюдал формат.
     """
     coerced: list[str] = []
+    status = raw.get("status")
+    if isinstance(status, str):
+        status_aliases = {
+            "success": "completed",
+            "succeeded": "completed",
+            "successful": "completed",
+            "done": "completed",
+            "complete": "completed",
+            "ok": "completed",
+            "error": "failed",
+            "failure": "failed",
+            "fail": "failed",
+        }
+        mapped_status = status_aliases.get(status.strip().lower())
+        if mapped_status is not None:
+            raw = {**raw, "status": mapped_status}
+            coerced.append(f"status: {status!r} -> {mapped_status}")
     tests = raw.get("tests")
     if isinstance(tests, dict) and isinstance(tests.get("result"), str):
         value = tests["result"].strip().lower()

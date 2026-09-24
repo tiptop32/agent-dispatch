@@ -128,3 +128,23 @@ async def test_claude_passes_model_flag_when_configured(git_repo, tmp_path):
     await adapter.execute(context(git_repo, tmp_path, FAKE_CAPTURE=str(capture)))
     argv = (tmp_path / "capture.argv").read_text().splitlines()
     assert argv[-2:] == ["--model", "sonnet"]
+
+
+@pytest.mark.asyncio
+async def test_claude_is_not_watched_for_silence_because_it_prints_only_at_the_end(
+    git_repo, tmp_path, monkeypatch
+):
+    from agent_dispatch.executors import claude as module
+    from agent_dispatch.executors.process import ProcessOutcome
+
+    seen = {}
+
+    async def fake(*args, **kwargs):
+        seen.update(kwargs)
+        return ProcessOutcome(exit_code=0, stdout="{}", stderr="", timed_out=False, duration_ms=1)
+
+    monkeypatch.setattr(module, "run_cli", fake)
+    adapter = ClaudeAdapter("claude/test", ExecutorSettings(adapter="claude", command="claude"))
+    ctx = context(git_repo, tmp_path).model_copy(update={"idle_timeout_seconds": 900})
+    await adapter.execute(ctx)
+    assert seen["idle_timeout_seconds"] is None

@@ -12,6 +12,9 @@ from agent_dispatch.models import ExecutionResult, Usage
 
 
 class ClaudeAdapter(BaseExecutorAdapter):
+    # `-p --output-format json` печатает результат одним JSON в самом конце.
+    streams_output = False
+
     async def execute(self, ctx: RunContext) -> ExecutionResult:
         argv = [
             self.command,
