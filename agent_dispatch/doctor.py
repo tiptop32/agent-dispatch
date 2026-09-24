@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import importlib.metadata
+import json
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import httpx
 from pydantic import BaseModel
 
+import agent_dispatch
 from agent_dispatch.config import Settings
 from agent_dispatch.executors.base import check_cli_version
 from agent_dispatch.executors.env import child_env
@@ -21,6 +27,71 @@ class Check(BaseModel):
     name: str
     ok: bool
     detail: str
+
+
+def stale_files(installed: Path, source: Path) -> list[str]:
+    suffixes = {".py", ".yaml", ".yml", ".json"}
+
+    def files(root: Path) -> dict[str, Path]:
+        return {
+            path.relative_to(root).as_posix(): path
+            for path in root.rglob("*")
+            if path.is_file()
+            and path.suffix in suffixes
+            and "__pycache__" not in path.relative_to(root).parts
+        }
+
+    installed_files = files(installed)
+    source_files = files(source)
+    different = installed_files.keys() ^ source_files.keys()
+    for relative in installed_files.keys() & source_files.keys():
+        installed_hash = hashlib.sha256(installed_files[relative].read_bytes()).digest()
+        source_hash = hashlib.sha256(source_files[relative].read_bytes()).digest()
+        if installed_hash != source_hash:
+            different.add(relative)
+    return sorted(different)
+
+
+def install_check(direct_url: dict | None, installed_pkg: Path) -> Check:
+    if direct_url is None:
+        return Check(name="install", ok=True, detail="not a local directory install, skipped")
+
+    parsed = urlparse(direct_url["url"])
+    source = Path(url2pathname(parsed.path))
+    if direct_url["dir_info"].get("editable"):
+        return Check(name="install", ok=True, detail=f"editable {source}")
+
+    source_pkg = source / "agent_dispatch"
+    if not source_pkg.is_dir():
+        return Check(name="install", ok=True, detail=f"source {source} not found, skipped")
+
+    stale = stale_files(installed_pkg, source_pkg)
+    if not stale:
+        return Check(name="install", ok=True, detail=f"copy matches {source}")
+
+    shown = ", ".join(stale[:3]) + (", ..." if len(stale) > 3 else "")
+    detail = (
+        f"installed copy differs from {source} in {len(stale)} files ({shown}): "
+        f"run uv tool install --reinstall {source}"
+    )
+    return Check(name="install", ok=False, detail=detail)
+
+
+def _install_check() -> Check:
+    try:
+        installed_pkg = Path(agent_dispatch.__file__).parent
+        try:
+            distribution = importlib.metadata.distribution("agent-dispatch")
+        except importlib.metadata.PackageNotFoundError:
+            return install_check(None, installed_pkg)
+        try:
+            raw_direct_url = distribution.read_text("direct_url.json")
+        except FileNotFoundError:
+            raw_direct_url = None
+        direct_url = json.loads(raw_direct_url) if raw_direct_url is not None else None
+        return install_check(direct_url, installed_pkg)
+    except Exception as exc:  # doctor must never crash while inspecting its own install
+        return Check(name="install", ok=True, detail=f"check failed: {exc}")
 
 
 def _config_check() -> Check:
@@ -45,7 +116,7 @@ async def _daemon_check(settings: Settings) -> Check:
 
 
 async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
-    checks = [_config_check()]
+    checks = [_config_check(), _install_check()]
     if settings.router.backend == "claude_local":
         checks.append(Check(name="env", ok=True, detail="not required for claude_local"))
     else:

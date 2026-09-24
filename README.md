@@ -45,6 +45,9 @@ agent-dispatch doctor            # config, ключ, демон, версии CL
 agent-dispatch doctor --online   # плюс живой вызов Jev
 ```
 
+Проверка `install` сравнивает установленную копию с исходниками и находит устаревшую
+установку. После изменения кода запустите `uv tool install --reinstall <repo>`.
+
 ## Первый запуск
 
 ```bash

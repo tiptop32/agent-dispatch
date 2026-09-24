@@ -9,14 +9,31 @@ import pytest
 import respx
 from typer.testing import CliRunner
 
+from agent_dispatch import doctor as doctor_module
 from agent_dispatch.cli import app
 from agent_dispatch.config import load_settings
-from agent_dispatch.doctor import Check, format_checks, run_checks
+from agent_dispatch.doctor import (
+    Check,
+    _install_check,
+    format_checks,
+    install_check,
+    run_checks,
+    stale_files,
+)
 from agent_dispatch.serve_state import ServeState, write_state
 
 runner = CliRunner()
 FAKE = Path(__file__).parent / "fakes" / "version_only.sh"
 JEV_RESPONSE = Path(__file__).parent / "fixtures" / "jev" / "response_ok.json"
+
+
+def _package_tree(root: Path, files: dict[str, str]) -> Path:
+    package = root / "agent_dispatch"
+    for relative, content in files.items():
+        path = package / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    return package
 
 
 def _configure(
@@ -63,6 +80,120 @@ def _mock_health(settings, state: ServeState):
     )
 
 
+def test_stale_files_returns_empty_for_identical_trees(tmp_path):
+    installed = _package_tree(tmp_path / "installed", {"main.py": "same", "config.yaml": "x: 1"})
+    source = _package_tree(tmp_path / "source", {"main.py": "same", "config.yaml": "x: 1"})
+
+    assert stale_files(installed, source) == []
+
+
+def test_stale_files_reports_changed_and_one_sided_files(tmp_path):
+    installed = _package_tree(tmp_path / "installed", {"changed.py": "old", "installed.json": "{}"})
+    source = _package_tree(
+        tmp_path / "source", {"changed.py": "new", "source.yml": "enabled: true"}
+    )
+
+    assert stale_files(installed, source) == ["changed.py", "installed.json", "source.yml"]
+
+
+def test_stale_files_ignores_pycache_and_pyc(tmp_path):
+    installed = _package_tree(
+        tmp_path / "installed", {"__pycache__/main.py": "old", "main.pyc": "old"}
+    )
+    source = _package_tree(tmp_path / "source", {"__pycache__/main.py": "new", "main.pyc": "new"})
+
+    assert stale_files(installed, source) == []
+
+
+def test_install_check_skips_non_local_install(tmp_path):
+    assert install_check(None, tmp_path) == Check(
+        name="install", ok=True, detail="not a local directory install, skipped"
+    )
+
+
+def test_install_check_accepts_editable_install(tmp_path):
+    source = tmp_path / "source"
+
+    check = install_check(
+        {"url": source.as_uri(), "dir_info": {"editable": True}}, tmp_path / "installed"
+    )
+
+    assert check == Check(name="install", ok=True, detail=f"editable {source}")
+
+
+def test_install_check_skips_missing_source(tmp_path):
+    source = tmp_path / "missing"
+
+    check = install_check({"url": source.as_uri(), "dir_info": {}}, tmp_path / "installed")
+
+    assert check == Check(name="install", ok=True, detail=f"source {source} not found, skipped")
+
+
+def test_install_check_accepts_matching_copy(tmp_path):
+    installed = _package_tree(tmp_path / "installed", {"main.py": "same"})
+    source = tmp_path / "source"
+    _package_tree(source, {"main.py": "same"})
+
+    check = install_check({"url": source.as_uri(), "dir_info": {}}, installed)
+
+    assert check == Check(name="install", ok=True, detail=f"copy matches {source}")
+
+
+def test_install_check_reports_stale_copy_and_reinstall_command(tmp_path):
+    installed = _package_tree(tmp_path / "installed", {"main.py": "old"})
+    source = tmp_path / "source"
+    _package_tree(source, {"main.py": "new"})
+
+    check = install_check({"url": source.as_uri(), "dir_info": {}}, installed)
+
+    assert not check.ok
+    assert "in 1 files (main.py)" in check.detail
+    assert f"uv tool install --reinstall {source}" in check.detail
+
+
+def test_install_check_limits_stale_file_details_to_three(tmp_path):
+    installed = _package_tree(tmp_path / "installed", {})
+    source = tmp_path / "source"
+    _package_tree(source, {f"file_{number}.py": "new" for number in range(4)})
+
+    check = install_check({"url": source.as_uri(), "dir_info": {}}, installed)
+
+    assert "in 4 files (file_0.py, file_1.py, file_2.py, ...)" in check.detail
+
+
+def test_install_check_decodes_percent_encoded_source_path(tmp_path):
+    source = tmp_path / "source with space"
+    installed = _package_tree(tmp_path / "installed", {"main.py": "same"})
+    _package_tree(source, {"main.py": "same"})
+
+    check = install_check({"url": source.as_uri(), "dir_info": {}}, installed)
+
+    assert check == Check(name="install", ok=True, detail=f"copy matches {source}")
+
+
+def test_install_check_decodes_the_source_path_exactly_once(tmp_path):
+    # Буквальный `%20` в имени каталога кодируется в URL как `%2520`: двойное
+    # раскодирование превратило бы его в пробел и увело проверку в чужой путь.
+    source = tmp_path / "literal%20percent"
+    installed = _package_tree(tmp_path / "installed", {"main.py": "same"})
+    _package_tree(source, {"main.py": "same"})
+
+    check = install_check({"url": source.as_uri(), "dir_info": {}}, installed)
+
+    assert check == Check(name="install", ok=True, detail=f"copy matches {source}")
+
+
+def test_install_check_wrapper_never_raises(monkeypatch):
+    def fail(_name):
+        raise RuntimeError("broken metadata")
+
+    monkeypatch.setattr(doctor_module.importlib.metadata, "distribution", fail)
+
+    assert _install_check() == Check(
+        name="install", ok=True, detail="check failed: broken metadata"
+    )
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_config_check_reports_found_path(tmp_config_dir):
@@ -71,6 +202,15 @@ async def test_config_check_reports_found_path(tmp_config_dir):
     checks = await run_checks(settings)
     config = checks[0]
     assert config.ok and "found" in config.detail and "config.yaml" in config.detail
+
+
+@pytest.mark.asyncio
+async def test_run_checks_contains_install_check(tmp_config_dir):
+    settings = _configure(tmp_config_dir)
+
+    checks = await run_checks(settings)
+
+    assert any(check.name == "install" for check in checks)
 
 
 @pytest.mark.asyncio
@@ -151,7 +291,7 @@ async def test_claude_local_backend_does_not_require_jev_or_call_it(tmp_config_d
     _mock_health(settings, _state())
     checks = await run_checks(settings, online=True)
     assert all(check.ok for check in checks)
-    assert checks[1] == Check(name="env", ok=True, detail="not required for claude_local")
+    assert checks[2] == Check(name="env", ok=True, detail="not required for claude_local")
     assert checks[-1].name == "jev" and checks[-1].ok
     assert "claude_local" in checks[-1].detail
 
