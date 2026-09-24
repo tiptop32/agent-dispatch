@@ -14,7 +14,7 @@ from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
 from agent_dispatch.models import DispatchRequest, SourceAgent
 from agent_dispatch.routing.claude_local import ClaudeLocalRouter
 from agent_dispatch.routing.jev import JevRouter
-from agent_dispatch.serve_state import is_alive, read_state
+from agent_dispatch.serve_state import is_running, read_state
 
 
 class Check(BaseModel):
@@ -34,7 +34,7 @@ def _config_check() -> Check:
 
 async def _daemon_check(settings: Settings) -> Check:
     state = read_state(settings.server.data_dir)
-    if state is None or not is_alive(state):
+    if state is None or not is_running(state):
         return Check(name="daemon", ok=False, detail="not running")
     try:
         async with DispatchClient(state, timeout=5) as client:

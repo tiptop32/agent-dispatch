@@ -26,6 +26,7 @@
 - Исполнитель не коммитит (запрещено в Task Package), коммитит демон: `worktree.commit` на ветке задачи, с `--no-verify`. Хуки репозитория на служебном коммите не гоняются осознанно — pre-commit с полным прогоном тестов падал бы на недоделанной задаче. Гейт — коммит вызывающего после ревью дифа.
 - `worktree.build_patch` считает диф от `Worktree.base`, а не от HEAD: после промежуточного коммита `diff --cached HEAD` вернул бы пустоту (есть тест на равенство патча до и после коммита).
 - `integrate: branch` оставляет ветку без worktree. Такие ветки показывает `worktree.list_branches`, иначе они копились бы незаметно.
+- «Демон запущен» решает порт, а не pid: `serve_state.is_running` это живой pid И занятый порт. `os.kill(pid, 0)` истинен и для зомби, и для процесса, застрявшего в shutdown, а такой pid в `serve.json` запирал старт нового демона навсегда.
 - Отмена задачи, перезапуск демона и сбой интеграции worktree не удаляют: в нём лежит работа исполнителя, и выбрасывать её демон не вправе. Но путь и ветка обязаны попасть в `result.meta` (`_note_kept_worktree` на срыве, `_worktree_meta` в `recover_stale`), иначе дерево не видно ни в `status`, ни вызывающему. Единственный сборщик мусора — `agent-dispatch worktrees --clean`, его запускает человек.
 - `config.example.yaml` равен `agent_dispatch/config_default.yaml` (есть тест).
 - Фикстуры: `tests/fixtures/jev/` (живые ответы Jev), `tests/fixtures/agent_output/` (живые выводы claude/codex/opencode), fake-CLI в `tests/fakes/`. Session-фикстура прогревает fake-скрипты (первый exec на macOS медленный).

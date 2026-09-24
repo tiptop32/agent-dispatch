@@ -1,8 +1,10 @@
 import json
 import os
+import socket
 from datetime import UTC, datetime
 
 import httpx
+import pytest
 import respx
 from typer.testing import CliRunner
 
@@ -15,6 +17,16 @@ runner = CliRunner()
 
 def _state(port: int = 17433, token: str = "secret") -> ServeState:
     return ServeState(pid=os.getpid(), port=port, token=token, started_at=datetime.now(UTC))
+
+
+@pytest.fixture(autouse=True)
+def _daemon_port():
+    """Порт фальшивого демона занят по-настоящему: `is_running` смотрит не только на pid."""
+    with socket.socket() as holder:
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", 17433))
+        holder.listen(1)
+        yield
 
 
 def _route_payload() -> dict:

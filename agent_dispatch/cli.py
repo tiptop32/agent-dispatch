@@ -41,7 +41,7 @@ async def _open_client(settings: Settings, wait: int, start: bool) -> DispatchCl
             state = await autostart.ensure_daemon(settings)
         else:
             state = serve_state.read_state(settings.server.data_dir)
-            if state is None or not serve_state.is_alive(state):
+            if state is None or not serve_state.is_running(state):
                 _daemon_error()
     except DaemonUnavailable as exc:
         _daemon_error(str(exc))

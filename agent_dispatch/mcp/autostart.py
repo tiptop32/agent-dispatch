@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from agent_dispatch.config import Settings
 from agent_dispatch.executors.env import child_env
 from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
-from agent_dispatch.serve_state import ServeState, is_alive, read_state
+from agent_dispatch.serve_state import ServeState, is_running, read_state
 
 
 async def ensure_daemon(
@@ -33,7 +33,7 @@ async def ensure_daemon(
         return True
 
     state = read_state(data_dir)
-    if state is not None and is_alive(state) and await healthy(state):
+    if state is not None and is_running(state) and await healthy(state):
         return state
 
     log_dir = data_dir / "logs"

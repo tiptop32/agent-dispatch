@@ -20,7 +20,7 @@ from agent_dispatch.models import (
     RouterKind,
     TaskStatus,
 )
-from agent_dispatch.serve_state import ServeState, is_alive, write_state
+from agent_dispatch.serve_state import ServeState, write_state
 from agent_dispatch.server import run_server
 from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
@@ -229,25 +229,45 @@ async def test_export_since_invalid(api):
     assert (await api[0].get("/export?since=wat", headers=headers())).status_code == 422
 
 
-def test_run_server_detects_live_state(tmp_path):
+def _state_settings(tmp_path, port: int):
     write_state(
         tmp_path,
         ServeState(
-            pid=__import__("os").getpid(), port=7433, token="x", started_at=datetime.now(UTC)
+            pid=__import__("os").getpid(), port=port, token="x", started_at=datetime.now(UTC)
         ),
     )
-    settings = Settings(
-        server=ServerSettings(data_dir=tmp_path),
+    return Settings(
+        server=ServerSettings(data_dir=tmp_path, port=port),
         executors={"codex": ExecutorSettings(adapter="codex")},
         routing=RoutingSettings(fallback_executor="codex"),
     )
-    with pytest.raises(SystemExit, match="daemon already running"):
-        run_server(settings)
-    assert is_alive(
-        ServeState(
-            pid=__import__("os").getpid(), port=7433, token="x", started_at=datetime.now(UTC)
-        )
-    )
+
+
+def test_run_server_detects_live_state(tmp_path):
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        settings = _state_settings(tmp_path, holder.getsockname()[1])
+        with pytest.raises(SystemExit, match="daemon already running"):
+            run_server(settings)
+
+
+def test_run_server_starts_when_the_state_pid_serves_nothing(tmp_path, monkeypatch):
+    """Зомби-pid в serve.json запирал старт навсегда: `serve` видел «уже запущен»,
+    а обслуживать запросы было некому."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    settings = _state_settings(tmp_path, port)
+    started = []
+
+    async def fake_serve(passed):
+        started.append(passed)
+
+    monkeypatch.setattr("agent_dispatch.server.serve", fake_serve)
+    run_server(settings)
+
+    assert started == [settings]
 
 
 def test_run_server_detects_busy_port(tmp_path):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from datetime import datetime
 from pathlib import Path
 
@@ -60,3 +61,27 @@ def is_alive(state: ServeState) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def port_in_use(host: str, port: int) -> bool:
+    """Занят ли порт: пробный bind, тот же, что делает uvicorn при старте."""
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((host, port))
+    except OSError:
+        return True
+    return False
+
+
+def is_running(state: ServeState) -> bool:
+    """Обслуживает ли демон из состояния запросы.
+
+    Одного pid мало: `os.kill(pid, 0)` истинен и для зомби, которого никто не
+    похоронил, и для процесса, застрявшего в shutdown. Такой pid запирал старт
+    нового демона навсегда: `serve` видел «уже запущен», а запросы при этом
+    некому было обслуживать. Порт отвечает честно — сокетов ни зомби, ни
+    завершившийся uvicorn не держат.
+    """
+    return is_alive(state) and port_in_use(state.host, state.port)
