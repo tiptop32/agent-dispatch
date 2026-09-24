@@ -64,6 +64,11 @@ class RoutingSettings(_ConfigModel):
     #: Поднимая порог, вы разрешаете отправлять наружу задачи, которые Jev счёл
     #: корпоративными неуверенно: это ослабление периметра данных, решение ваше.
     corporate_min_confidence: float = Field(0.0, ge=0.0, le=1.0)
+    #: Когда false, вопрос о корпоративных данных Jev не задаётся и пул не
+    #: сужается до исполнителей с `corporate: true`: корпоративный код может
+    #: уехать за периметр. Отключать периметр вправе только человек, поэтому
+    #: по умолчанию true и поведение прежнее.
+    corporate_perimeter: bool = True
     exclude_source_agent: bool = True
     default_timeout_seconds: int = Field(1800, ge=0)
     availability_ttl_seconds: int = Field(60, ge=0)

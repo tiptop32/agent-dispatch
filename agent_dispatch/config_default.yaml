@@ -27,6 +27,7 @@ routing:
   max_hops: 2
   max_children: 2
   corporate_min_confidence: 0.0  # порог уверенности ответа о корп. данных; 0 = доверять любому
+  corporate_perimeter: true     # false: вопрос о корп. данных не задаётся и пул не сужается
   exclude_source_agent: true
   default_timeout_seconds: 1800
   availability_ttl_seconds: 60

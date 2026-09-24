@@ -53,7 +53,7 @@ class JevRouter:
         if not api_key:
             raise RouterError(f"missing API key: {cfg.api_key_env}")
         capabilities = tiers_present(candidates)
-        ask_corporate = has_corporate(candidates)
+        ask_corporate = has_corporate(candidates) and self.settings.routing.corporate_perimeter
         body = {
             "model": cfg.model,
             "state": build_state(req),
@@ -83,6 +83,8 @@ class JevRouter:
                 judgment = judgments.get("judgment")
                 corporate = judgments.get("corporate_data")
                 narrow, extra_note = self._corporate_verdict(corporate)
+                if not ask_corporate:
+                    narrow, extra_note = False, None
                 selection = select(
                     capability,
                     candidates,

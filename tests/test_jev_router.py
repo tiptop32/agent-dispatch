@@ -262,6 +262,76 @@ async def test_confident_corporate_answer_still_narrows_the_perimeter_at_the_sam
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_corporate_perimeter_off_does_not_ask_the_question():
+    s = Settings.model_validate(
+        {
+            "secrets": {"OPENROUTER_API_KEY": "k"},
+            "executors": {"codex": {"adapter": "codex"}},
+            "routing": {"corporate_perimeter": False},
+        }
+    )
+    candidates = {
+        "external": ExecutorSettings(adapter="codex", tier="fast"),
+        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+    }
+    route = respx.post(s.router.jev.base_url).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "answers": {
+                    "capability": {
+                        "type": "choice",
+                        "choice": "fast",
+                        "probabilities": {"fast": 1},
+                        "confidence": 0.9,
+                    }
+                }
+            },
+        )
+    )
+    async with httpx.AsyncClient() as client:
+        await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), candidates)
+    body = json.loads(route.calls[0].request.content)
+    assert "corporate_data" not in body["questions"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_corporate_perimeter_off_ignores_the_answer():
+    # Даже если Jev почему-то отвечает «корп. данные: да» уверенно, при
+    # выключенном периметре пул не сужается и заметки о периметре нет.
+    s = Settings.model_validate(
+        {
+            "secrets": {"OPENROUTER_API_KEY": "k"},
+            "executors": {"codex": {"adapter": "codex"}},
+            "routing": {"corporate_perimeter": False},
+        }
+    )
+    candidates = {
+        "external": ExecutorSettings(adapter="claude", tier="strong"),
+        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+    }
+    payload = {
+        "answers": {
+            "capability": {
+                "type": "choice",
+                "choice": "strong",
+                "probabilities": {"strong": 1},
+                "confidence": 0.95,
+            },
+            "corporate_data": {"type": "noul", "noul": 0.95},
+        }
+    }
+    respx.post(s.router.jev.base_url).mock(return_value=httpx.Response(200, json=payload))
+    async with httpx.AsyncClient() as client:
+        result = await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), candidates)
+
+    assert result.executor == "external"
+    assert not any("corporate" in n for n in result.meta.get("selection_notes", []))
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_judgment_answer_sends_the_task_to_a_reasoning_agent():
     s = settings()
     candidates = {
