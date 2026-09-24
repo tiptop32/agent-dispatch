@@ -49,9 +49,10 @@ class DispatchClient:
         response = await self._request("POST", "/tasks", json=req.model_dump(mode="json"))
         return TaskView.model_validate(response.json())
 
-    async def status(self, task_id: str) -> TaskView:
+    async def status(self, task_id: str, wait: int = 0) -> TaskView:
         try:
-            response = await self._request("GET", f"/tasks/{task_id}")
+            kwargs = {"params": {"wait": wait}} if wait > 0 else {}
+            response = await self._request("GET", f"/tasks/{task_id}", **kwargs)
         except RuntimeError as exc:
             if "404" in str(exc):
                 raise ValueError(f"task not found: {task_id}") from exc

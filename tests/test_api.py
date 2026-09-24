@@ -167,6 +167,42 @@ async def test_unknown_task_get(api):
 
 
 @pytest.mark.asyncio
+async def test_get_task_wait_returns_final_status(api):
+    client, _, _, adapters, repo, _ = api
+    adapters["codex"].gate = asyncio.Event()
+    response = await client.post("/tasks", headers=headers(), json=payload(repo, wait_seconds=0))
+    task_id = response.json()["task_id"]
+    await adapters["codex"].started.wait()
+
+    async def finish():
+        await asyncio.sleep(0.01)
+        adapters["codex"].gate.set()
+
+    finisher = asyncio.create_task(finish())
+    response = await client.get(f"/tasks/{task_id}?wait=1", headers=headers())
+    await finisher
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_get_task_wait_timeout_returns_running(api, monkeypatch):
+    client, _, _, adapters, repo, _ = api
+    adapters["codex"].gate = asyncio.Event()
+    monkeypatch.setattr(routes, "MAX_WAIT_SECONDS", 0.05)
+    response = await client.post("/tasks", headers=headers(), json=payload(repo, wait_seconds=0))
+    task_id = response.json()["task_id"]
+    await adapters["codex"].started.wait()
+
+    started = asyncio.get_running_loop().time()
+    response = await client.get(f"/tasks/{task_id}?wait=1", headers=headers())
+    elapsed = asyncio.get_running_loop().time() - started
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+    assert 0.04 <= elapsed < 1
+
+
+@pytest.mark.asyncio
 async def test_cancel_running(api):
     client, _, _, adapters, repo, _ = api
     adapters["codex"].gate = asyncio.Event()

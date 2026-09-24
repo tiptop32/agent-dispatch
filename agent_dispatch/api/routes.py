@@ -91,10 +91,13 @@ def build_router() -> APIRouter:
         return to_view(record)
 
     @router.get("/tasks/{task_id}")
-    async def get_task(task_id: str, request: Request):
-        record = await _deps(request).dispatcher.get(task_id)
+    async def get_task(task_id: str, request: Request, wait: int = 0):
+        deps = _deps(request)
+        record = await deps.dispatcher.get(task_id)
         if record is None:
             raise HTTPException(404, "task not found")
+        if wait > 0 and record.status not in FINAL_STATUSES:
+            record = await deps.dispatcher.wait(task_id, min(wait, MAX_WAIT_SECONDS))
         return to_view(record)
 
     @router.delete("/tasks/{task_id}")

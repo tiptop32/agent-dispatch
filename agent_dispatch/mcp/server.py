@@ -13,7 +13,15 @@ from mcp.server.mcpserver.exceptions import ToolError
 from agent_dispatch.config import Settings, load_settings
 from agent_dispatch.mcp.autostart import ensure_daemon
 from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
-from agent_dispatch.models import ContextMode, DispatchRequest, SourceAgent, TaskStatus, TaskView
+from agent_dispatch.models import (
+    ContextMode,
+    DispatchRequest,
+    RouteDecision,
+    RouterKind,
+    SourceAgent,
+    TaskStatus,
+    TaskView,
+)
 from agent_dispatch.serve_state import ServeState
 
 ClientFactory = Callable[[ServeState, float], DispatchClient]
@@ -49,19 +57,88 @@ def _request(task: str, cwd: str, settings: Settings, **kwargs: Any) -> Dispatch
     )
 
 
-def _task_text(view: TaskView) -> str:
+def _route_lines(decision: RouteDecision) -> list[str]:
+    route_parts = [str(decision.router)]
+    if decision.capability:
+        route_parts.append(decision.capability)
+    confidence = str(decision.confidence)
+    if decision.confidence_tier:
+        confidence += f" {decision.confidence_tier}"
+    route_parts.append(confidence)
+    route = f"route: {' · '.join(route_parts)}"
+    if decision.router == RouterKind.fallback and decision.reason:
+        route += f" (reason: {decision.reason})"
+
+    lines = [route]
+    notes = decision.meta.get("selection_notes")
+    if notes:
+        lines.append(f"notes: {'; '.join(notes)}")
+    return lines
+
+
+def _task_text(view: TaskView, verbose: bool = False) -> str:
     result = view.result
-    executor = result.executor if result else (view.decision.executor if view.decision else "")
+    executor = (
+        result.executor
+        if result and result.executor
+        else (view.decision.executor if view.decision else "")
+    )
     changed = ", ".join(result.changed_files) if result else ""
     summary = result.summary if result else ""
-    text = (
-        f"task_id: {view.task_id}\nstatus: {view.status.value}\n"
-        f"executor: {executor}\nchanged_files: {changed}\nsummary: {summary}\n\n"
-        f"{view.model_dump_json(indent=2)}"
-    )
+    if verbose:
+        text = (
+            f"task_id: {view.task_id}\nstatus: {view.status.value}\n"
+            f"executor: {executor}\nchanged_files: {changed}\nsummary: {summary}\n\n"
+            f"{view.model_dump_json(indent=2)}"
+        )
+        if view.status in {TaskStatus.queued, TaskStatus.routing, TaskStatus.running}:
+            text += "\n\nTask is still running. Call `status` with this task_id to get the result."
+        return text
+
+    lines = [f"task_id: {view.task_id}", f"status: {view.status.value}"]
+    if executor:
+        lines.append(f"executor: {executor}")
+    if view.decision:
+        lines.extend(_route_lines(view.decision))
+    if view.escalated_from:
+        lines.append(f"escalated_from: {view.escalated_from}")
+    if result:
+        escalated_to = result.meta.get("escalated_to")
+        if escalated_to:
+            lines.append(f"escalated_to: {escalated_to}")
+        if changed:
+            lines.append(f"changed_files: {changed}")
+        if result.tests and result.tests.result:
+            tests = result.tests.result
+            if result.tests.command:
+                tests += f" ({result.tests.command})"
+            lines.append(f"tests: {tests}")
+        if result.error:
+            lines.append(f"error: {result.error[:500]}")
+        for key in ("branch", "worktree", "patch", "integration_error"):
+            if value := result.meta.get(key):
+                lines.append(f"{key}: {value}")
+        if summary:
+            if len(summary) > 800:
+                summary = summary[:800] + " …"
+            lines.append(f"summary: {summary}")
+
+    show_log = view.status in {
+        TaskStatus.queued,
+        TaskStatus.routing,
+        TaskStatus.running,
+        TaskStatus.failed,
+        TaskStatus.partial,
+    }
+    log_lines = [line[:200] for line in view.log_tail.splitlines() if line.strip()][-5:]
+    if show_log and log_lines:
+        lines.append("log_tail:\n" + "\n".join(log_lines))
     if view.status in {TaskStatus.queued, TaskStatus.routing, TaskStatus.running}:
-        text += "\n\nTask is still running. Call `status` with this task_id to get the result."
-    return text
+        lines.append(
+            "Task is still running. Call `status` with this task_id and wait_seconds "
+            "(up to 600) to block until it finishes."
+        )
+    return "\n".join(lines)
 
 
 def build_server(
@@ -92,6 +169,7 @@ def build_server(
         constraints: list[str] | None = None,
         success_criteria: list[str] | None = None,
         context_mode: str = "prompt+summary",
+        verbose: bool = False,
     ) -> str:
         try:
             client = await get_client(settings.mcp.wait_seconds)
@@ -107,11 +185,13 @@ def build_server(
                     context_mode=ContextMode(context_mode),
                 )
             )
-            return (
-                f"executor: {decision.executor}\nconfidence: {decision.confidence}\n"
-                f"router: {decision.router}\nreason: {decision.reason}\n\n"
-                f"{decision.model_dump_json(indent=2)}"
-            )
+            if verbose:
+                return (
+                    f"executor: {decision.executor}\nconfidence: {decision.confidence}\n"
+                    f"router: {decision.router}\nreason: {decision.reason}\n\n"
+                    f"{decision.model_dump_json(indent=2)}"
+                )
+            return "\n".join([f"executor: {decision.executor}", *_route_lines(decision)])
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
 
@@ -127,6 +207,7 @@ def build_server(
         allow_escalation: bool,
         wait_seconds: int | None,
         timeout_seconds: int | None,
+        verbose: bool,
     ) -> str:
         try:
             wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
@@ -145,7 +226,7 @@ def build_server(
                 wait_seconds=wait,
                 timeout_seconds=timeout_seconds,
             )
-            return _task_text(await client.submit(req))
+            return _task_text(await client.submit(req), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
 
@@ -166,6 +247,7 @@ def build_server(
         allow_escalation: bool = True,
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
+        verbose: bool = False,
     ) -> str:
         return await do_dispatch(
             None,
@@ -179,6 +261,7 @@ def build_server(
             allow_escalation,
             wait_seconds,
             timeout_seconds,
+            verbose,
         )
 
     @server.tool(
@@ -199,6 +282,7 @@ def build_server(
         allow_escalation: bool = True,
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
+        verbose: bool = False,
     ) -> str:
         return await do_dispatch(
             executor,
@@ -212,13 +296,15 @@ def build_server(
             allow_escalation,
             wait_seconds,
             timeout_seconds,
+            verbose,
         )
 
     @server.tool(description="Get the current result of a delegated task by task_id.")
-    async def status(task_id: str) -> str:
+    async def status(task_id: str, wait_seconds: int = 0, verbose: bool = False) -> str:
         try:
-            client = await get_client(settings.mcp.wait_seconds)
-            return _task_text(await client.status(task_id))
+            wait = max(0, wait_seconds)
+            client = await get_client(wait)
+            return _task_text(await client.status(task_id, wait), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
 
