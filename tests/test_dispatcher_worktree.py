@@ -18,7 +18,7 @@ from agent_dispatch.config import (
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.executors import worktree
 from agent_dispatch.executors.registry import AvailabilityCache
-from agent_dispatch.models import DispatchRequest
+from agent_dispatch.models import DispatchRequest, TaskStatus
 from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
 
@@ -258,3 +258,121 @@ async def test_request_can_override_the_configured_mode(tmp_path, git_repo):
     await dispatcher.wait(record.task_id, WAIT)
 
     assert adapters["codex"].calls[0].cwd != str(git_repo)
+
+
+def _holds(gate: asyncio.Event):
+    async def on_execute(ctx):
+        (Path(ctx.cwd) / "a.py").write_text("half done\n")
+        await gate.wait()
+
+    return on_execute
+
+
+@pytest.mark.asyncio
+async def test_cancelled_task_keeps_the_worktree_and_reports_it(tmp_path, git_repo):
+    _, _, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].on_execute = _holds(asyncio.Event())
+
+    record = await dispatcher.submit(_req(git_repo))
+    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    done = await dispatcher.cancel(record.task_id)
+
+    assert done.status == "cancelled"
+    # Незакоммиченная работа исполнителя остаётся в дереве, но она видна.
+    assert Path(done.result.meta["worktree"]).is_dir()  # noqa: ASYNC240
+    assert done.result.meta["branch"] in _git(git_repo, "branch", "--list", "agent-dispatch/*")
+    assert done.result.meta["integrated"] is False
+    assert done.result.error == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_leaves_the_worktree_in_the_stored_record(tmp_path, git_repo):
+    _, storage, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].on_execute = _holds(asyncio.Event())
+
+    record = await dispatcher.submit(_req(git_repo))
+    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    await dispatcher.shutdown()
+
+    stored = await storage.get_task(record.task_id)
+    assert stored.status == "cancelled"
+    assert Path(stored.result.meta["worktree"]).is_dir()  # noqa: ASYNC240
+    assert stored.result.meta["branch"]
+
+
+@pytest.mark.asyncio
+async def test_failure_before_the_executor_starts_reports_the_worktree(
+    tmp_path, git_repo, monkeypatch
+):
+    _, _, _, dispatcher = await _make(tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("prompt render failed")
+
+    monkeypatch.setattr("agent_dispatch.dispatch.dispatcher.render_prompt", boom)
+
+    record = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    assert done.status == "failed"
+    assert "prompt render failed" in done.result.error
+    assert Path(done.result.meta["worktree"]).is_dir()  # noqa: ASYNC240
+
+
+@pytest.mark.asyncio
+async def test_unwritable_patch_keeps_the_worktree_and_reports_the_failure(tmp_path, git_repo):
+    # Файл на месте каталога патчей: mkdir упирается в него с OSError.
+    (tmp_path / "patches").write_text("not a directory\n")
+    _, _, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].on_execute = _writes("x = 2\n")
+
+    record = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    assert done.status == "completed"
+    assert done.result.meta["integrated"] is False
+    assert "patch not written" in done.result.meta["integration_error"]
+    assert Path(done.result.meta["worktree"]).is_dir()  # noqa: ASYNC240
+    assert (git_repo / "a.py").read_text() == "x = 1\n"  # рабочая копия не тронута
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_restores_the_worktree_from_the_event(tmp_path, git_repo):
+    settings, storage, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].on_execute = _holds(asyncio.Event())
+
+    record = await dispatcher.submit(_req(git_repo))
+    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    await dispatcher.shutdown()
+    # Демон, убитый сигналом, оставляет задачу в running и ничего не дописывает.
+    stale = await storage.get_task(record.task_id)
+    stale.status, stale.result, stale.finished_at = TaskStatus.running, None, None
+    await storage.update_task(stale)
+
+    fresh = Dispatcher(settings, storage, adapters, AvailabilityCache(adapters, 60), [FakeRouter()])
+    assert await fresh.recover_stale() == 1
+
+    done = await storage.get_task(record.task_id)
+    assert done.result.error == "daemon restarted"
+    assert done.result.meta["worktree"] == adapters["codex"].calls[0].cwd
+    assert done.result.meta["branch"]
+
+
+@pytest.mark.asyncio
+async def test_failure_after_integration_does_not_report_a_removed_worktree(
+    tmp_path, git_repo, monkeypatch
+):
+    _, _, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].on_execute = _writes("x = 2\n")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("finalize failed")
+
+    monkeypatch.setattr("agent_dispatch.dispatch.dispatcher.should_escalate", boom)
+
+    record = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    assert done.status == "failed"
+    # Дерево убрано удачной интеграцией: указателя в пустоту в результате нет.
+    assert "worktree" not in done.result.meta

@@ -174,11 +174,29 @@ class Dispatcher:
                     model=None,
                     summary="",
                     error="daemon restarted",
+                    # Демон умер вместе со знанием о worktree задачи. Путь
+                    # восстанавливается из события, иначе дерево осталось бы
+                    # на диске, не упомянутое ни в одной записи.
+                    meta=await self._worktree_meta(record.task_id),
                 )
                 await self.storage.add_event(record.task_id, "exit", {"status": "failed"})
                 await self.storage.update_task(record)
                 count += 1
         return count
+
+    async def _worktree_meta(self, task_id: str) -> dict[str, object]:
+        """Путь и ветка worktree задачи по её событиям; пусто в режиме in_place."""
+        events = await self.storage.list_events(task_id)
+        payload = next(
+            (event["payload"] for event in reversed(events) if event["kind"] == "worktree"), None
+        )
+        if not payload or not payload.get("path"):
+            return {}
+        return {
+            "worktree": payload["path"],
+            "branch": payload.get("branch", ""),
+            "integrated": False,
+        }
 
     async def route_only(self, req: DispatchRequest) -> tuple[RouteDecision, list[GuardEvent]]:
         routing = await self._route(req)
@@ -254,6 +272,9 @@ class Dispatcher:
                     error="worker stopped unexpectedly"
                     if record.status == TaskStatus.failed
                     else None,
+                    # Тот же перенос meta, что и в `_mark_failed`: путь
+                    # оставшегося worktree переживает подмену результата.
+                    meta=dict(record.result.meta) if record.result else {},
                 )
                 await self.storage.update_task(record)
                 await self.storage.add_event(task_id, "exit", {"status": record.status.value})
@@ -341,25 +362,37 @@ class Dispatcher:
                 await self.storage.add_event(
                     task_id, "worktree", {"path": str(tree.path), "branch": tree.branch}
                 )
-            ctx = await self._build_context(record, decision, tree)
-            record.status, record.started_at = TaskStatus.running, self._now()
-            await self.storage.update_task(record)
-            await self.storage.add_event(
-                task_id, "spawn", {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd}
-            )
             try:
-                result = await adapter.execute(ctx)
-            except Exception as exc:
-                result = ExecutionResult(
-                    status="failed",
-                    executor=decision.executor,
-                    model=None,
-                    summary="",
-                    error=f"{type(exc).__name__}: {exc}",
+                ctx = await self._build_context(record, decision, tree)
+                record.status, record.started_at = TaskStatus.running, self._now()
+                await self.storage.update_task(record)
+                await self.storage.add_event(
+                    task_id,
+                    "spawn",
+                    {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
                 )
-            if tree is not None:
-                await self._finish_worktree(req, tree, result, task_id)
-            await self._finalize(record, decision, result)
+                try:
+                    result = await adapter.execute(ctx)
+                except Exception as exc:
+                    result = ExecutionResult(
+                        status="failed",
+                        executor=decision.executor,
+                        model=None,
+                        summary="",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                if tree is not None:
+                    await self._finish_worktree(req, tree, result, task_id)
+                await self._finalize(record, decision, result)
+            except BaseException as exc:
+                # Отмена задачи это BaseException, её не ловит `except Exception`
+                # выше, и обычный путь уборки не отрабатывает. Дерево остаётся
+                # намеренно: в нём лежит незакоммиченная работа исполнителя.
+                # Но без записи в результате его не видно ни в `status`, ни
+                # вызывающему, поэтому путь и ветка уходят в meta.
+                if tree is not None:
+                    await self._note_kept_worktree(record, tree, exc)
+                raise
 
     async def _build_context(
         self, record: TaskRecord, decision: RouteDecision, tree: worktree.Worktree | None
@@ -439,6 +472,35 @@ class Dispatcher:
         )
         result.meta["escalated_to"] = child.task_id
 
+    async def _note_kept_worktree(
+        self, record: TaskRecord, tree: worktree.Worktree, exc: BaseException
+    ) -> None:
+        """Записать в результат worktree, который остался после срыва задачи.
+
+        Каталога может уже не быть: срыв бывает и после удачной интеграции,
+        когда дерево убрано. Тогда путь не пишется, иначе в результате оказался
+        бы указатель в пустоту.
+        """
+        # Проверка синхронная нарочно: задачу уже отменяют, и лишняя точка
+        # ожидания здесь может снять запись результата вместе с путём.
+        if not tree.path.exists():  # noqa: ASYNC240
+            return
+        cancelled = isinstance(exc, asyncio.CancelledError)
+        meta = dict(record.result.meta) if record.result else {}
+        meta["worktree"], meta["branch"] = str(tree.path), tree.branch
+        meta["integrated"] = False
+        record.result = ExecutionResult(
+            status="failed",
+            executor=record.decision.executor if record.decision else "",
+            model=record.result.model if record.result else None,
+            summary=record.result.summary if record.result else "",
+            # `cancelled` нет в TerminalStatus: статус задачи живёт в record.status,
+            # у результата остаётся только причина.
+            error="cancelled" if cancelled else f"{type(exc).__name__}: {exc}",
+            meta=meta,
+        )
+        await self.storage.update_task(record)
+
     async def _mark_cancelled(self, record: TaskRecord) -> None:
         if record.status in FINAL_STATUSES:
             return
@@ -448,12 +510,15 @@ class Dispatcher:
         self._notify(record.task_id)
 
     async def _mark_failed(self, record: TaskRecord, exc: BaseException) -> None:
+        # meta уже собранного результата переносится: в ней путь оставшегося
+        # worktree, и терять его вместе с прежним результатом нельзя.
         record.result = ExecutionResult(
             status="failed",
             executor=record.decision.executor if record.decision else "",
             model=None,
             summary="",
             error=f"{type(exc).__name__}: {exc}",
+            meta=dict(record.result.meta) if record.result else {},
         )
         record.status, record.finished_at = TaskStatus.failed, self._now()
         await self.storage.add_event(record.task_id, "exit", {"status": "failed"})
@@ -521,8 +586,15 @@ class Dispatcher:
             result.meta["integration_error"] = str(exc)
             return
         patch_path = self.settings.server.data_dir / "patches" / f"{task_id}.patch"
-        await asyncio.to_thread(patch_path.parent.mkdir, parents=True, exist_ok=True)
-        await asyncio.to_thread(patch_path.write_text, patch)
+        try:
+            await asyncio.to_thread(patch_path.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(patch_path.write_text, patch)
+        except OSError as exc:
+            # Патч не лёг на диск: применять нечего, но работа цела на ветке,
+            # и дерево остаётся вместе с ней.
+            result.meta["integrated"] = False
+            result.meta["integration_error"] = f"patch not written: {exc}"
+            return
         result.meta["patch"] = str(patch_path)
         if execution.integrate == "branch":
             # Ветка с коммитом и есть результат: рабочую копию не трогаем,
