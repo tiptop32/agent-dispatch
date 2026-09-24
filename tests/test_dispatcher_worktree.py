@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -376,3 +378,52 @@ async def test_failure_after_integration_does_not_report_a_removed_worktree(
     assert done.status == "failed"
     # Дерево убрано удачной интеграцией: указателя в пустоту в результате нет.
     assert "worktree" not in done.result.meta
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_creation_still_reports_the_worktree(tmp_path, git_repo, monkeypatch):
+    _, _, adapters, dispatcher = await _make(tmp_path)
+    entered = threading.Event()
+    real_create = worktree.create
+
+    def slow_create(cwd, directory, branch):
+        # Каталог уже создан, поток ещё занят: отмена в этот момент бросает
+        # ожидание, но дерево на диске остаётся.
+        tree = real_create(cwd, directory, branch)
+        entered.set()
+        time.sleep(0.3)
+        return tree
+
+    monkeypatch.setattr(worktree, "create", slow_create)
+
+    record = await dispatcher.submit(_req(git_repo))
+    await asyncio.to_thread(entered.wait, WAIT)
+    done = await dispatcher.cancel(record.task_id)
+
+    assert done.status == "cancelled"
+    assert Path(done.result.meta["worktree"]).is_dir()  # noqa: ASYNC240
+    assert done.result.meta["branch"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_integration_keeps_the_integrated_verdict(
+    tmp_path, git_repo, monkeypatch
+):
+    _, _, adapters, dispatcher = await _make(tmp_path, keep_worktrees=True)
+    adapters["codex"].on_execute = _writes("x = 2\n")
+
+    def cancel_now(result):
+        raise asyncio.CancelledError
+
+    # Отмена приходит в `_finalize`, когда патч уже применён к рабочей копии.
+    monkeypatch.setattr("agent_dispatch.dispatch.dispatcher.should_escalate", cancel_now)
+
+    record = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    # Результат уже записан и финален, отмена его не отбирает.
+    assert done.status == "completed"
+    assert (git_repo / "a.py").read_text() == "x = 2\n"
+    # Интеграция состоялась: отмена не переписывает вердикт на false.
+    assert done.result.meta["integrated"] is True
+    assert Path(done.result.meta["worktree"]).is_dir()  # noqa: ASYNC240

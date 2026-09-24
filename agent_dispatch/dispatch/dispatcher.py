@@ -357,12 +357,16 @@ class Dispatcher:
         )
         async with semaphore, lock:
             tree = None
-            if mode == "worktree":
-                tree = await asyncio.to_thread(self._create_worktree, req, task_id)
-                await self.storage.add_event(
-                    task_id, "worktree", {"path": str(tree.path), "branch": tree.branch}
-                )
+            # Путь и ветка известны до создания: отмена посреди `worktree.create`
+            # бросает ожидание, но поток доводит каталог до конца, и корутина
+            # никогда не узнает о дереве, которое уже есть на диске.
+            target = self._worktree_target(task_id) if mode == "worktree" else None
             try:
+                if target is not None:
+                    tree = await asyncio.to_thread(self._create_worktree, req, task_id)
+                    await self.storage.add_event(
+                        task_id, "worktree", {"path": str(tree.path), "branch": tree.branch}
+                    )
                 ctx = await self._build_context(record, decision, tree)
                 record.status, record.started_at = TaskStatus.running, self._now()
                 await self.storage.update_task(record)
@@ -390,8 +394,8 @@ class Dispatcher:
                 # намеренно: в нём лежит незакоммиченная работа исполнителя.
                 # Но без записи в результате его не видно ни в `status`, ни
                 # вызывающему, поэтому путь и ветка уходят в meta.
-                if tree is not None:
-                    await self._note_kept_worktree(record, tree, exc)
+                if target is not None:
+                    await self._note_kept_worktree(record, *target, exc)
                 raise
 
     async def _build_context(
@@ -473,7 +477,7 @@ class Dispatcher:
         result.meta["escalated_to"] = child.task_id
 
     async def _note_kept_worktree(
-        self, record: TaskRecord, tree: worktree.Worktree, exc: BaseException
+        self, record: TaskRecord, path: Path, branch: str, exc: BaseException
     ) -> None:
         """Записать в результат worktree, который остался после срыва задачи.
 
@@ -483,12 +487,15 @@ class Dispatcher:
         """
         # Проверка синхронная нарочно: задачу уже отменяют, и лишняя точка
         # ожидания здесь может снять запись результата вместе с путём.
-        if not tree.path.exists():  # noqa: ASYNC240
+        if not path.exists():  # noqa: ASYNC240
             return
         cancelled = isinstance(exc, asyncio.CancelledError)
         meta = dict(record.result.meta) if record.result else {}
-        meta["worktree"], meta["branch"] = str(tree.path), tree.branch
-        meta["integrated"] = False
+        meta["worktree"], meta["branch"] = str(path), branch
+        # Отмена может прийти и после удачной интеграции, когда дерево оставлено
+        # по `keep_worktrees`. Готовый вердикт об интеграции не перебивается:
+        # рабочая копия уже изменена, и `integrated: false` был бы ложью.
+        meta.setdefault("integrated", False)
         record.result = ExecutionResult(
             status="failed",
             executor=record.decision.executor if record.decision else "",
@@ -541,10 +548,17 @@ class Dispatcher:
             else:
                 self._cwd_locks[key] = (lock, waiters - 1)
 
-    def _create_worktree(self, req: DispatchRequest, task_id: str) -> worktree.Worktree:
+    def _worktree_target(self, task_id: str) -> tuple[Path, str]:
+        """Каталог и ветка будущего дерева: они известны ещё до его создания."""
         base = self.settings.execution.worktree_dir or (self.settings.server.data_dir / "worktrees")
-        branch = f"{self.settings.execution.branch_prefix}/{task_id[:8]}"
-        return worktree.create(req.cwd, Path(base).expanduser() / task_id, branch)
+        return (
+            Path(base).expanduser() / task_id,
+            f"{self.settings.execution.branch_prefix}/{task_id[:8]}",
+        )
+
+    def _create_worktree(self, req: DispatchRequest, task_id: str) -> worktree.Worktree:
+        path, branch = self._worktree_target(task_id)
+        return worktree.create(req.cwd, path, branch)
 
     async def _finish_worktree(
         self,
