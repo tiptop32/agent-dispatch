@@ -31,6 +31,9 @@ routing:
   exclude_source_agent: true
   default_timeout_seconds: 1800
   availability_ttl_seconds: 60
+  # лимит расходов, перегруженная модель, отказ авторизации, обрыв сети:
+  # исполнитель выходит из ротации на столько секунд; 0 выключает
+  failure_cooldown_seconds: 900
 
 execution:
   workspace_mode: in_place    # worktree: каждому исполнителю свой git worktree

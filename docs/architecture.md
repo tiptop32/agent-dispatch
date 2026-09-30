@@ -29,7 +29,7 @@ queued → routing → running → completed | partial | failed | needs_context 
 Порядок в `Dispatcher._run`:
 
 1. Pre-guards (`routing/guards.py`, чистые функции): `bad_cwd` (нет каталога или не git-репа), `max_hops`, `unknown_parent`, `max_children` (только для детей, ретраи эскалации не считаются), явный `executor` (disabled или unavailable → отказ, иначе `router=override`).
-2. Кандидаты: enabled минус unavailable (кэш `check --version` с TTL) минус исполнители с `adapter == source_agent` при `exclude_source_agent` и `hop == 0`.
+2. Кандидаты: enabled минус unavailable (кэш `check --version` с TTL плюс остывающие после сбоя исполнителя, см. п. 9) минус исполнители с `adapter == source_agent` при `exclude_source_agent` и `hop == 0`.
 3. Один кандидат → решение без роутера. Иначе `decide_with_fallback`: `JevRouter` → при `RouterError` `ClaudeLocalRouter` → при обоих отказах `fallback_executor` (или первый кандидат, если fallback не в кандидатах).
 4. Post-guards: `confidence < min_confidence`, `top1 − top2 < min_margin`.
 5. `TaskPackage` → `render_prompt(package, adapter_kind)` (jinja2, снапшоты в тестах). Промпт для codex просит structured output, для claude и opencode блок ```` ```agent-dispatch-result ````.
@@ -37,6 +37,10 @@ queued → routing → running → completed | partial | failed | needs_context 
 7. Адаптер получает `RunContext` с env из `child_env(settings, extra)`: `os.environ` без секретов из `Settings.secret_names()`, без маркеров сессии Claude Code (`CLAUDECODE`, `CLAUDE_CODE_*`, иначе `claude -p` отказывается работать вложенно), плюс `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP = hop + 1`.
 8. Результат нормализуется в `ExecutionResult`; `changed_files` из `git status --porcelain -z` до и после; исключение адаптера → `failed`; отмена → `cancelled`.
 9. Эскалация: при `failed`, `needs_escalation` или `tests.result == failed` и `allow_escalation` берётся следующий из `escalation[executor]`, не пройденный раньше по цепочке `escalated_from`; создаётся дочерняя задача с явным executor и `escalated_from`. `wait()` следует за `meta.escalated_to`, поэтому вызывающий получает результат последнего звена. Исчерпанная цепочка → `failed`.
+
+   Сбой исполнителя, а не задачи (`executors/health.py:classify_failure`: лимит расходов, `at capacity`, отказ авторизации, таймаут или молчание после событий переподключения codex без изменённых файлов), выводит исполнителя из ротации на `routing.failure_cooldown_seconds` (по умолчанию 900, `0` выключает): событие `cooldown`, `meta.executor_failure`, причина эскалации `executor_<kind>`. Остывающий исполнитель выпадает из кандидатов, из цепочек эскалации и отвечает отказом с временем окончания на явный `executor`. Остывание живёт в памяти демона и снимается только по часам: `check --version` у CLI с исчерпанным лимитом проходит. Если цепочка за упавшим исполнителем пуста, задача уходит роутеру заново (`escalate.to = "router"`), без всех, кто уже брал её по цепочке; цикл конечен, потому что каждый такой шаг выводит из ротации ещё одного исполнителя.
+
+   Работа звена, которое эскалируется, в рабочую копию не переносится (`meta.integration_held = "escalated"`): она остаётся коммитом на ветке задачи и файлом патча. Следующее звено стартует с HEAD, и его патч ложится на чистую копию. Раньше недоделка применялась первой, и готовый патч следующего звена конфликтовал с ней. Без эскалации упавшая работа интегрируется как прежде, о ней судит вызывающий.
 
 Любое исключение вне адаптера тоже переводит задачу в `failed` и ставит событие: задача не может остаться `running` навсегда. После рестарта демона `recover_stale()` переводит осиротевшие `queued/routing/running` в `failed` с `error="daemon restarted"`.
 
@@ -107,5 +111,7 @@ Endpoint `POST https://openrouter.ai/api/alpha/decisions`, модель `typesaf
 ## Телеметрия
 
 Три таблицы в SQLite (`tasks`, `routing_decisions`, `events`), WAL. Решения `route` без запуска пишутся с `task_id = NULL`. `GET /export?since=7d` отдаёт JSONL: одна строка на задачу с вложенными `decision` и `events`, затем строки безадресных решений. `feedback` это событие с `outcome` из `success | failure | manual_override | escalated | user_accepted | user_reworked`.
+
+`uv run python -m evals.replay` прогоняет правила диспатчера по этой базе без сети и CLI: сколько запусков ушло к уже лежавшему исполнителю, сколько недоделок легло в рабочую копию перед эскалацией, сколько `partial` дал только формат отчёта.
 
 Метрики, ради которых всё это собирается: routing accuracy на размеченных задачах (порог 0.8), доля `low_confidence`/`fallback`/`override`, success rate и медианная длительность по исполнителям, стоимость решения и исполнения.

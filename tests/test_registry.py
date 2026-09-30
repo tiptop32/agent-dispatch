@@ -97,3 +97,40 @@ async def test_availability_cache_ttl_force_and_unavailable():
     now[0] = 11
     await cache.check_all()
     assert a.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_tripped_executor_is_unavailable_until_the_cooldown_ends():
+    now = [0.0]
+    cache = AvailabilityCache({"a": Stub(True)}, 10, clock=lambda: now[0])
+    await cache.check_all()
+
+    cooldown = cache.trip("a", "quota", "You've hit your monthly spend limit", 900)
+
+    assert cooldown is not None and cooldown.kind == "quota"
+    assert cache.unavailable() == {"a"}
+    value = cache.get("a")
+    assert value.available is False and "quota" in value.error and value.version is None
+    now[0] = 899
+    assert cache.unavailable() == {"a"}
+    now[0] = 900
+    assert cache.unavailable() == set() and cache.get("a").available is True
+    assert cache.cooldowns() == {}
+
+
+@pytest.mark.asyncio
+async def test_recheck_of_the_cli_does_not_lift_the_cooldown():
+    # `--version` отвечает и при исчерпанном лимите: снимают остывание только часы.
+    now = [0.0]
+    stub = Stub(True)
+    cache = AvailabilityCache({"a": stub}, 1, clock=lambda: now[0])
+    cache.trip("a", "capacity", "at capacity", 600)
+    now[0] = 5
+    await cache.check_all(force=True)
+    assert stub.calls == 1 and cache.unavailable() == {"a"}
+
+
+def test_zero_cooldown_disables_tripping():
+    cache = AvailabilityCache({}, 1)
+    assert cache.trip("a", "quota", "spend limit", 0) is None
+    assert cache.unavailable() == set()

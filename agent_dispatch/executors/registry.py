@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from agent_dispatch.config import Settings
 from agent_dispatch.executors.base import ExecutorAdapter
@@ -22,7 +24,24 @@ def build_adapters(settings: Settings) -> dict[str, ExecutorAdapter]:
     }
 
 
+@dataclass(frozen=True)
+class Cooldown:
+    """Исполнитель выведен из ротации после сбоя, который повторится на любой задаче."""
+
+    kind: str
+    detail: str
+    until: float
+    until_utc: datetime
+
+
 class AvailabilityCache:
+    """Доступность исполнителей: проверка CLI с TTL плюс остывание после сбоев.
+
+    Остывание живёт отдельно от результатов `check`: CLI установлен и отвечает
+    на `--version`, но лимит расходов исчерпан, и повторная проверка этого не
+    увидит. Поэтому `check_all` остывание не снимает, его снимают только часы.
+    """
+
     def __init__(
         self,
         adapters: dict[str, ExecutorAdapter],
@@ -34,6 +53,7 @@ class AvailabilityCache:
         self.clock = clock
         self._values: dict[str, Availability] = {}
         self._checked_at: float | None = None
+        self._cooldowns: dict[str, Cooldown] = {}
 
     async def check_all(self, force: bool = False) -> dict[str, Availability]:
         now = self.clock()
@@ -45,7 +65,46 @@ class AvailabilityCache:
         return dict(self._values)
 
     def get(self, name: str) -> Availability | None:
-        return self._values.get(name)
+        cooldown = self.cooldown(name)
+        value = self._values.get(name)
+        if cooldown is None:
+            return value
+        error = f"cooldown until {cooldown.until_utc.isoformat()}: {cooldown.kind}"
+        return Availability(
+            available=False,
+            version=value.version if value else None,
+            error=error,
+            checked_at=value.checked_at if value else cooldown.until_utc,
+        )
 
     def unavailable(self) -> set[str]:
-        return {name for name, value in self._values.items() if not value.available}
+        down = {name for name, value in self._values.items() if not value.available}
+        return down | set(self.cooldowns())
+
+    def trip(self, name: str, kind: str, detail: str, seconds: float) -> Cooldown | None:
+        """Вывести исполнителя из ротации на `seconds`; 0 выключает механизм."""
+        if seconds <= 0:
+            return None
+        cooldown = Cooldown(
+            kind=kind,
+            detail=detail[:300],
+            until=self.clock() + seconds,
+            until_utc=datetime.now(UTC) + timedelta(seconds=seconds),
+        )
+        self._cooldowns[name] = cooldown
+        return cooldown
+
+    def cooldown(self, name: str) -> Cooldown | None:
+        cooldown = self._cooldowns.get(name)
+        if cooldown is not None and self.clock() >= cooldown.until:
+            del self._cooldowns[name]
+            return None
+        return cooldown
+
+    def cooldowns(self) -> dict[str, Cooldown]:
+        """Действующие остывания; истёкшие снимаются по дороге."""
+        return {
+            name: cooldown
+            for name in list(self._cooldowns)
+            if (cooldown := self.cooldown(name)) is not None
+        }

@@ -193,7 +193,7 @@ async def _make_dispatcher(
 
 def _request(repo: Path, **updates) -> DispatchRequest:
     return DispatchRequest(
-        task="fix tests", cwd=str(repo), executor="opencode/kimi", hop=0, **updates
+        task="fix tests", cwd=str(repo), hop=0, **{"executor": "opencode/kimi", **updates}
     )
 
 
@@ -435,3 +435,129 @@ async def test_wait_zero_returns_parent_not_escalation_child(tmp_path, git_repo)
     zero = await dispatcher.wait(parent.task_id, 0)
     assert zero.task_id == parent.task_id
     await storage.close()
+
+
+SPEND_LIMIT = "You've hit your monthly spend limit · your session limit resets 3pm"
+
+
+def _quota(executor: str) -> ExecutionResult:
+    return ExecutionResult(
+        status="failed", executor=executor, model=None, summary="", error=SPEND_LIMIT
+    )
+
+
+def test_next_executor_skips_unavailable_link(tmp_path):
+    settings = _settings(tmp_path)
+    assert next_executor("opencode/kimi", settings, ["opencode/kimi"], {"codex"}) == "claude"
+
+
+@pytest.mark.asyncio
+async def test_executor_failure_takes_it_out_of_rotation(tmp_path, git_repo):
+    storage, adapters, _, dispatcher = await _make_dispatcher(
+        tmp_path, results={"opencode/kimi": _quota("opencode/kimi")}
+    )
+    first = await dispatcher.submit(_request(git_repo))
+    records = await _wait_for_records(dispatcher, storage, 2)
+    parent = next(record for record in records if record.task_id == first.task_id)
+
+    assert parent.result.meta["executor_failure"] == "quota"
+    events = await storage.list_events(first.task_id)
+    cooldown = next(event["payload"] for event in events if event["kind"] == "cooldown")
+    assert cooldown["executor"] == "opencode/kimi" and cooldown["kind"] == "quota"
+    escalate = next(event["payload"] for event in events if event["kind"] == "escalate")
+    assert escalate == {"from": "opencode/kimi", "to": "codex", "reason": "executor_quota"}
+
+    # Следующая задача к остывающему исполнителю не уходит и не жжёт попытку.
+    again = await dispatcher.submit(_request(git_repo))
+    done = await dispatcher.wait(again.task_id, WAIT)
+    assert done.status == "failed" and done.result.meta["guard"] == "unavailable"
+    assert "cooldown until" in done.result.error and "spend limit" in done.result.error
+    assert len(adapters["opencode/kimi"].calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_escalation_chain_skips_a_cooling_link(tmp_path, git_repo):
+    storage, adapters, _, dispatcher = await _make_dispatcher(
+        tmp_path,
+        results={
+            "codex": _quota("codex"),
+            "opencode/kimi": _result("opencode/kimi", "failed"),
+        },
+    )
+    # codex падает на лимите и остывает.
+    await dispatcher.wait(
+        (await dispatcher.submit(_request(git_repo, executor="codex"))).task_id, WAIT
+    )
+    await _wait_for_records(dispatcher, storage, 2)
+    calls_before = len(adapters["codex"].calls)
+
+    # Цепочка kimi -> codex -> claude обходит остывающий codex.
+    first = await dispatcher.submit(_request(git_repo))
+    await dispatcher.wait(first.task_id, WAIT)
+    await _wait_for_records(dispatcher, storage, 4)
+    events = await storage.list_events(first.task_id)
+    escalate = next(event["payload"] for event in events if event["kind"] == "escalate")
+    assert escalate["to"] == "claude"
+    assert len(adapters["codex"].calls) == calls_before
+
+
+@pytest.mark.asyncio
+async def test_executor_failure_without_chain_goes_back_to_the_router(tmp_path, git_repo):
+    # 09-29: claude/opus на лимите расходов, цепочки за ним нет, задача падала.
+    storage, adapters, _, dispatcher = await _make_dispatcher(
+        tmp_path, results={"claude": _quota("claude")}
+    )
+    first = await dispatcher.submit(_request(git_repo, executor="claude"))
+    records = await _wait_for_records(dispatcher, storage, 2)
+    child = next(record for record in records if record.escalated_from == first.task_id)
+
+    events = await storage.list_events(first.task_id)
+    escalate = next(event["payload"] for event in events if event["kind"] == "escalate")
+    assert escalate == {"from": "claude", "to": "router", "reason": "executor_quota"}
+    assert child.request.executor is None
+    assert child.status == "completed" and child.decision.executor != "claude"
+    assert len(adapters["claude"].calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_rerouting_stops_when_every_executor_is_down(tmp_path, git_repo):
+    storage, _, _, dispatcher = await _make_dispatcher(
+        tmp_path,
+        results={name: _quota(name) for name in _settings(tmp_path).executors},
+        escalation={},
+    )
+    first = await dispatcher.submit(_request(git_repo, executor="claude"))
+    records = await _wait_for_records(dispatcher, storage, 4)
+    await asyncio.sleep(0.1)
+    records = await storage.list_tasks(limit=20)
+
+    # claude, затем два других через роутер, затем отказ без кандидатов.
+    assert len(records) == 4
+    assert all(record.status == "failed" for record in records)
+    last = await dispatcher.wait(first.task_id, WAIT)
+    assert last.result.error == "no available executors"
+
+
+@pytest.mark.asyncio
+async def test_rerouting_terminates_with_more_than_ten_executors(tmp_path, git_repo):
+    # Цепочка предков раньше обрезалась на 10: ранние исполнители возвращались
+    # в выбор, и при выключенном остывании переадресация шла бы без конца.
+    names = [f"codex/{index}" for index in range(12)]
+    settings = Settings(
+        server=ServerSettings(data_dir=tmp_path),
+        routing=RoutingSettings(fallback_executor=names[0], failure_cooldown_seconds=0),
+        executors={name: ExecutorSettings(adapter="codex", description=name) for name in names},
+    )
+    storage = Storage(tmp_path / "db.sqlite")
+    await storage.open()
+    adapters = {name: FakeAdapter(name, result=_quota(name)) for name in names}
+    dispatcher = Dispatcher(
+        settings, storage, adapters, AvailabilityCache(adapters, 60), [FakeRouter()]
+    )
+
+    first = await dispatcher.submit(_request(git_repo, executor=names[0]))
+    last = await dispatcher.wait(first.task_id, 10.0)
+
+    assert last.result.error == "no available executors"
+    assert all(len(adapter.calls) == 1 for adapter in adapters.values())
+    assert len(await storage.list_tasks(limit=50)) == len(names) + 1

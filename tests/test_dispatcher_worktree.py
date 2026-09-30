@@ -20,7 +20,7 @@ from agent_dispatch.config import (
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.executors import worktree
 from agent_dispatch.executors.registry import AvailabilityCache
-from agent_dispatch.models import DispatchRequest, TaskStatus
+from agent_dispatch.models import DispatchRequest, ExecutionResult, TaskStatus
 from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
 
@@ -58,6 +58,19 @@ def _writes(text: str, name: str = "a.py"):
         (Path(ctx.cwd) / name).write_text(text)
 
     return on_execute
+
+
+def _fail_on_exit_event(monkeypatch, storage, exc: BaseException) -> None:
+    """Сбой в `_finalize`: интеграция уже прошла, результат уже присвоен задаче."""
+    real_add_event = storage.add_event
+    pending = [exc]
+
+    async def add_event(task_id, kind, payload):
+        if kind == "exit" and pending:
+            raise pending.pop()
+        await real_add_event(task_id, kind, payload)
+
+    monkeypatch.setattr(storage, "add_event", add_event)
 
 
 @pytest.mark.asyncio
@@ -364,13 +377,9 @@ async def test_recover_stale_restores_the_worktree_from_the_event(tmp_path, git_
 async def test_failure_after_integration_does_not_report_a_removed_worktree(
     tmp_path, git_repo, monkeypatch
 ):
-    _, _, adapters, dispatcher = await _make(tmp_path)
+    _, storage, adapters, dispatcher = await _make(tmp_path)
     adapters["codex"].on_execute = _writes("x = 2\n")
-
-    def boom(*args, **kwargs):
-        raise RuntimeError("finalize failed")
-
-    monkeypatch.setattr("agent_dispatch.dispatch.dispatcher.should_escalate", boom)
+    _fail_on_exit_event(monkeypatch, storage, RuntimeError("finalize failed"))
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
@@ -409,14 +418,10 @@ async def test_cancel_during_creation_still_reports_the_worktree(tmp_path, git_r
 async def test_cancel_after_integration_keeps_the_integrated_verdict(
     tmp_path, git_repo, monkeypatch
 ):
-    _, _, adapters, dispatcher = await _make(tmp_path, keep_worktrees=True)
+    _, storage, adapters, dispatcher = await _make(tmp_path, keep_worktrees=True)
     adapters["codex"].on_execute = _writes("x = 2\n")
-
-    def cancel_now(result):
-        raise asyncio.CancelledError
-
     # Отмена приходит в `_finalize`, когда патч уже применён к рабочей копии.
-    monkeypatch.setattr("agent_dispatch.dispatch.dispatcher.should_escalate", cancel_now)
+    _fail_on_exit_event(monkeypatch, storage, asyncio.CancelledError())
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
@@ -427,3 +432,91 @@ async def test_cancel_after_integration_keeps_the_integrated_verdict(
     # Интеграция состоялась: отмена не переписывает вердикт на false.
     assert done.result.meta["integrated"] is True
     assert Path(done.result.meta["worktree"]).is_dir()  # noqa: ASYNC240
+
+
+@pytest.mark.asyncio
+async def test_escalated_work_is_held_on_its_branch_and_the_next_executor_integrates(
+    tmp_path, git_repo
+):
+    # 09-23: недоделка codex/sol ложилась в рабочую копию, а готовый патч
+    # claude/opus после эскалации не применялся (`does not match index`).
+    settings = Settings(
+        server=ServerSettings(data_dir=tmp_path, max_concurrent_tasks=2),
+        routing=RoutingSettings(fallback_executor="codex"),
+        execution=ExecutionSettings(workspace_mode="worktree"),
+        executors={
+            "codex": ExecutorSettings(adapter="codex", description="codex"),
+            "claude": ExecutorSettings(adapter="claude", description="claude"),
+        },
+        escalation={"codex": ["claude"]},
+    )
+    storage = Storage(tmp_path / "db.sqlite")
+    await storage.open()
+    adapters = {
+        "codex": FakeAdapter(
+            "codex",
+            result=ExecutionResult(
+                status="failed", executor="codex", model=None, summary="", error="timeout"
+            ),
+            on_execute=_writes("x = 'half'\n"),
+        ),
+        "claude": FakeAdapter("claude", on_execute=_writes("x = 'done'\n")),
+    }
+    dispatcher = Dispatcher(
+        settings, storage, adapters, AvailabilityCache(adapters, 60), [FakeRouter()]
+    )
+
+    first = await dispatcher.submit(_req(git_repo))
+    child = await dispatcher.wait(first.task_id, WAIT)
+    parent = await storage.get_task(first.task_id)
+
+    assert child.task_id != parent.task_id and child.status == "completed"
+    assert child.result.meta["integrated"] is True
+    assert (git_repo / "a.py").read_text() == "x = 'done'\n"
+    # Недоделка не пропала: коммит на ветке задачи и файл патча.
+    assert parent.result.meta["integrated"] is False
+    assert parent.result.meta["integration_held"] == "escalated"
+    branch = parent.result.meta["branch"]
+    assert _git(git_repo, "show", f"{branch}:a.py") == "x = 'half'\n"
+    assert Path(parent.result.meta["patch"]).is_file()  # noqa: ASYNC240
+
+
+@pytest.mark.asyncio
+async def test_failed_work_without_escalation_is_still_integrated(tmp_path, git_repo):
+    _, _, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].result = ExecutionResult(
+        status="failed", executor="codex", model=None, summary="", error="timeout"
+    )
+    adapters["codex"].on_execute = _writes("x = 'half'\n")
+
+    record = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    # Эскалации нет: судит вызывающий по дифу, как и раньше.
+    assert done.result.meta["integrated"] is True
+    assert "integration_held" not in done.result.meta
+    assert (git_repo / "a.py").read_text() == "x = 'half'\n"
+
+
+@pytest.mark.asyncio
+async def test_recover_stale_does_not_point_to_a_removed_worktree(tmp_path, git_repo):
+    # Дерево убрано (удержание перед эскалацией, `integrate: branch`), а демон
+    # умер до записи результата: ветка остаётся, пути в пустоту нет.
+    settings, storage, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].on_execute = _holds(asyncio.Event())
+
+    record = await dispatcher.submit(_req(git_repo))
+    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    tree_path = adapters["codex"].calls[0].cwd
+    await dispatcher.shutdown()
+    _git(git_repo, "worktree", "remove", "--force", tree_path)
+    stale = await storage.get_task(record.task_id)
+    stale.status, stale.result, stale.finished_at = TaskStatus.running, None, None
+    await storage.update_task(stale)
+
+    fresh = Dispatcher(settings, storage, adapters, AvailabilityCache(adapters, 60), [FakeRouter()])
+    assert await fresh.recover_stale() == 1
+
+    done = await storage.get_task(record.task_id)
+    assert "worktree" not in done.result.meta
+    assert done.result.meta["branch"] and done.result.meta["integrated"] is False

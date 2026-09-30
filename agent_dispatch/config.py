@@ -72,6 +72,10 @@ class RoutingSettings(_ConfigModel):
     exclude_source_agent: bool = True
     default_timeout_seconds: int = Field(1800, ge=0)
     availability_ttl_seconds: int = Field(60, ge=0)
+    #: На сколько секунд исполнитель выходит из ротации после сбоя, который
+    #: повторится на любой задаче: лимит расходов, перегруженная модель, отказ
+    #: авторизации, обрыв сети. 0 выключает остывание.
+    failure_cooldown_seconds: int = Field(900, ge=0)
 
     @model_validator(mode="after")
     def validate_thresholds(self) -> RoutingSettings:

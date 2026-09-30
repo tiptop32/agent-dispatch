@@ -15,6 +15,7 @@ from agent_dispatch.dispatch.task_package import build_task_package, render_prom
 from agent_dispatch.executors import worktree
 from agent_dispatch.executors.base import ExecutorAdapter, RunContext
 from agent_dispatch.executors.env import child_env
+from agent_dispatch.executors.health import classify_failure
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     FINAL_STATUSES,
@@ -45,6 +46,26 @@ class Routing:
     guard: GuardEvent | None = None
     events: list[GuardEvent] = field(default_factory=list)
     candidates: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EscalationPlan:
+    """Что делать с результатом, который не закрывает задачу.
+
+    `executor` это следующее звено цепочки. Пустой `executor` при `reroute`
+    отдаёт задачу роутеру заново: исполнитель упал на сбое, который к задаче
+    не относится (лимит, сеть), и цепочка за ним кончилась. Пустой `executor`
+    без `reroute` значит, что эскалация исчерпана.
+    """
+
+    reason: str
+    tried: list[str]
+    executor: str | None = None
+    reroute: bool = False
+
+    @property
+    def hands_off(self) -> bool:
+        return self.executor is not None or self.reroute
 
 
 class Dispatcher:
@@ -192,11 +213,12 @@ class Dispatcher:
         )
         if not payload or not payload.get("path"):
             return {}
-        return {
-            "worktree": payload["path"],
-            "branch": payload.get("branch", ""),
-            "integrated": False,
-        }
+        meta: dict[str, object] = {"branch": payload.get("branch", ""), "integrated": False}
+        # Дерево могли убрать до записи результата (`integrate: branch` или
+        # удержание перед эскалацией): работа на ветке, а путь вёл бы в пустоту.
+        if Path(payload["path"]).exists():  # noqa: ASYNC240
+            meta["worktree"] = payload["path"]
+        return meta
 
     async def route_only(self, req: DispatchRequest) -> tuple[RouteDecision, list[GuardEvent]]:
         routing = await self._route(req)
@@ -204,8 +226,15 @@ class Dispatcher:
         # Сработавший guard объясняет решение целиком: события роутеров к нему не относятся.
         return routing.decision, [routing.guard] if routing.guard else routing.events
 
-    async def _route(self, req: DispatchRequest, *, is_escalation: bool = False) -> Routing:
+    async def _route(
+        self,
+        req: DispatchRequest,
+        *,
+        is_escalation: bool = False,
+        exclude: set[str] | frozenset[str] = frozenset(),
+    ) -> Routing:
         await self.availability.check_all()
+        unavailable = self.availability.unavailable() | set(exclude)
         parent_exists = (
             await self.storage.task_exists(req.parent_task_id) if req.parent_task_id else False
         )
@@ -213,13 +242,17 @@ class Dispatcher:
         if req.parent_task_id and not is_escalation:
             # Ретраи эскалации не съедают квоту fan-out родителя, cancelled тоже.
             siblings = await self.storage.count_children(req.parent_task_id, exclude_escalated=True)
-        verdict = pre_guards(
-            req, self.settings, self.availability.unavailable(), parent_exists, siblings
-        )
-        names = candidates(
-            self.settings, self.availability.unavailable(), req.source_agent, req.hop
-        )
+        verdict = pre_guards(req, self.settings, unavailable, parent_exists, siblings)
+        names = candidates(self.settings, unavailable, req.source_agent, req.hop)
         if isinstance(verdict, GuardEvent):
+            cooldown = self.availability.cooldown(verdict.executor) if verdict.executor else None
+            if verdict.reason == GuardReason.unavailable and cooldown is not None:
+                # Явно выбранный исполнитель остывает: вызывающему нужно знать
+                # почему и до какого времени, а не только «недоступен».
+                verdict.detail += (
+                    f" (cooldown until {cooldown.until_utc.isoformat(timespec='seconds')}"
+                    f" after {cooldown.kind}: {cooldown.detail[:160]})"
+                )
             return Routing(self._fallback_decision(verdict.reason), verdict, [], names)
         if isinstance(verdict, RouteDecision):
             guard = GuardEvent(
@@ -316,7 +349,14 @@ class Dispatcher:
         """Маршрутизация и guard'ы. None значит, что задача уже закрыта отказом."""
         record.status = TaskStatus.routing
         await self.storage.update_task(record)
-        routing = await self._route(record.request, is_escalation=record.escalated_from is not None)
+        exclude: set[str] = set()
+        if record.escalated_from is not None and record.request.executor is None:
+            # Повторная маршрутизация после сбоя исполнителя: те, кто уже брал
+            # задачу, в выбор не входят, иначе роутер вернул бы её им же.
+            exclude = set(await self._escalation_chain(record))
+        routing = await self._route(
+            record.request, is_escalation=record.escalated_from is not None, exclude=exclude
+        )
         if routing.guard and routing.guard.reason != GuardReason.user_override:
             await self._guard_failure(record, routing.guard)
             return None
@@ -385,9 +425,16 @@ class Dispatcher:
                         summary="",
                         error=f"{type(exc).__name__}: {exc}",
                     )
+                await self._note_executor_failure(record, decision, result)
+                plan = await self._plan_escalation(record, decision, result)
                 if tree is not None:
-                    await self._finish_worktree(req, tree, result, task_id)
-                await self._finalize(record, decision, result)
+                    # Работу, которую переделает следующий исполнитель, в рабочую
+                    # копию не переносим: он стартует с HEAD, и его патч лёг бы
+                    # поверх чужой недоделки с конфликтом. Она остаётся коммитом
+                    # на ветке задачи.
+                    hold = plan is not None and plan.hands_off
+                    await self._finish_worktree(req, tree, result, task_id, hold=hold)
+                await self._finalize(record, decision, result, plan)
             except BaseException as exc:
                 # Отмена задачи это BaseException, её не ловит `except Exception`
                 # выше, и обычный путь уборки не отрабатывает. Дерево остаётся
@@ -433,15 +480,62 @@ class Dispatcher:
             prompt=prompt,
         )
 
-    async def _finalize(
+    async def _note_executor_failure(
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
+    ) -> None:
+        """Вывести исполнителя из ротации, если он упал на сбое, не связанном с задачей."""
+        kind = classify_failure(result)
+        if kind is None:
+            return
+        result.meta["executor_failure"] = kind
+        cooldown = self.availability.trip(
+            decision.executor,
+            kind,
+            result.error or "",
+            self.settings.routing.failure_cooldown_seconds,
+        )
+        if cooldown is None:
+            return
+        await self.storage.add_event(
+            record.task_id,
+            "cooldown",
+            {
+                "executor": decision.executor,
+                "kind": kind,
+                "until": cooldown.until_utc.isoformat(),
+            },
+        )
+
+    async def _plan_escalation(
+        self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
+    ) -> EscalationPlan | None:
+        if not record.request.allow_escalation:
+            return None
+        reason = should_escalate(result)
+        if reason is None:
+            return None
+        failure = result.meta.get("executor_failure")
+        if failure:
+            reason = f"executor_{failure}"
+        tried = await self._escalation_chain(record)
+        unavailable = self.availability.unavailable()
+        nxt = next_executor(decision.executor, self.settings, tried, unavailable)
+        return EscalationPlan(
+            reason=reason, tried=tried, executor=nxt, reroute=nxt is None and bool(failure)
+        )
+
+    async def _finalize(
+        self,
+        record: TaskRecord,
+        decision: RouteDecision,
+        result: ExecutionResult,
+        plan: EscalationPlan | None = None,
     ) -> None:
         """Записать результат, при необходимости эскалировать, разбудить ожидающих."""
         record.result = result
         record.status, record.finished_at = TaskStatus(result.status), self._now()
-        reason = should_escalate(result) if record.request.allow_escalation else None
-        if reason is not None:
-            await self._escalate(record, decision, result, reason)
+        if plan is not None:
+            await self._escalate(record, decision, result, plan)
         await self.storage.add_event(
             record.task_id,
             "exit",
@@ -455,25 +549,25 @@ class Dispatcher:
         record: TaskRecord,
         decision: RouteDecision,
         result: ExecutionResult,
-        reason: str,
+        plan: EscalationPlan,
     ) -> None:
         """Отдать задачу следующему исполнителю цепочки, либо закрыть её отказом."""
-        tried = await self._escalation_chain(record)
-        nxt = next_executor(decision.executor, self.settings, tried)
-        if nxt is None:
-            result.meta["escalation_chain"] = tried
+        if not plan.hands_off:
+            result.meta["escalation_chain"] = plan.tried
             if result.status != "failed":
                 result.status = "failed"
-                result.error = f"escalation exhausted: {reason}"
+                result.error = f"escalation exhausted: {plan.reason}"
                 record.status = TaskStatus.failed
             return
         await self.storage.add_event(
             record.task_id,
             "escalate",
-            {"from": decision.executor, "to": nxt, "reason": reason},
+            {"from": decision.executor, "to": plan.executor or "router", "reason": plan.reason},
         )
+        # `executor: None` отдаёт задачу роутеру; уже пробовавшие исключает `_prepare`.
         child = await self.submit(
-            record.request.model_copy(update={"executor": nxt}), escalated_from=record.task_id
+            record.request.model_copy(update={"executor": plan.executor}),
+            escalated_from=record.task_id,
         )
         result.meta["escalated_to"] = child.task_id
 
@@ -567,8 +661,13 @@ class Dispatcher:
         tree: worktree.Worktree,
         result: ExecutionResult,
         task_id: str,
+        *,
+        hold: bool = False,
     ) -> None:
         """Закоммитить результат на ветке worktree и перенести его в рабочую копию.
+
+        `hold` оставляет результат на ветке, как `integrate: branch`: задачу
+        переделывает следующий исполнитель, и его патч должен лечь на чистую копию.
 
         Промежуточный коммит делает работу исполнителя долговечной: она переживает
         и неудачную интеграцию, и уборку каталога. Патч применяется под тем же lock,
@@ -611,7 +710,9 @@ class Dispatcher:
             result.meta["integration_error"] = f"patch not written: {exc}"
             return
         result.meta["patch"] = str(patch_path)
-        if execution.integrate == "branch":
+        if hold and execution.integrate == "apply":
+            result.meta["integration_held"] = "escalated"
+        if execution.integrate == "branch" or (hold and execution.integrate == "apply"):
             # Ветка с коммитом и есть результат: рабочую копию не трогаем,
             # каталог можно убрать, работа останется на ветке.
             result.meta["integrated"] = False
@@ -654,7 +755,10 @@ class Dispatcher:
         chain: list[str] = []
         current: TaskRecord | None = record
         seen = {record.task_id}
-        for _ in range(10):
+        # Без предела глубины: от циклов защищает `seen`, а усечённая цепочка
+        # вернула бы ранних исполнителей в выбор при повторной маршрутизации,
+        # и она перестала бы быть конечной.
+        while current is not None:
             if current.decision is not None:
                 chain.append(current.decision.executor)
             previous_id = current.escalated_from

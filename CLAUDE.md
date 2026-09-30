@@ -9,6 +9,7 @@
 - `uv run pre-commit install` (ruff, detect-secrets, pytest gate)
 - `uv run agent-dispatch doctor [--online]`, `uv run agent-dispatch serve`
 - Evals (платные): `uv run python -m evals.routing`, `uv run python -m evals.smoke --executors codex`
+- Replay по живой телеметрии (бесплатно): `uv run python -m evals.replay [--json]`
 
 ## Правила проекта
 
@@ -27,6 +28,8 @@
 - `partial` с `parse_error` и пустым `changed_files` эскалируется (`no_result`): исполнитель не отчитался и ничего не тронул. При непустом `changed_files` эскалации нет — работа есть, судит о ней вызывающий по дифу, повторный запуск лёг бы поверх.
 - Зависший исполнитель убивает сторож молчания (`execution.idle_timeout_seconds`, по умолчанию 900): результат `failed` с `stalled: ...` и эскалацией. Жёсткий таймаут остаётся верхней границей. Сторож работает только у адаптеров с `streams_output = True`; `claude -p --output-format json` печатает всё в конце, поэтому у него сторож выключен.
 - OpenCode в режиме `run` прерывает сессию при отклонённом запросе разрешения; адаптер сообщает `failed` с `opencode permission rejected: ...` вместо молчаливого `partial`.
+- Остывание исполнителя (`routing.failure_cooldown_seconds`) включается только по узнаваемым сообщениям CLI в `error` и по событиям переподключения codex в хвосте stdout без изменённых файлов (`executors/health.py`). Слова из вывода агента и ошибки MCP-серверов в stderr codex не считаются: задача про rate limiting не должна выключать исполнителя. Голый таймаут тоже не считается, агент мог работать.
+- Эскалируемая работа не интегрируется в рабочую копию (`integration_held`), следующее звено стартует с HEAD. Без эскалации упавшая работа интегрируется, как раньше.
 - В режиме `execution.workspace_mode: worktree` исполнитель работает в отдельном git worktree от HEAD, а результат возвращается патчем; lock на `cwd` берётся только на время интеграции.
 - Исполнитель не коммитит (запрещено в Task Package), коммитит демон: `worktree.commit` на ветке задачи, с `--no-verify`. Хуки репозитория на служебном коммите не гоняются осознанно — pre-commit с полным прогоном тестов падал бы на недоделанной задаче. Гейт — коммит вызывающего после ревью дифа.
 - `worktree.build_patch` считает диф от `Worktree.base`, а не от HEAD: после промежуточного коммита `diff --cached HEAD` вернул бы пустоту (есть тест на равенство патча до и после коммита).

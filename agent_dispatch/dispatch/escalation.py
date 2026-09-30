@@ -23,11 +23,21 @@ def should_escalate(result: ExecutionResult) -> str | None:
     return None
 
 
-def next_executor(current: str, settings: Settings, tried: list[str]) -> str | None:
+def next_executor(
+    current: str,
+    settings: Settings,
+    tried: list[str],
+    unavailable: set[str] | frozenset[str] = frozenset(),
+) -> str | None:
+    """Следующее звено цепочки: включённое, ещё не пробованное и не остывающее.
+
+    Недоступное звено пропускается, а не обрывает цепочку: эскалация к
+    исполнителю с исчерпанным лимитом только сожгла бы ещё одну попытку.
+    """
     for executor in settings.escalation.get(current, []):
         configured = settings.executors.get(executor)
-        if configured is None:
+        if configured is None or not configured.enabled:
             continue
-        if executor not in tried and configured.enabled:
+        if executor not in tried and executor not in unavailable:
             return executor
     return None

@@ -131,7 +131,28 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
         if mapped_status is not None:
             raw = {**raw, "status": mapped_status}
             coerced.append(f"status: {status!r} -> {mapped_status}")
+    # Strict-схема codex требует `null` в необязательных полях, а обычная схема
+    # его не принимает. `null` значит «нет значения»: поле убирается, а не
+    # превращает готовую работу в `partial`.
+    for key in _OPTIONAL_FIELDS:
+        if key in raw and raw[key] is None:
+            raw = {name: value for name, value in raw.items() if name != key}
+            coerced.append(f"{key}: None -> dropped")
     tests = raw.get("tests")
+    if isinstance(tests, dict) and None in (tests.get("command", ""), tests.get("result", "")):
+        dropped = [key for key in ("command", "result") if key in tests and tests[key] is None]
+        tests = {name: value for name, value in tests.items() if name not in dropped}
+        raw = {**raw, "tests": tests}
+        coerced.extend(f"tests.{key}: None -> dropped" for key in dropped)
+    confidence = raw.get("confidence")
+    if confidence is not None and not _is_unit_number(confidence):
+        mapped_confidence = _coerce_confidence(confidence)
+        if mapped_confidence is None:
+            raw = {name: value for name, value in raw.items() if name != "confidence"}
+        else:
+            raw = {**raw, "confidence": mapped_confidence}
+        shown = "dropped" if mapped_confidence is None else mapped_confidence
+        coerced.append(f"confidence: {confidence!r} -> {shown}")
     if isinstance(tests, dict) and isinstance(tests.get("result"), str):
         value = tests["result"].strip().lower()
         if value not in ("passed", "failed", "not_run"):
@@ -143,3 +164,34 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
             raw = {**raw, "tests": {**tests, "result": mapped}}
             coerced.append(f"tests.result: {tests['result']!r} -> {mapped}")
     return raw, coerced
+
+
+_OPTIONAL_FIELDS = ("changed_files", "tests", "confidence", "needs_escalation")
+
+#: Уверенность словами: модели пишут «high» вместо числа.
+_CONFIDENCE_WORDS = {"high": 0.9, "medium": 0.6, "moderate": 0.6, "low": 0.3}
+
+
+def _is_unit_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and 0 <= value <= 1
+
+
+def _coerce_confidence(value: object) -> float | None:
+    """Уверенность в [0, 1] из слова, строки с числом или процентов; иначе None.
+
+    Уверенность в отчёте только советует. Негодное значение отбрасывается, а
+    отчёт остаётся в силе: терять из-за неё весь результат дороже.
+    """
+    if isinstance(value, str):
+        text = value.strip().lower().rstrip("%").strip()
+        if text in _CONFIDENCE_WORDS:
+            return _CONFIDENCE_WORDS[text]
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if 1 < value <= 100:
+        value = value / 100
+    return float(value) if 0 <= value <= 1 else None

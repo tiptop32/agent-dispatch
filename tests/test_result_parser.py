@@ -186,3 +186,57 @@ def test_normalize_coerces_failed_wording():
     }
     result = normalize(raw, ProcessOutcome(0, "", "", False, 1), [], "claude", None)
     assert result.tests is not None and result.tests.result == "failed"
+
+
+def _block(**fields):
+    return {"status": "completed", "summary": "done", **fields}
+
+
+@pytest.mark.parametrize(
+    ("confidence", "expected"),
+    [
+        pytest.param("high", 0.9, id="word"),
+        pytest.param("Low", 0.3, id="word-case"),
+        pytest.param("0.8", 0.8, id="numeric-string"),
+        pytest.param("85%", 0.85, id="percent-string"),
+        pytest.param(85, 0.85, id="percent-number"),
+    ],
+)
+def test_normalize_coerces_confidence_instead_of_losing_the_report(confidence, expected):
+    # 09-29: готовая работа с "confidence": "high" вернулась как partial.
+    result = normalize(_block(confidence=confidence), outcome(), ["a.py"], "x", None)
+    assert result.status == "completed"
+    assert result.confidence == pytest.approx(expected)
+    assert result.meta["coerced"] == [f"confidence: {confidence!r} -> {expected}"]
+
+
+@pytest.mark.parametrize("confidence", ["very sure", 250, True, -1])
+def test_normalize_drops_unusable_confidence_and_keeps_the_report(confidence):
+    result = normalize(_block(confidence=confidence), outcome(), ["a.py"], "x", None)
+    assert result.status == "completed" and result.confidence is None
+    assert result.meta["coerced"] == [f"confidence: {confidence!r} -> dropped"]
+
+
+def test_normalize_drops_nulls_the_codex_strict_schema_requires():
+    # 09-24: codex/luna по strict-схеме написал null, отчёт стал partial.
+    raw = _block(
+        changed_files=None,
+        tests={"command": None, "result": "not_run"},
+        confidence=None,
+        needs_escalation=None,
+    )
+    result = normalize(raw, outcome(), ["done.txt"], "codex/luna", None)
+    assert result.status == "completed" and "parse_error" not in result.meta
+    assert result.tests.result == "not_run" and result.tests.command is None
+    assert result.needs_escalation is False
+    assert result.meta["coerced"] == [
+        "changed_files: None -> dropped",
+        "confidence: None -> dropped",
+        "needs_escalation: None -> dropped",
+        "tests.command: None -> dropped",
+    ]
+
+
+def test_normalize_valid_confidence_is_not_reported_as_coerced():
+    result = normalize(_block(confidence=0.7), outcome(), [], "x", None)
+    assert result.confidence == 0.7 and "coerced" not in result.meta
