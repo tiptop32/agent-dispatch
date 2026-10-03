@@ -66,6 +66,11 @@ class DispatchClient:
     async def executors(self) -> list[dict]:
         return (await self._request("GET", "/executors")).json()
 
+    async def clear_cooldowns(self, names: list[str] | None = None) -> list[str]:
+        params = {"name": names} if names else {}
+        response = await self._request("DELETE", "/executors/cooldowns", params=params)
+        return response.json()["cleared"]
+
     async def feedback(self, task_id: str, outcome: str, note: str | None = None) -> dict:
         return (
             await self._request(

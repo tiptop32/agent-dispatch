@@ -134,3 +134,34 @@ def test_zero_cooldown_disables_tripping():
     cache = AvailabilityCache({}, 1)
     assert cache.trip("a", "quota", "spend limit", 0) is None
     assert cache.unavailable() == set()
+
+
+def test_a_shorter_cooldown_does_not_cut_a_longer_one():
+    # Сосед по группе упал с «Try again later» (1 час), а недельный лимит до утра.
+    now = [0.0]
+    cache = AvailabilityCache({"a": Stub(True)}, 10, clock=lambda: now[0])
+    cache.trip("a", "quota", "weekly", 50_000, origin="b")
+    kept = cache.trip("a", "quota", "later", 3600)
+    assert kept.detail == "weekly" and kept.origin == "b"
+    now[0] = 10_000
+    assert cache.unavailable() == {"a"}
+
+
+def test_restore_brings_back_a_live_cooldown_and_drops_an_expired_one():
+    from datetime import UTC, datetime, timedelta
+
+    cache = AvailabilityCache({"a": Stub(True), "b": Stub(True)}, 10)
+    future = datetime.now(UTC) + timedelta(hours=3)
+    assert cache.restore("a", "quota", "weekly", future, "a") is not None
+    assert cache.restore("b", "quota", "old", datetime.now(UTC) - timedelta(seconds=1)) is None
+    assert set(cache.cooldowns()) == {"a"}
+    assert cache.cooldown("a").until_utc == future
+
+
+def test_clear_lifts_only_the_named_cooldowns():
+    cache = AvailabilityCache({"a": Stub(True), "b": Stub(True)}, 10)
+    cache.trip("a", "quota", "x", 900)
+    cache.trip("b", "quota", "x", 900)
+    assert cache.clear({"a", "nope"}) == ["a"]
+    assert set(cache.cooldowns()) == {"b"}
+    assert cache.clear() == ["b"] and cache.cooldowns() == {}

@@ -1,4 +1,5 @@
 import os
+import socket
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -23,12 +24,19 @@ def make_state():
 
 @pytest.mark.asyncio
 async def test_live_state_skips_popen(tmp_path):
+    # «Демон жив» это живой pid и занятый порт. Порт занимает сам тест: раньше
+    # тест проходил только при запущенном на 7433 настоящем демоне.
     settings = make_settings(tmp_path)
-    state = make_state()
-    write_state(tmp_path, state)
-    popen = AsyncMock()
-    assert await ensure_daemon(settings, popen=popen, health=AsyncMock(return_value=True)) == state
-    popen.assert_not_called()
+    with socket.socket() as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        state = make_state().model_copy(update={"port": holder.getsockname()[1]})
+        write_state(tmp_path, state)
+        popen = AsyncMock()
+        assert (
+            await ensure_daemon(settings, popen=popen, health=AsyncMock(return_value=True)) == state
+        )
+        popen.assert_not_called()
 
 
 @pytest.mark.asyncio

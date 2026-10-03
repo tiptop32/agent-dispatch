@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -34,11 +35,57 @@ def _agent(value: str | None, default: SourceAgent | None = None) -> SourceAgent
         return default
 
 
-def _request(task: str, cwd: str, settings: Settings, **kwargs: Any) -> DispatchRequest:
-    source = (
+KIND_HINT = (
+    "kind='task' (default) changes code; kind='review' asks for a read-only review "
+    "of the working copy and returns findings without editing files."
+)
+
+
+def _source() -> SourceAgent:
+    return (
         _agent(os.environ.get("AGENT_DISPATCH_SOURCE_AGENT"), SourceAgent.unknown)
         or SourceAgent.unknown
     )
+
+
+def _local_time(value: str | datetime) -> str:
+    moment = datetime.fromisoformat(value) if isinstance(value, str) else value
+    return moment.astimezone().isoformat(timespec="minutes")
+
+
+def _executors_text(rows: list[dict], settings: Settings, source: SourceAgent) -> str:
+    """Компактная сводка: кому можно отдать работу сейчас и почему нельзя остальным."""
+    review_only = set(settings.routing.review_only.get(source.value, []))
+    ready: list[str] = []
+    cooling: dict[tuple[str, str, str], list[str]] = {}
+    down: list[str] = []
+    reviewers: list[str] = []
+    for row in rows:
+        if not row.get("enabled"):
+            continue
+        name = row["name"]
+        cooldown = row.get("cooldown")
+        if cooldown:
+            key = (_local_time(cooldown["until"]), cooldown["kind"], cooldown["detail"][:120])
+            cooling.setdefault(key, []).append(name)
+        elif row.get("available") is False:
+            down.append(f"{name} ({(row.get('error') or 'unavailable')[:80]})")
+        else:
+            ready.append(name)
+        if row.get("adapter") in review_only:
+            reviewers.append(name)
+    lines = [f"available: {', '.join(ready) or '(none)'}"]
+    for (until, kind, detail), names in cooling.items():
+        lines.append(f"out until {until} ({kind}): {', '.join(names)}; {detail}")
+    if down:
+        lines.append(f"unavailable: {', '.join(down)}")
+    if reviewers:
+        lines.append(f"review only from {source.value} (kind='review'): {', '.join(reviewers)}")
+    return "\n".join(lines)
+
+
+def _request(task: str, cwd: str, settings: Settings, **kwargs: Any) -> DispatchRequest:
+    source = _source()
     hop_raw = os.environ.get("AGENT_DISPATCH_HOP", "0")
     try:
         hop = int(hop_raw)
@@ -74,6 +121,10 @@ def _route_lines(decision: RouteDecision) -> list[str]:
     if notes:
         lines.append(f"notes: {'; '.join(notes)}")
     return lines
+
+
+#: Поля `result.meta`, которые компактный ответ показывает вызывающему.
+_META_LINES = ("warning", "cooldown_until", "branch", "worktree", "patch", "integration_error")
 
 
 def _task_text(view: TaskView, verbose: bool = False) -> str:
@@ -115,7 +166,7 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
             lines.append(f"tests: {tests}")
         if result.error:
             lines.append(f"error: {result.error[:500]}")
-        for key in ("branch", "worktree", "patch", "integration_error"):
+        for key in _META_LINES:
             if value := result.meta.get(key):
                 lines.append(f"{key}: {value}")
         if summary:
@@ -160,7 +211,7 @@ def build_server(
         state = await result if inspect.isawaitable(result) else result
         return factory(state, wait + 30)
 
-    @server.tool(description="Choose the best executor for a task without running it.")
+    @server.tool(description="Choose the best executor for a task without running it. " + KIND_HINT)
     async def route(
         task: str,
         cwd: str,
@@ -169,6 +220,7 @@ def build_server(
         constraints: list[str] | None = None,
         success_criteria: list[str] | None = None,
         context_mode: str = "prompt+summary",
+        kind: str = "task",
         verbose: bool = False,
     ) -> str:
         try:
@@ -183,6 +235,7 @@ def build_server(
                     constraints=constraints or [],
                     success_criteria=success_criteria or [],
                     context_mode=ContextMode(context_mode),
+                    kind=kind,
                 )
             )
             if verbose:
@@ -208,6 +261,7 @@ def build_server(
         wait_seconds: int | None,
         timeout_seconds: int | None,
         verbose: bool,
+        kind: str = "task",
     ) -> str:
         try:
             wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
@@ -225,6 +279,7 @@ def build_server(
                 allow_escalation=allow_escalation,
                 wait_seconds=wait,
                 timeout_seconds=timeout_seconds,
+                kind=kind,
             )
             return _task_text(await client.submit(req), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
@@ -233,7 +288,7 @@ def build_server(
     @server.tool(
         description=(
             "Dispatch a coding task to the selected executor. Do not re-dispatch an "
-            "already delegated task unless escalation is allowed."
+            "already delegated task unless escalation is allowed. " + KIND_HINT
         )
     )
     async def dispatch(
@@ -247,6 +302,7 @@ def build_server(
         allow_escalation: bool = True,
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
+        kind: str = "task",
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -262,12 +318,14 @@ def build_server(
             wait_seconds,
             timeout_seconds,
             verbose,
+            kind,
         )
 
     @server.tool(
         description=(
             "Dispatch a coding task to a specific executor. Use only when the executor "
-            "is known; do not re-dispatch delegated work unless escalation is allowed."
+            "is known; do not re-dispatch delegated work unless escalation is allowed. "
+            "Executors out of usage limits are refused: call `executors` first. " + KIND_HINT
         )
     )
     async def dispatch_to(
@@ -282,6 +340,7 @@ def build_server(
         allow_escalation: bool = True,
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
+        kind: str = "task",
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -297,7 +356,22 @@ def build_server(
             wait_seconds,
             timeout_seconds,
             verbose,
+            kind,
         )
+
+    @server.tool(
+        description=(
+            "List executors that can take work right now. Shows which are out of usage "
+            "limits (and until when) and which take only reviews from you."
+        )
+    )
+    async def executors() -> str:
+        try:
+            client = await get_client(settings.mcp.wait_seconds)
+            rows = await client.executors()
+        except (DaemonUnavailable, RuntimeError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+        return _executors_text(rows, settings, _source())
 
     @server.tool(description="Get the current result of a delegated task by task_id.")
     async def status(task_id: str, wait_seconds: int = 0, verbose: bool = False) -> str:

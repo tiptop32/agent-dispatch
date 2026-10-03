@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
@@ -63,6 +63,7 @@ def build_router() -> APIRouter:
         result = []
         for name, config in deps.settings.executors.items():
             availability = deps.availability.get(name)
+            cooldown = deps.availability.cooldown(name)
             result.append(
                 {
                     "name": name,
@@ -73,9 +74,24 @@ def build_router() -> APIRouter:
                     "version": availability.version if availability else None,
                     "checked_at": availability.checked_at if availability else None,
                     "error": availability.error if availability else None,
+                    "cooldown": (
+                        {
+                            "kind": cooldown.kind,
+                            "until": cooldown.until_utc,
+                            "origin": cooldown.origin,
+                            "detail": cooldown.detail,
+                        }
+                        if cooldown
+                        else None
+                    ),
                 }
             )
         return result
+
+    @router.delete("/executors/cooldowns")
+    async def clear_cooldowns(request: Request, name: list[str] | None = Query(None)):  # noqa: B008
+        cleared = await _deps(request).dispatcher.clear_cooldowns(name)
+        return {"cleared": cleared}
 
     @router.post("/route")
     async def route(req: DispatchRequest, request: Request):

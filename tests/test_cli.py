@@ -349,3 +349,30 @@ def test_help_lists_all_commands():
         "doctor",
     ):
         assert command in result.stdout
+
+
+@respx.mock
+def test_dispatch_sends_review_kind(tmp_config_dir, monkeypatch):
+    state = _state()
+    _patch_autostart(monkeypatch, state)
+    request = respx.post(f"http://127.0.0.1:{state.port}/tasks").mock(
+        return_value=httpx.Response(200, json=_view())
+    )
+    result = runner.invoke(app, ["dispatch", "--kind", "review", "review the diff"])
+    assert result.exit_code == 0
+    assert json.loads(request.calls[0].request.content)["kind"] == "review"
+
+
+@respx.mock
+def test_cooldown_clear_sends_names(tmp_config_dir, monkeypatch):
+    state = _state()
+    _write_running_state(tmp_config_dir, state)
+    request = respx.delete(f"http://127.0.0.1:{state.port}/executors/cooldowns").mock(
+        return_value=httpx.Response(200, json={"cleared": ["claude/opus"]})
+    )
+    result = runner.invoke(app, ["cooldown-clear", "claude/opus", "claude/haiku"])
+    assert result.exit_code == 0 and "cleared: claude/opus" in result.stdout
+    assert request.calls[0].request.url.params.get_list("name") == ["claude/opus", "claude/haiku"]
+
+    result = runner.invoke(app, ["cooldown-clear"])
+    assert "name" not in request.calls[1].request.url.params

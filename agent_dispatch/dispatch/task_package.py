@@ -19,6 +19,8 @@ class TaskPackage(BaseModel):
     request: DispatchRequest
     git_status: str | None = None
     git_diff_stat: str | None = None
+    #: Дифф рабочей копии против HEAD для ревью: ревьюер работает без Bash.
+    git_diff: str | None = None
     #: Рабочий каталог исполнителя, если это не сам cwd запроса.
     worktree: str | None = None
     branch: str | None = None
@@ -37,6 +39,17 @@ def build_task_package(
     worktree: str | None = None,
     branch: str | None = None,
 ) -> TaskPackage:
+    if req.kind == "review":
+        diff = _git(req.cwd, ["diff", "HEAD"])
+        if len(diff) > REVIEW_DIFF_LIMIT:
+            diff = diff[:REVIEW_DIFF_LIMIT] + "\n... (diff truncated, read the files directly)\n"
+        return TaskPackage(
+            request=req,
+            git_status=_git(req.cwd, ["status", "--short"]),
+            git_diff=diff,
+            worktree=worktree,
+            branch=branch,
+        )
     if req.context_mode == ContextMode.full:
         return TaskPackage(
             request=req,
@@ -46,6 +59,10 @@ def build_task_package(
             branch=branch,
         )
     return TaskPackage(request=req, worktree=worktree, branch=branch)
+
+
+#: Сколько символов диффа уходит ревьюеру; дальше он читает файлы сам.
+REVIEW_DIFF_LIMIT = 100_000
 
 
 def _bullets(value: list[str]) -> str:
@@ -70,6 +87,7 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         instructions = 'End your final message with a fenced block tagged `agent-dispatch-result` containing a JSON object with fields: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation. Example:\n```agent-dispatch-result\n{"status": "completed", "summary": "...", "changed_files": [], "tests": {"command": "pytest", "result": "passed"}, "confidence": 0.9, "needs_escalation": false}\n```'  # noqa: E501
     return env.get_template("task_package.md.j2").render(
         task=req.task,
+        review=req.kind == "review",
         cwd=package.worktree or req.cwd,
         repo=req.cwd,
         worktree=bool(package.worktree),
@@ -81,6 +99,7 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         context_mode=req.context_mode.value,
         git_status=package.git_status or "",
         git_diff_stat=package.git_diff_stat or "",
+        git_diff=package.git_diff or "",
         source_agent=req.source_agent.value,
         hop=req.hop,
         max_hops=settings.routing.max_hops,

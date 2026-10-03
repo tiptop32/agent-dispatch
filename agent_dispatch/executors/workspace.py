@@ -1,3 +1,4 @@
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -51,6 +52,29 @@ def snapshot(cwd: str | Path) -> set[str]:
         if "R" in status or "C" in status:
             index += 1
     return paths
+
+
+def fingerprint(cwd: str | Path) -> str:
+    """Хеш содержимого рабочей копии: дифф против HEAD плюс неотслеживаемые файлы.
+
+    `snapshot` видит только набор грязных путей, и правка файла, который был
+    грязным ещё до запуска, в нём не заметна. Ревью обещает ничего не менять,
+    поэтому сравнивается содержимое.
+    """
+    digest = hashlib.sha256()
+    for args in (["diff", "HEAD", "--binary"], ["ls-files", "-o", "--exclude-standard", "-z"]):
+        result = subprocess.run(
+            ["git", *args], cwd=cwd, env=git_env(), capture_output=True, check=True
+        )
+        digest.update(result.stdout)
+        if args[0] == "ls-files":
+            root = Path(cwd)
+            for name in filter(None, result.stdout.split(b"\0")):
+                try:
+                    digest.update((root / os.fsdecode(name)).read_bytes())
+                except OSError:
+                    digest.update(b"<unreadable>")
+    return digest.hexdigest()
 
 
 def diff(before: set[str], after: set[str]) -> list[str]:

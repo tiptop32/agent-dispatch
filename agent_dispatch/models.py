@@ -74,11 +74,17 @@ class GuardReason(StrEnum):
     unknown_parent = "unknown_parent"
     max_children = "max_children"
     escalated = "escalated"
+    review_only = "review_only"
+
+
+#: `task` меняет файлы, `review` только читает и возвращает замечания.
+TaskKind = Literal["task", "review"]
 
 
 class DispatchRequest(_Model):
     task: str = Field(min_length=1)
     cwd: str
+    kind: TaskKind = "task"
     context: str | None = None
     files: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)

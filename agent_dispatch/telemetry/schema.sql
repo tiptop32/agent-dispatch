@@ -43,6 +43,18 @@ CREATE TABLE IF NOT EXISTS events (
     FOREIGN KEY (task_id) REFERENCES tasks(task_id)
 );
 
+-- Исполнители вне ротации после исчерпанного лимита или иного сбоя исполнителя.
+-- Живёт в базе, чтобы недельный лимит переживал перезапуск демона.
+CREATE TABLE IF NOT EXISTS cooldowns (
+    executor TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    task_id TEXT,
+    until TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id ON tasks(parent_task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);

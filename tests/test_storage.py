@@ -204,3 +204,52 @@ async def test_count_children_can_exclude_escalation_retries(storage: Storage):
     await storage.insert_task(make_task(parent=parent.task_id, status="cancelled"))
     assert await storage.count_children(parent.task_id) == 3
     assert await storage.count_children(parent.task_id, exclude_escalated=True) == 2
+
+
+@pytest.mark.asyncio
+async def test_cooldowns_survive_reopen_and_expire(tmp_path):
+    from datetime import timedelta
+
+    path = tmp_path / "db.sqlite"
+    first = Storage(path)
+    await first.open()
+    now = datetime.now(UTC)
+    await first.save_cooldown(
+        "claude/opus",
+        kind="quota",
+        detail="weekly",
+        origin="claude/opus",
+        until=now + timedelta(hours=5),
+        task_id="t1",
+    )
+    await first.save_cooldown(
+        "claude/haiku",
+        kind="quota",
+        detail="weekly",
+        origin="claude/opus",
+        until=now + timedelta(hours=5),
+    )
+    await first.save_cooldown(
+        "codex", kind="network", detail="x", origin="codex", until=now - timedelta(seconds=1)
+    )
+    await first.close()
+
+    second = Storage(path)
+    await second.open()
+    rows = await second.active_cooldowns()
+    assert [row["executor"] for row in rows] == ["claude/haiku", "claude/opus"]
+    assert rows[1]["task_id"] == "t1" and rows[0]["origin"] == "claude/opus"
+    # Повторное остывание того же исполнителя заменяет запись, а не дублирует.
+    await second.save_cooldown(
+        "claude/opus",
+        kind="quota",
+        detail="later",
+        origin="claude/opus",
+        until=now + timedelta(hours=1),
+    )
+    assert [r["detail"] for r in await second.active_cooldowns()] == ["weekly", "later"]
+    await second.delete_cooldowns(["claude/haiku"])
+    assert [r["executor"] for r in await second.active_cooldowns()] == ["claude/opus"]
+    await second.delete_cooldowns()
+    assert await second.active_cooldowns() == []
+    await second.close()

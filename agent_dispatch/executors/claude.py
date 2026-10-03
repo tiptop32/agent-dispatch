@@ -5,10 +5,25 @@ import json
 from agent_dispatch.executors.base import (
     BaseExecutorAdapter,
     RunContext,
+    strip_flags,
 )
 from agent_dispatch.executors.process import ProcessOutcome, run_cli
 from agent_dispatch.executors.result_parser import extract_result_block, normalize
 from agent_dispatch.models import ExecutionResult, Usage
+
+#: Ревью: из встроенных инструментов существуют только чтение и поиск.
+#: `--allowedTools` для этого мало: правила `allow` из ~/.claude/settings.json
+#: складываются с ним, и живая проверка 2026-10-03 создала файл при
+#: `--disallowedTools Write`. `--tools` убирает остальные инструменты целиком,
+#: `--strict-mcp-config` отключает MCP-серверы пользователя (среди них бывают
+#: пишущие). Дифф рабочей копии ревьюер получает в Task Package, Bash ему не нужен.
+READ_ONLY_ARGS = [
+    "--tools",
+    "Read,Glob,Grep",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "dontAsk",
+]
 
 
 class ClaudeAdapter(BaseExecutorAdapter):
@@ -16,6 +31,24 @@ class ClaudeAdapter(BaseExecutorAdapter):
     streams_output = False
 
     async def execute(self, ctx: RunContext) -> ExecutionResult:
+        extra = self.settings.extra_args
+        if ctx.read_only:
+            extra = [
+                *strip_flags(
+                    extra,
+                    {
+                        "--permission-mode",
+                        "--allowedTools",
+                        "--allowed-tools",
+                        "--disallowedTools",
+                        "--disallowed-tools",
+                        "--tools",
+                        "--mcp-config",
+                    },
+                    {"--dangerously-skip-permissions", "--strict-mcp-config"},
+                ),
+                *READ_ONLY_ARGS,
+            ]
         argv = [
             self.command,
             "-p",
@@ -24,7 +57,7 @@ class ClaudeAdapter(BaseExecutorAdapter):
             "--add-dir",
             ctx.cwd,
             *(["--model", self.settings.model] if self.settings.model else []),
-            *self.settings.extra_args,
+            *extra,
         ]
         return await self._execute_common(
             ctx,

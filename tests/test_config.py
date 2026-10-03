@@ -268,3 +268,40 @@ def test_secrets_in_user_yaml_raise_config_error(tmp_config_dir: Path) -> None:
 
 def test_max_children_defaults_to_two(tmp_config_dir: Path) -> None:
     assert load_settings(tmp_config_dir).routing.max_children == 2
+
+
+@pytest.mark.parametrize(
+    ("rule", "message"),
+    [
+        ({"codex": ["gpt"]}, r"unknown adapter 'gpt'"),
+        ({"cursor": ["claude"]}, r"review_only\.cursor: unknown source agent"),
+    ],
+)
+def test_review_only_rule_is_validated(tmp_config_dir: Path, rule, message) -> None:
+    import yaml
+
+    (tmp_config_dir / "config.yaml").write_text(yaml.safe_dump({"routing": {"review_only": rule}}))
+    with pytest.raises(ConfigError, match=message):
+        load_settings(tmp_config_dir)
+
+
+def test_user_config_can_switch_the_review_rule_off(tmp_config_dir: Path) -> None:
+    (tmp_config_dir / "config.yaml").write_text("routing:\n  review_only:\n    codex: []\n")
+    assert load_settings(tmp_config_dir).routing.review_only == {"codex": []}
+
+
+@pytest.mark.parametrize(
+    ("adapter", "model", "explicit", "expected"),
+    [
+        ("claude", "opus", None, "claude"),
+        ("codex", "gpt-5.6-sol", None, "codex"),
+        ("opencode", "copilot/x5-airun-code-large", None, "opencode:copilot"),
+        ("opencode", "kimi", None, "opencode/kimi"),
+        ("codex", "sol", "codex-lb", "codex-lb"),
+    ],
+)
+def test_limit_group_defaults_to_the_shared_account(adapter, model, explicit, expected) -> None:
+    from agent_dispatch.config import ExecutorSettings
+
+    item = ExecutorSettings(adapter=adapter, model=model, limit_group=explicit)
+    assert item.resolved_limit_group("opencode/kimi") == expected

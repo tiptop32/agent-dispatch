@@ -97,6 +97,7 @@ async def test_tools_exact(tmp_path):
             "dispatch",
             "dispatch_to",
             "status",
+            "executors",
         }
 
 
@@ -293,3 +294,76 @@ async def test_client_500():
     respx.get("http://127.0.0.1:7433/health").mock(return_value=httpx.Response(500, text="boom"))
     with pytest.raises(RuntimeError, match="boom"):
         await DispatchClient(state()).health()
+
+
+def _executor_row(name, adapter, *, cooldown=None, available=True, enabled=True, error=None):
+    return {
+        "name": name,
+        "adapter": adapter,
+        "model": None,
+        "enabled": enabled,
+        "available": available,
+        "version": "1",
+        "checked_at": None,
+        "error": error,
+        "cooldown": cooldown,
+    }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_executors_tool_names_who_is_out_of_limits_and_review_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_DISPATCH_SOURCE_AGENT", "codex")
+    weekly = {
+        "kind": "quota",
+        "until": "2026-10-03T00:01:00+00:00",
+        "origin": "claude/opus",
+        "detail": "You've hit your weekly limit · resets 5am (Asia/Yekaterinburg)",
+    }
+    rows = [
+        _executor_row("claude/opus", "claude", cooldown=weekly, available=False),
+        _executor_row("claude/haiku", "claude", cooldown=weekly, available=False),
+        _executor_row("codex/sol", "codex"),
+        _executor_row("opencode/kimi", "opencode", available=False, error="not installed"),
+        _executor_row("codex/off", "codex", enabled=False),
+    ]
+    respx.get("http://127.0.0.1:7433/executors").mock(return_value=httpx.Response(200, json=rows))
+    text = (await call(settings(tmp_path), "executors", {})).content[0].text
+    lines = text.splitlines()
+    assert lines[0] == "available: codex/sol"
+    assert (
+        lines[1].startswith("out until 2026-10-03T")
+        and "(quota): claude/opus, claude/haiku" in (lines[1])
+    )
+    assert "weekly limit" in lines[1]
+    assert lines[2] == "unavailable: opencode/kimi (not installed)"
+    assert lines[3] == "review only from codex (kind='review'): claude/opus, claude/haiku"
+    assert "codex/off" not in text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dispatch_sends_review_kind(tmp_path):
+    request = respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(200, json=view().model_dump(mode="json"))
+    )
+    await call(
+        settings(tmp_path),
+        "dispatch_to",
+        {"executor": "claude", "task": "review diff", "cwd": ".", "kind": "review"},
+    )
+    assert '"kind":"review"' in request.calls[0].request.content.decode()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compact_output_shows_cooldown_and_review_warning(tmp_path):
+    payload = view().model_dump(mode="json")
+    payload["result"]["meta"] = {
+        "cooldown_until": "2026-10-03T00:01:00+00:00",
+        "warning": "review changed files: a.py",
+    }
+    respx.get("http://127.0.0.1:7433/tasks/t1").mock(return_value=httpx.Response(200, json=payload))
+    text = (await call(settings(tmp_path), "status", {"task_id": "t1"})).content[0].text
+    assert "warning: review changed files: a.py" in text
+    assert "cooldown_until: 2026-10-03T00:01:00+00:00" in text

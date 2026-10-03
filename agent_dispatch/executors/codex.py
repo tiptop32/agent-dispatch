@@ -5,7 +5,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from agent_dispatch.executors.base import BaseExecutorAdapter, RunContext
+from agent_dispatch.executors.base import BaseExecutorAdapter, RunContext, strip_flags
 from agent_dispatch.executors.process import ProcessOutcome, run_cli
 from agent_dispatch.executors.result_parser import normalize
 from agent_dispatch.models import ExecutionResult, Usage
@@ -14,6 +14,17 @@ from agent_dispatch.schemas import load_agent_result_strict_schema
 
 class CodexAdapter(BaseExecutorAdapter):
     async def execute(self, ctx: RunContext) -> ExecutionResult:
+        extra = self.settings.extra_args
+        if ctx.read_only:
+            extra = [
+                *strip_flags(
+                    extra,
+                    {"--sandbox", "-s"},
+                    {"--full-auto", "--dangerously-bypass-approvals-and-sandbox"},
+                ),
+                "--sandbox",
+                "read-only",
+            ]
         temp_dir = Path(tempfile.mkdtemp(prefix="agent-dispatch-codex-"))
         try:
             schema_path = temp_dir / "schema.json"
@@ -30,7 +41,7 @@ class CodexAdapter(BaseExecutorAdapter):
                 "-o",
                 str(last_path),
                 *(["-m", self.settings.model] if self.settings.model else []),
-                *self.settings.extra_args,
+                *extra,
                 "-",
             ]
             return await self._execute_common(

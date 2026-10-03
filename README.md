@@ -14,8 +14,8 @@ OpenCode ────┘                                                        
 
 - `agent-dispatch serve`: локальный демон (HTTP на `127.0.0.1:7433`, SQLite-телеметрия, очередь задач). Переживает смерть агента, который его вызвал.
 - `agent-dispatch mcp`: stdio MCP-сервер, тонкий прокси в демон. Поднимает демон сам, если тот не запущен.
-- Tools: `route` (только решение), `dispatch` (решение + запуск), `dispatch_to` (явный исполнитель), `status`.
-- Guards в коде: недоступный исполнитель, лимит глубины делегирования (`max_hops`), лимит сабагентов на задачу (`max_children`), низкая уверенность Jev, таймаут, отмена.
+- Tools: `route` (только решение), `dispatch` (решение + запуск), `dispatch_to` (явный исполнитель), `status`, `executors` (кто доступен сейчас, кто на лимите и до какого времени).
+- Guards в коде: недоступный исполнитель, исчерпанный лимит (до объявленного сброса, на весь аккаунт), правило «только ревью» (`routing.review_only`), лимит глубины делегирования (`max_hops`), лимит сабагентов на задачу (`max_children`), низкая уверенность Jev, таймаут, отмена.
 - Escalation chains из конфига: `opencode/kimi → codex → claude`.
 - Телеметрия каждого решения и результата, экспорт в JSONL для анализа routing accuracy.
 
@@ -173,6 +173,62 @@ agent-dispatch worktrees --clean --delete-branches
 ### Сабагенты и hop-протокол
 
 Исполнитель получает в окружении `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP`. Его собственный MCP-прокси читает их и передаёт в демон, поэтому глубина делегирования известна демону, а не модели. При `max_hops: 2` исполнитель может разбить задачу и отдать до `max_children` подзадач через тот же `dispatch` (каждую роутит Jev), а его сабагенты уже делегировать не могут.
+
+### Лимиты исполнителей
+
+Когда CLI отвечает исчерпанным лимитом (`You've hit your weekly limit · resets 5am (Asia/Yekaterinburg)`, `You’ve hit your usage limit. Try again at 5:02 PM.`), демон выводит исполнителя из ротации до названного момента плюс минута запаса. Время без часового пояса считается местным временем машины демона. Если момент не назван, исполнитель перепроверяется через `routing.quota_cooldown_seconds` (3600).
+
+- **Весь аккаунт.** Лимит, авторизация и сеть общие для аккаунта, поэтому вместе с упавшим исполнителем остывают все с тем же `limit_group`: по умолчанию все `claude/*`, все `codex/*`, у `opencode` все модели одного провайдера. Перегрузка модели (`at capacity`) и лимит конкретной модели (`hit your Opus limit`) выводят только её.
+- **Лимит расходов** (`monthly spend limit · raise it at …`) человек поднимает сам в любую минуту, поэтому он перепроверяется не реже `quota_cooldown_seconds`, даже если сброс назван через три дня.
+- **Пул аккаунтов за балансировщиком** (codex через codex-lb): сброс в сообщении относится к одному аккаунту, следующий запрос может уйти на свободный. Для таких исполнителей `limit_reset: recheck`:
+
+  ```yaml
+  executors:
+    codex/sol:
+      adapter: codex
+      model: gpt-5.6-sol
+      limit_reset: recheck   # announced (по умолчанию): ждать названный сброс
+  ```
+
+- **Переживает перезапуск.** Остывание хранится в таблице `cooldowns` в `dispatch.db` и восстанавливается при старте демона.
+- **Видно вызывающей модели.** MCP-инструмент `executors` отвечает в несколько строк:
+
+  ```text
+  available: codex/luna, codex/sol, opencode/x5-code-large
+  out until 2026-10-03T05:01+05:00 (quota): claude/opus, claude/sonnet, claude/haiku; You've hit your weekly limit · resets 5am (Asia/Yekaterinburg)
+  review only from codex (kind='review'): claude/opus, claude/sonnet, claude/haiku
+  ```
+
+  Роутер такого исполнителя не предлагает, цепочка эскалации его пропускает, а `dispatch_to` к нему сразу получает отказ с временем окончания, не запуская CLI. В ответе на упавшую задачу есть строка `cooldown_until`.
+- **Снять вручную**, если лимит подняли раньше: `agent-dispatch cooldown-clear claude/opus` (без имён снимает все). `agent-dispatch executors` показывает остывание в колонке ошибки.
+
+### Только ревью
+
+Задача бывает двух видов: `kind: task` (по умолчанию) меняет код, `kind: review` читает рабочую копию и возвращает замечания. Правило `routing.review_only` задаёт, кому источник может отдать только ревью:
+
+```yaml
+routing:
+  review_only:
+    codex: [claude]    # по умолчанию: Codex не тратит токены Claude на работу, а просит ревью
+```
+
+Для `source_agent: codex` и `kind: task` исполнители `claude/*` выпадают из кандидатов роутера и из цепочек эскалации, а `dispatch_to` к ним получает отказ `review_only` с подсказкой. С `kind: review` Codex может обратиться к Claude напрямую или через роутер. Выключить правило: `review_only: {codex: []}`.
+
+Ревью идёт в режиме только чтения и всегда в самой рабочей копии, даже при `workspace_mode: worktree`: worktree от HEAD не увидел бы незакоммиченного диффа, который и просят проверить.
+
+| адаптер | режим ревью |
+|---|---|
+| `claude` | `--tools Read,Glob,Grep --strict-mcp-config --permission-mode dontAsk`: других встроенных инструментов и MCP-серверов в сессии нет |
+| `codex` | `--sandbox read-only` |
+| `opencode` | `--agent plan` (встроенный агент без права правки) |
+
+Почему у Claude `--tools`, а не `--allowedTools`/`--disallowedTools`: правила `allow` из `~/.claude/settings.json` складываются с флагами, и живая проверка 2026-10-03 с `--disallowedTools Write` создала файл. `--tools` убирает инструменты из сессии целиком. Bash ревьюеру не нужен: `git status --short` и `git diff HEAD` (до 100 000 символов) приходят в Task Package.
+
+Конфликтующие флаги из `extra_args` (`--permission-mode`, `--allowedTools`, `--tools`, `--sandbox`, `--agent`) в режиме ревью убираются, а не перекрываются: codex повтор флага отвергает. Демон сравнивает содержимое рабочей копии до и после ревью; если оно изменилось, в результате `warning: review changed files: ...` или `warning: working copy changed during the review` (ревью идёт без lock, изменение мог внести и параллельный запуск). Правки не откатываются, решает вызывающий. Сверка содержимого не смотрит файлы из `.gitignore` (`.env`, `.venv`): хешировать их на каждое ревью дорого, от записи туда защищает режим CLI.
+
+```bash
+agent-dispatch dispatch --kind review "Проверь незакоммиченный дифф на ошибки"
+```
 
 ## Конфигурация
 

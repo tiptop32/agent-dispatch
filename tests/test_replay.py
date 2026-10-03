@@ -28,14 +28,17 @@ def _db(tmp_path: Path, rows: list[tuple]) -> Path:
     path = tmp_path / "dispatch.db"
     conn = sqlite3.connect(path)
     conn.executescript(SCHEMA.read_text())
-    for task_id, executor, created, finished, minutes, parent, result in rows:
+    for row in rows:
+        task_id, executor, created, finished, minutes, parent, result = row[:7]
+        source = row[7] if len(row) > 7 else "claude"
         conn.execute(
             "insert into tasks (task_id, escalated_from, root_agent, source_agent, hop, cwd,"
             " status, executor, request_json, result_json, log_path, created_at, finished_at,"
-            " duration_ms) values (?, ?, 'claude', 'claude', 0, '/r', ?, ?, '{}', ?, '', ?, ?, ?)",
+            " duration_ms) values (?, ?, 'claude', ?, 0, '/r', ?, ?, '{}', ?, '', ?, ?, ?)",
             (
                 task_id,
                 parent,
+                source,
                 result["status"],
                 executor,
                 json.dumps(result),
@@ -88,7 +91,7 @@ def test_replay_counts_runs_sent_to_an_executor_that_was_down(tmp_path):
             ("e" * 32, "claude/opus", "10:31", "10:40", 9, None, _result("completed")),
         ],
     )
-    report = replay(load(db), cooldown_seconds=900)
+    report = replay(load(db), cooldown=900)
 
     assert [row["kind"] for row in report["executor_failures"]] == ["network", "network"]
     assert [row["task_id"] for row in report["avoidable_runs"]] == ["b" * 8]
@@ -129,3 +132,40 @@ def test_replay_separates_report_format_partials(tmp_path):
     )
     report = replay(load(db))
     assert report["partial"] == 2 and report["partial_from_report_format"] == ["f" * 8]
+
+
+WEEKLY = "You've hit your weekly limit · resets 5am (Asia/Yekaterinburg)"
+
+
+def test_replay_holds_the_whole_limit_group_until_the_reset(tmp_path):
+    # 2026-09-23: claude/opus на недельном лимите в 10:00 UTC, сброс 00:00 UTC.
+    db = _db(
+        tmp_path,
+        [
+            ("a" * 32, "claude/opus", "10:00", "10:01", 1, None, _result("failed", error=WEEKLY)),
+            # Через 3 часа: старое 15-минутное остывание уже кончилось бы.
+            ("b" * 32, "claude/opus", "13:00", "13:01", 1, None, _result("failed", error=WEEKLY)),
+            # Соседняя модель того же аккаунта.
+            ("c" * 32, "claude/haiku", "14:00", "14:01", 1, None, _result("failed", error=WEEKLY)),
+            ("d" * 32, "codex/sol", "14:00", "14:10", 10, None, _result("completed")),
+        ],
+    )
+    report = replay(load(db), cooldown=900)
+    assert [row["task_id"] for row in report["avoidable_runs"]] == ["b" * 8, "c" * 8]
+    assert report["executor_failures"][0]["hours"] == 14.0
+
+
+def test_replay_counts_work_given_to_a_review_only_executor(tmp_path):
+    db = _db(
+        tmp_path,
+        [
+            ("a" * 32, "claude/opus", "10:00", "10:20", 20, None, _result("completed"), "codex"),
+            ("b" * 32, "claude/opus", "11:00", "11:01", 1, None, _result("failed"), "codex"),
+            ("c" * 32, "claude/opus", "12:00", "12:05", 5, None, _result("completed"), "claude"),
+            ("d" * 32, "codex/sol", "12:00", "12:05", 5, None, _result("completed"), "codex"),
+        ],
+    )
+    report = replay(load(db))
+    assert (report["review_only_runs"], report["review_only_failed"]) == (2, 1)
+    assert report["review_only_minutes"] == 21.0
+    assert "work given to a review-only executor: 2 runs, 1 failed, 21.0 min" in render(report)

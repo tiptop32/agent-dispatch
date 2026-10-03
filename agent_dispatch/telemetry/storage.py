@@ -218,6 +218,47 @@ class Storage:
             self._db.commit()
             return int(cur.lastrowid)
 
+    async def save_cooldown(
+        self,
+        executor: str,
+        *,
+        kind: str,
+        detail: str,
+        origin: str,
+        until: datetime,
+        task_id: str | None = None,
+    ) -> None:
+        async with self._write_lock:
+            self._db.execute(
+                "INSERT INTO cooldowns(executor,kind,detail,origin,task_id,until,created_at)"
+                " VALUES (?,?,?,?,?,?,?) ON CONFLICT(executor) DO UPDATE SET"
+                " kind=excluded.kind, detail=excluded.detail, origin=excluded.origin,"
+                " task_id=excluded.task_id, until=excluded.until, created_at=excluded.created_at",
+                (executor, kind, detail, origin, task_id, _dt(until), _dt(datetime.now(UTC))),
+            )
+            self._db.commit()
+
+    async def active_cooldowns(self, now: datetime | None = None) -> list[dict]:
+        """Остывания, которые ещё не истекли; истёкшие по дороге удаляются."""
+        moment = _dt(now or datetime.now(UTC))
+        async with self._write_lock:
+            self._db.execute("DELETE FROM cooldowns WHERE until <= ?", (moment,))
+            self._db.commit()
+        rows = self._db.execute(
+            "SELECT executor,kind,detail,origin,task_id,until FROM cooldowns ORDER BY executor"
+        ).fetchall()
+        return [{**dict(row), "until": _parse_dt(row["until"])} for row in rows]
+
+    async def delete_cooldowns(self, executors: list[str] | None = None) -> None:
+        async with self._write_lock:
+            if executors is None:
+                self._db.execute("DELETE FROM cooldowns")
+            else:
+                self._db.executemany(
+                    "DELETE FROM cooldowns WHERE executor=?", [(name,) for name in executors]
+                )
+            self._db.commit()
+
     async def list_events(self, task_id: str) -> list[dict]:
         rows = self._db.execute(
             "SELECT id,task_id,ts,kind,payload_json FROM events WHERE task_id=? ORDER BY id",

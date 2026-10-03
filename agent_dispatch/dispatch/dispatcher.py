@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import subprocess
 import time
 import uuid
 from collections.abc import AsyncIterator, Coroutine
@@ -12,10 +13,10 @@ from pathlib import Path
 from agent_dispatch.config import Settings
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import build_task_package, render_prompt
-from agent_dispatch.executors import worktree
+from agent_dispatch.executors import workspace, worktree
 from agent_dispatch.executors.base import ExecutorAdapter, RunContext
 from agent_dispatch.executors.env import child_env
-from agent_dispatch.executors.health import classify_failure
+from agent_dispatch.executors.health import classify_failure, cooldown_seconds, failure_scope
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     FINAL_STATUSES,
@@ -30,7 +31,7 @@ from agent_dispatch.models import (
 )
 from agent_dispatch.routing.base import Router
 from agent_dispatch.routing.decision import decide_with_fallback
-from agent_dispatch.routing.guards import candidates, pre_guards
+from agent_dispatch.routing.guards import candidates, pre_guards, review_only_executors
 from agent_dispatch.telemetry.storage import Storage
 
 
@@ -234,6 +235,7 @@ class Dispatcher:
         exclude: set[str] | frozenset[str] = frozenset(),
     ) -> Routing:
         await self.availability.check_all()
+        review_only = review_only_executors(req, self.settings)
         unavailable = self.availability.unavailable() | set(exclude)
         parent_exists = (
             await self.storage.task_exists(req.parent_task_id) if req.parent_task_id else False
@@ -242,8 +244,8 @@ class Dispatcher:
         if req.parent_task_id and not is_escalation:
             # Ретраи эскалации не съедают квоту fan-out родителя, cancelled тоже.
             siblings = await self.storage.count_children(req.parent_task_id, exclude_escalated=True)
-        verdict = pre_guards(req, self.settings, unavailable, parent_exists, siblings)
-        names = candidates(self.settings, unavailable, req.source_agent, req.hop)
+        verdict = pre_guards(req, self.settings, unavailable, parent_exists, siblings, review_only)
+        names = candidates(self.settings, unavailable | review_only, req.source_agent, req.hop)
         if isinstance(verdict, GuardEvent):
             cooldown = self.availability.cooldown(verdict.executor) if verdict.executor else None
             if verdict.reason == GuardReason.unavailable and cooldown is not None:
@@ -386,13 +388,19 @@ class Dispatcher:
         self, record: TaskRecord, decision: RouteDecision, adapter: ExecutorAdapter
     ) -> None:
         req, task_id = record.request, record.task_id
+        review = req.kind == "review"
+        # Ревью читает рабочую копию как есть: worktree от HEAD не видел бы
+        # незакоммиченного диффа, который и просят проверить. Ничего не правит,
+        # поэтому и lock на рабочую копию ему не нужен.
         mode = req.workspace_mode or self.settings.execution.workspace_mode
+        if review:
+            mode = "in_place"
         semaphore = self._semaphore if req.hop == 0 else contextlib.nullcontext()
         # В режиме worktree исполнители не делят дерево, поэтому lock нужен
         # только на время переноса результата обратно в рабочую копию.
         lock = (
             self._cwd_lock(req.cwd)
-            if req.hop == 0 and mode == "in_place"
+            if req.hop == 0 and mode == "in_place" and not review
             else contextlib.nullcontext()
         )
         async with semaphore, lock:
@@ -415,6 +423,7 @@ class Dispatcher:
                     "spawn",
                     {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
                 )
+                before = await self._review_fingerprint(req) if review else None
                 try:
                     result = await adapter.execute(ctx)
                 except Exception as exc:
@@ -425,8 +434,17 @@ class Dispatcher:
                         summary="",
                         error=f"{type(exc).__name__}: {exc}",
                     )
+                if review:
+                    await self._check_review_wrote_nothing(req, before, result)
                 await self._note_executor_failure(record, decision, result)
-                plan = await self._plan_escalation(record, decision, result)
+                # Ревью, после которого изменилась рабочая копия, не эскалируется:
+                # иначе вызывающий получил бы ответ следующего ревьюера без
+                # предупреждения о правках первого.
+                plan = (
+                    None
+                    if review and result.meta.get("warning")
+                    else await self._plan_escalation(record, decision, result)
+                )
                 if tree is not None:
                     # Работу, которую переделает следующий исполнитель, в рабочую
                     # копию не переносим: он стартует с HEAD, и его патч лёг бы
@@ -444,6 +462,29 @@ class Dispatcher:
                 if target is not None:
                     await self._note_kept_worktree(record, *target, exc)
                 raise
+
+    @staticmethod
+    async def _review_fingerprint(req: DispatchRequest) -> str | None:
+        try:
+            return await asyncio.to_thread(workspace.fingerprint, req.cwd)
+        except subprocess.CalledProcessError:
+            return None
+
+    async def _check_review_wrote_nothing(
+        self, req: DispatchRequest, before: str | None, result: ExecutionResult
+    ) -> None:
+        """Предупредить, если рабочая копия изменилась за время ревью.
+
+        Режим только чтения задаёт CLI, и он не гарантия. Правки не откатываются:
+        это рабочая копия вызывающего, и решать о ней ему. Ревью идёт без lock,
+        поэтому изменение мог сделать и параллельный запуск; предупреждение
+        говорит о факте, а не о виновнике.
+        """
+        after = await self._review_fingerprint(req)
+        if result.changed_files:
+            result.meta["warning"] = "review changed files: " + ", ".join(result.changed_files)
+        elif before is not None and after is not None and before != after:
+            result.meta["warning"] = "working copy changed during the review"
 
     async def _build_context(
         self, record: TaskRecord, decision: RouteDecision, tree: worktree.Worktree | None
@@ -473,11 +514,18 @@ class Dispatcher:
                     "AGENT_DISPATCH_TASK_ID": record.task_id,
                     "AGENT_DISPATCH_ROOT_AGENT": record.root_agent.value,
                     "AGENT_DISPATCH_HOP": str(req.hop + 1),
+                    # Источник вложенного вызова это сам исполнитель. Без этого
+                    # MCP-прокси внутри codex унаследовал бы источник демона
+                    # (того, кто его поднял), и правило review_only не сработало бы.
+                    "AGENT_DISPATCH_SOURCE_AGENT": self.settings.executors[
+                        decision.executor
+                    ].adapter,
                 },
             ),
             log_path=Path(record.log_path),
             task_id=record.task_id,
             prompt=prompt,
+            read_only=req.kind == "review",
         )
 
     async def _note_executor_failure(
@@ -488,23 +536,76 @@ class Dispatcher:
         if kind is None:
             return
         result.meta["executor_failure"] = kind
-        cooldown = self.availability.trip(
-            decision.executor,
+        error = result.error or ""
+        routing = self.settings.routing
+        configured = self.settings.executors.get(decision.executor)
+        seconds = cooldown_seconds(
             kind,
-            result.error or "",
-            self.settings.routing.failure_cooldown_seconds,
+            error,
+            self._now(),
+            failure_seconds=routing.failure_cooldown_seconds,
+            quota_seconds=routing.quota_cooldown_seconds,
+            recheck=configured is not None and configured.limit_reset == "recheck",
         )
-        if cooldown is None:
+        members = self._limit_group(decision.executor, failure_scope(kind, error))
+        tripped: dict[str, datetime] = {}
+        for name in members:
+            cooldown = self.availability.trip(name, kind, error, seconds, origin=decision.executor)
+            if cooldown is None:
+                continue
+            tripped[name] = cooldown.until_utc
+            await self.storage.save_cooldown(
+                name,
+                kind=cooldown.kind,
+                detail=cooldown.detail,
+                origin=cooldown.origin,
+                until=cooldown.until_utc,
+                task_id=record.task_id,
+            )
+        if decision.executor not in tripped:
             return
+        until = tripped[decision.executor].isoformat(timespec="seconds")
+        result.meta["cooldown_until"] = until
         await self.storage.add_event(
             record.task_id,
             "cooldown",
             {
                 "executor": decision.executor,
                 "kind": kind,
-                "until": cooldown.until_utc.isoformat(),
+                "until": until,
+                "executors": sorted(tripped),
             },
         )
+
+    def _limit_group(self, executor: str, scope: str) -> list[str]:
+        """Исполнитель и все, кто делит с ним лимит (scope `group`)."""
+        configured = self.settings.executors.get(executor)
+        if scope != "group" or configured is None:
+            return [executor]
+        group = configured.resolved_limit_group(executor)
+        return [executor] + [
+            name
+            for name, item in self.settings.executors.items()
+            if name != executor and item.enabled and item.resolved_limit_group(name) == group
+        ]
+
+    async def restore_cooldowns(self) -> int:
+        """Вернуть остывания из базы после перезапуска демона."""
+        count = 0
+        for row in await self.storage.active_cooldowns(self._now()):
+            if row["executor"] not in self.settings.executors:
+                continue
+            restored = self.availability.restore(
+                row["executor"], row["kind"], row["detail"], row["until"], row["origin"]
+            )
+            count += restored is not None
+        return count
+
+    async def clear_cooldowns(self, names: list[str] | None = None) -> list[str]:
+        """Снять остывание вручную: лимит подняли или сбросили раньше срока."""
+        cleared = self.availability.clear(set(names) if names is not None else None)
+        await self.storage.delete_cooldowns(names)
+        return cleared
 
     async def _plan_escalation(
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
@@ -518,7 +619,11 @@ class Dispatcher:
         if failure:
             reason = f"executor_{failure}"
         tried = await self._escalation_chain(record)
-        unavailable = self.availability.unavailable()
+        # Цепочка эскалации подчиняется тому же правилу ревью, что и роутер:
+        # иначе задача Codex дошла бы до Claude через `codex/sol: [claude/opus]`.
+        unavailable = self.availability.unavailable() | review_only_executors(
+            record.request, self.settings
+        )
         nxt = next_executor(decision.executor, self.settings, tried, unavailable)
         return EscalationPlan(
             reason=reason, tried=tried, executor=nxt, reroute=nxt is None and bool(failure)

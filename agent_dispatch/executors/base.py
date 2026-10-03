@@ -26,6 +26,33 @@ class RunContext(BaseModel):
     log_path: Path
     task_id: str
     prompt: str
+    #: Ревью: исполнитель только читает. Адаптер переводит CLI в режим без правок.
+    read_only: bool = False
+
+
+def strip_flags(
+    args: list[str], with_value: set[str], boolean: set[str] = frozenset()
+) -> list[str]:
+    """`extra_args` без флагов, которые режим только чтения задаёт сам.
+
+    Повтор флага codex отвергает («cannot be used multiple times»), а у claude
+    последний `--permission-mode` из конфига снял бы режим ревью. Поэтому
+    конфликтующие флаги убираются, а не перекрываются.
+    """
+    result: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        name = arg.split("=", 1)[0]
+        if name in boolean:
+            continue
+        if name in with_value:
+            skip = "=" not in arg
+            continue
+        result.append(arg)
+    return result
 
 
 class ExecutorAdapter(Protocol):

@@ -76,11 +76,32 @@ class RoutingSettings(_ConfigModel):
     #: повторится на любой задаче: лимит расходов, перегруженная модель, отказ
     #: авторизации, обрыв сети. 0 выключает остывание.
     failure_cooldown_seconds: int = Field(900, ge=0)
+    #: Остывание после исчерпанного лимита, если CLI не сказал, когда лимит
+    #: сбросится. Когда сказал («resets 5am», «Try again at 5:02 PM»),
+    #: исполнитель остывает ровно до сброса. 0 в `failure_cooldown_seconds`
+    #: выключает и это.
+    quota_cooldown_seconds: int = Field(3600, ge=1)
+    #: Источник -> адаптеры, которым он вправе отдать только ревью (`kind: review`),
+    #: но не задачу на правку. По умолчанию Codex не тратит токены Claude на
+    #: работу, которую делает сам, а просит у него только ревью.
+    review_only: dict[str, list[str]] = Field(default_factory=lambda: {"codex": ["claude"]})
 
     @model_validator(mode="after")
     def validate_thresholds(self) -> RoutingSettings:
         if self.autonomous_confidence < self.min_confidence:
             raise ValueError("autonomous_confidence must be >= min_confidence")
+        return self
+
+    @model_validator(mode="after")
+    def validate_review_only(self) -> RoutingSettings:
+        sources = {"claude", "codex", "opencode", "cli", "unknown"}
+        adapters = {"claude", "codex", "opencode"}
+        for source, targets in self.review_only.items():
+            if source not in sources:
+                raise ValueError(f"review_only.{source}: unknown source agent")
+            for target in targets:
+                if target not in adapters:
+                    raise ValueError(f"review_only.{source}: unknown adapter {target!r}")
         return self
 
 
@@ -111,6 +132,15 @@ class ExecutorSettings(_ConfigModel):
     tier: Literal["fast", "balanced", "strong"] = "balanced"
     #: Исполнитель внутри корпоративного периметра: данные не уходят наружу.
     corporate: bool = False
+    #: Исполнители с общим лимитом: исчерпанный лимит одного выводит из ротации
+    #: всю группу. По умолчанию у claude и codex это адаптер (один аккаунт на
+    #: все модели), у opencode провайдер из `model`.
+    limit_group: str | None = None
+    #: `announced` держит исполнителя до сброса, названного в сообщении CLI.
+    #: `recheck` для пула аккаунтов за балансировщиком (codex-lb): названный
+    #: сброс относится к одному аккаунту, следующий запрос уйдёт на другой,
+    #: поэтому исполнитель перепроверяется через `routing.quota_cooldown_seconds`.
+    limit_reset: Literal["announced", "recheck"] = "announced"
 
     @model_validator(mode="after")
     def validate_adapter(self) -> ExecutorSettings:
@@ -121,6 +151,14 @@ class ExecutorSettings(_ConfigModel):
     @property
     def resolved_command(self) -> str:
         return self.command or self.adapter
+
+    def resolved_limit_group(self, name: str) -> str:
+        if self.limit_group:
+            return self.limit_group
+        if self.adapter == "opencode":
+            provider = (self.model or "").split("/", 1)
+            return f"opencode:{provider[0]}" if len(provider) == 2 else name
+        return self.adapter
 
 
 class Settings(_ConfigModel):

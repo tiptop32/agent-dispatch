@@ -6,6 +6,7 @@ from agent_dispatch.config import ExecutorSettings
 from agent_dispatch.executors.base import (
     BaseExecutorAdapter,
     RunContext,
+    strip_flags,
 )
 from agent_dispatch.executors.process import ProcessOutcome, run_cli
 from agent_dispatch.executors.result_parser import extract_result_block, normalize
@@ -21,6 +22,10 @@ class OpenCodeAdapter(BaseExecutorAdapter):
         super().__init__(name, settings, base_env)
 
     async def execute(self, ctx: RunContext) -> ExecutionResult:
+        extra = self.settings.extra_args
+        if ctx.read_only:
+            # Встроенный агент `plan` в OpenCode запрещает правку файлов.
+            extra = [*strip_flags(extra, {"--agent"}), "--agent", "plan"]
         argv = [
             self.command,
             "run",
@@ -30,7 +35,7 @@ class OpenCodeAdapter(BaseExecutorAdapter):
             ctx.cwd,
             "--model",
             self.settings.model,
-            *self.settings.extra_args,
+            *extra,
             ctx.prompt,
         ]
         return await self._execute_common(

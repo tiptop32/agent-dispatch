@@ -32,6 +32,8 @@ class Cooldown:
     detail: str
     until: float
     until_utc: datetime
+    #: Исполнитель, чей отказ вывел этого из ротации (для группы с общим лимитом).
+    origin: str = ""
 
 
 class AvailabilityCache:
@@ -81,8 +83,14 @@ class AvailabilityCache:
         down = {name for name, value in self._values.items() if not value.available}
         return down | set(self.cooldowns())
 
-    def trip(self, name: str, kind: str, detail: str, seconds: float) -> Cooldown | None:
-        """Вывести исполнителя из ротации на `seconds`; 0 выключает механизм."""
+    def trip(
+        self, name: str, kind: str, detail: str, seconds: float, origin: str = ""
+    ) -> Cooldown | None:
+        """Вывести исполнителя из ротации на `seconds`; 0 выключает механизм.
+
+        Более длинное действующее остывание не укорачивается: отказ соседа по
+        группе с «Try again later» не должен снять недельный лимит.
+        """
         if seconds <= 0:
             return None
         cooldown = Cooldown(
@@ -90,9 +98,38 @@ class AvailabilityCache:
             detail=detail[:300],
             until=self.clock() + seconds,
             until_utc=datetime.now(UTC) + timedelta(seconds=seconds),
+            origin=origin or name,
+        )
+        current = self.cooldown(name)
+        if current is not None and current.until >= cooldown.until:
+            return current
+        self._cooldowns[name] = cooldown
+        return cooldown
+
+    def restore(
+        self, name: str, kind: str, detail: str, until_utc: datetime, origin: str = ""
+    ) -> Cooldown | None:
+        """Вернуть остывание, записанное до перезапуска демона; истёкшее не вернётся."""
+        seconds = (until_utc - datetime.now(UTC)).total_seconds()
+        if seconds <= 0:
+            return None
+        cooldown = Cooldown(
+            kind=kind,
+            detail=detail[:300],
+            until=self.clock() + seconds,
+            until_utc=until_utc,
+            origin=origin or name,
         )
         self._cooldowns[name] = cooldown
         return cooldown
+
+    def clear(self, names: set[str] | None = None) -> list[str]:
+        """Снять остывание вручную (лимит подняли раньше сброса); вернуть снятые."""
+        active = self.cooldowns()
+        cleared = sorted(active if names is None else set(active) & names)
+        for name in cleared:
+            del self._cooldowns[name]
+        return cleared
 
     def cooldown(self, name: str) -> Cooldown | None:
         cooldown = self._cooldowns.get(name)

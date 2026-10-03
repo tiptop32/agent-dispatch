@@ -38,6 +38,8 @@ def create_app(
         await storage.open()
         recovered = await dispatcher.recover_stale()
         logging.getLogger("agent_dispatch.api").info("recovered %d stale tasks", recovered)
+        restored = await dispatcher.restore_cooldowns()
+        logging.getLogger("agent_dispatch.api").info("restored %d cooldowns", restored)
         await availability.check_all()
         try:
             yield

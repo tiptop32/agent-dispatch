@@ -100,7 +100,17 @@ async def test_localhost_accepted(api):
 async def test_executors(api):
     data = (await api[0].get("/executors", headers=headers())).json()
     assert {x["name"] for x in data} == {"codex", "claude"}
-    fields = {"name", "adapter", "model", "enabled", "available", "version", "checked_at", "error"}
+    fields = {
+        "name",
+        "adapter",
+        "model",
+        "enabled",
+        "available",
+        "version",
+        "checked_at",
+        "error",
+        "cooldown",
+    }
     assert all(set(item) == fields and item["available"] is True for item in data)
 
 

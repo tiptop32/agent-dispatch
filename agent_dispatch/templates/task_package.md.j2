@@ -1,5 +1,16 @@
 # Task
 {{ task }}
+{% if review %}
+
+# Review only
+This is a review request. Read the code and report findings. Do NOT create, modify or delete any file: your tools are read-only, and the caller fixes what you find. Put the findings in `summary`, most severe first, each with `path:line`, what is wrong and the concrete failure it causes. Leave `changed_files` empty. If you find nothing worth fixing, say so plainly.
+
+## Working copy
+$ git status --short
+{{ git_status or "(clean)" }}
+$ git diff HEAD
+{{ git_diff or "(no changes against HEAD)" }}
+{% endif %}
 
 # Workspace
 cwd: {{ cwd }}
@@ -23,10 +34,11 @@ $ git diff --stat
 {% endif %}
 # Delegation
 This task was delegated by {{ source_agent }} via AgentDispatch (hop {{ hop }} of {{ max_hops }}).
-{% if hop + 1 >= max_hops %}Do NOT delegate further: the hop limit is reached.{% else %}You may split this task into at most {{ max_children }} independent subtasks and delegate each with the AgentDispatch `dispatch` tool; the router picks the best agent for each. Do not delegate the whole task as-is. {% if worktree %}Each subtask gets its own worktree, so they cannot collide.{% else %}Subtasks share this working tree: give each a disjoint `files` list.{% endif %}{% endif %}
+{% if review %}Do NOT delegate this review: answer it yourself.{% elif hop + 1 >= max_hops %}Do NOT delegate further: the hop limit is reached.{% else %}You may split this task into at most {{ max_children }} independent subtasks and delegate each with the AgentDispatch `dispatch` tool; the router picks the best agent for each. Do not delegate the whole task as-is. {% if worktree %}Each subtask gets its own worktree, so they cannot collide.{% else %}Subtasks share this working tree: give each a disjoint `files` list.{% endif %}{% endif %}
 
 # Rules
-Do not commit or push: leave all changes in the working tree, the caller reviews and commits.
+{% if review %}Do not edit files, commit or push.{% else %}Do not commit or push: leave all changes in the working tree, the caller reviews and commits.{% endif %}
+
 
 # Result format
 {{ result_instructions }}

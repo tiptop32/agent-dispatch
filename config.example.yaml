@@ -34,6 +34,13 @@ routing:
   # лимит расходов, перегруженная модель, отказ авторизации, обрыв сети:
   # исполнитель выходит из ротации на столько секунд; 0 выключает
   failure_cooldown_seconds: 900
+  # исчерпанный лимит держит исполнителя до сброса из сообщения CLI
+  # («resets 5am», «Try again at 5:02 PM»); если сброс не назван, столько секунд.
+  # Вместе с ним остывают все, у кого тот же limit_group (claude/*, codex/*).
+  quota_cooldown_seconds: 3600
+  # источник -> адаптеры, которым он отдаёт только ревью (kind: review), не задачи
+  review_only:
+    codex: [claude]
 
 execution:
   workspace_mode: in_place    # worktree: каждому исполнителю свой git worktree

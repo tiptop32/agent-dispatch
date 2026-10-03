@@ -23,6 +23,7 @@ def pre_guards(
     unavailable: set[str],
     parent_exists: bool,
     sibling_count: int,
+    review_only: set[str] | frozenset[str] = frozenset(),
 ) -> GuardEvent | RouteDecision | None:
     if not is_git_repo(req.cwd):
         return _event(GuardReason.bad_cwd, f"cwd is not a git repository: {req.cwd}")
@@ -39,6 +40,14 @@ def pre_guards(
         if req.executor not in settings.executors or not settings.executors[req.executor].enabled:
             return _event(
                 GuardReason.disabled, f"executor is disabled: {req.executor}", req.executor
+            )
+        if req.executor in review_only:
+            return _event(
+                GuardReason.review_only,
+                f"{req.executor} takes only reviews from {req.source_agent.value}:"
+                " pass kind='review' to ask for a review, or dispatch without executor"
+                " so the router picks someone else for the work",
+                req.executor,
             )
         if req.executor in unavailable:
             return _event(
@@ -101,8 +110,16 @@ def post_guards(
     result = decision.model_copy(deep=True)
     result.confidence_tier = classify_confidence(result.confidence, settings)
     events: list[GuardEvent] = []
-    ranked = sorted(result.scores.items(), key=lambda item: item[1], reverse=True)
-    top1 = ranked[0][0] if ranked else result.executor
+    # Оценки исполнителей вне кандидатов не в счёт: роутер (claude_local)
+    # может вернуть их, и тогда подмена fallback увела бы задачу к тому, кого
+    # guards исключили (остывающему или закрытому правилом review_only).
+    allowed = set(candidates)
+    ranked = sorted(
+        ((name, score) for name, score in result.scores.items() if name in allowed),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    top1 = ranked[0][0] if ranked else (candidates[0] if candidates else result.executor)
     top_score = ranked[0][1] if ranked else result.confidence
     second_score = ranked[1][1] if len(ranked) > 1 else 0.0
     if result.confidence < settings.routing.min_confidence:
@@ -122,4 +139,22 @@ def post_guards(
         warning = f"fallback executor unavailable: {settings.routing.fallback_executor}"
         result.meta["warning"] = warning
         events.append(_event(GuardReason.unavailable, warning, settings.routing.fallback_executor))
+    if candidates and result.executor not in allowed:
+        chosen = result.executor
+        result.executor = top1
+        events.append(
+            _event(GuardReason.unavailable, f"router chose a non-candidate: {chosen}", chosen)
+        )
     return result, events
+
+
+def review_only_executors(req: DispatchRequest, settings: Settings) -> set[str]:
+    """Исполнители, которым этот источник может отдать только ревью, а не задачу.
+
+    Правило `routing.review_only` бережёт токены дорогого исполнителя: Codex
+    делает работу сам или отдаёт её дешёвым, а у Claude просит только ревью.
+    """
+    if req.kind == "review":
+        return set()
+    adapters = set(settings.routing.review_only.get(req.source_agent.value, []))
+    return {name for name, item in settings.executors.items() if item.adapter in adapters}

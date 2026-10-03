@@ -119,10 +119,12 @@ def _request(
     wait: int = 1800,
     timeout: int | None = None,
     allow_escalation: bool = True,
+    kind: str = "task",
 ) -> DispatchRequest:
     return DispatchRequest(
         task=task,
         cwd=cwd,
+        kind=kind,
         context=context,
         files=files or [],
         constraints=constraints or [],
@@ -172,9 +174,14 @@ def route(
     context: str | None = typer.Option(None),
     files: list[str] | None = typer.Option(None, "--file"),  # noqa: B008
     constraints: list[str] | None = typer.Option(None, "--constraint"),  # noqa: B008
+    kind: str = typer.Option(
+        "task", help="task changes code; review reads the working copy and reports findings."
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-    decision = _daemon_call("route", _request(task, cwd, context, files, constraints), start=True)
+    decision = _daemon_call(
+        "route", _request(task, cwd, context, files, constraints, kind=kind), start=True
+    )
     if as_json:
         typer.echo(decision.model_dump_json(indent=2))
         return
@@ -200,6 +207,9 @@ def dispatch(
     timeout: int | None = typer.Option(None, min=1),
     poll_seconds: float = typer.Option(2.0, "--poll", min=0.0, help="Polling interval in seconds."),
     no_escalation: bool = typer.Option(False, "--no-escalation"),
+    kind: str = typer.Option(
+        "task", help="task changes code; review reads the working copy and reports findings."
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     views = asyncio.run(
@@ -215,6 +225,7 @@ def dispatch(
                 wait=wait,
                 timeout=timeout,
                 allow_escalation=not no_escalation,
+                kind=kind,
             ),
             wait,
             poll_seconds,
@@ -244,11 +255,23 @@ def list_executors() -> None:
     rows = _daemon_call("executors")
     typer.echo("name\tadapter\tmodel\tenabled\tavailable\tversion/error")
     for row in rows:
-        version_or_error = row.get("version") or row.get("error") or "-"
+        # Остывание важнее версии: CLI установлен, но лимит исчерпан.
+        version_or_error = (
+            row.get("error") if row.get("cooldown") else row.get("version") or row.get("error")
+        ) or "-"
         typer.echo(
             f"{row['name']}\t{row['adapter']}\t{row.get('model') or '-'}\t"
             f"{row['enabled']}\t{row.get('available')}\t{version_or_error}"
         )
+
+
+@app.command(
+    "cooldown-clear",
+    help="Return executors to rotation before their usage limit resets (all if none given).",
+)
+def cooldown_clear(names: list[str] | None = typer.Argument(None)) -> None:  # noqa: B008
+    cleared = _daemon_call("clear_cooldowns", names or None)
+    typer.echo(f"cleared: {', '.join(cleared) if cleared else '(none)'}")
 
 
 @app.command("worktrees", help="List or clean up AgentDispatch worktrees of a repository.")
