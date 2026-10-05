@@ -93,13 +93,8 @@ class AvailabilityCache:
         """
         if seconds <= 0:
             return None
-        cooldown = Cooldown(
-            kind=kind,
-            detail=detail[:300],
-            until=self.clock() + seconds,
-            until_utc=datetime.now(UTC) + timedelta(seconds=seconds),
-            origin=origin or name,
-        )
+        until_utc = datetime.now(UTC) + timedelta(seconds=seconds)
+        cooldown = self._cooldown(name, kind, detail, seconds, until_utc, origin)
         current = self.cooldown(name)
         if current is not None and current.until >= cooldown.until:
             return current
@@ -113,15 +108,20 @@ class AvailabilityCache:
         seconds = (until_utc - datetime.now(UTC)).total_seconds()
         if seconds <= 0:
             return None
-        cooldown = Cooldown(
+        cooldown = self._cooldown(name, kind, detail, seconds, until_utc, origin)
+        self._cooldowns[name] = cooldown
+        return cooldown
+
+    def _cooldown(
+        self, name: str, kind: str, detail: str, seconds: float, until_utc: datetime, origin: str
+    ) -> Cooldown:
+        return Cooldown(
             kind=kind,
             detail=detail[:300],
             until=self.clock() + seconds,
             until_utc=until_utc,
             origin=origin or name,
         )
-        self._cooldowns[name] = cooldown
-        return cooldown
 
     def clear(self, names: set[str] | None = None) -> list[str]:
         """Снять остывание вручную (лимит подняли раньше сброса); вернуть снятые."""
