@@ -335,3 +335,16 @@ async def test_cancelled_root_task_releases_cwd_lock(tmp_path, git_repo):
     await d.cancel(r.task_id, wait_seconds=WAIT)
     await asyncio.sleep(0)
     assert not d._cwd_locks
+
+
+@pytest.mark.asyncio
+async def test_worker_cancelled_before_start_is_recorded_cancelled(tmp_path, git_repo):
+    # Отмена до первого шага `_run` (shutdown сразу после submit) доходит только
+    # до done-колбэка; задача не должна остаться queued до перезапуска демона.
+    _, st, _, d = await _make(tmp_path)
+    record = await d.submit(_req(git_repo))
+    d._tasks[record.task_id].cancel()
+    await d.shutdown()
+    stored = await st.get_task(record.task_id)
+    assert stored.status == TaskStatus.cancelled
+    assert stored.result is not None and stored.result.error == "cancelled"

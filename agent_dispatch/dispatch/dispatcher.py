@@ -69,6 +69,32 @@ class EscalationPlan:
         return self.executor is not None or self.reroute
 
 
+def _failed_result(
+    record: TaskRecord, error: str | None, meta: dict[str, object] | None = None
+) -> ExecutionResult:
+    """Отказ на месте прежнего результата задачи.
+
+    meta прежнего результата переносится, если не задана явно: в ней путь
+    оставшегося worktree, и терять его вместе с результатом нельзя. Статус
+    всегда `failed`: `cancelled` нет в TerminalStatus, статус задачи живёт в
+    `record.status`, у результата остаётся только причина.
+    """
+    previous = record.result
+    return ExecutionResult(
+        status="failed",
+        executor=record.decision.executor if record.decision else "",
+        model=previous.model if previous else None,
+        summary=previous.summary if previous else "",
+        error=error,
+        meta=dict(previous.meta if previous else {}) if meta is None else meta,
+    )
+
+
+def _not_integrated(result: ExecutionResult, error: str) -> None:
+    result.meta["integrated"] = False
+    result.meta["integration_error"] = error
+
+
 class Dispatcher:
     def __init__(
         self,
@@ -190,17 +216,11 @@ class Dispatcher:
             ):
                 record.status = TaskStatus.failed
                 record.finished_at = self._now()
-                record.result = ExecutionResult(
-                    status="failed",
-                    executor=record.decision.executor if record.decision else "",
-                    model=None,
-                    summary="",
-                    error="daemon restarted",
-                    # Демон умер вместе со знанием о worktree задачи. Путь
-                    # восстанавливается из события, иначе дерево осталось бы
-                    # на диске, не упомянутое ни в одной записи.
-                    meta=await self._worktree_meta(record.task_id),
-                )
+                # Демон умер вместе со знанием о worktree задачи. Путь
+                # восстанавливается из события, иначе дерево осталось бы
+                # на диске, не упомянутое ни в одной записи.
+                meta = await self._worktree_meta(record.task_id)
+                record.result = _failed_result(record, "daemon restarted", meta)
                 await self.storage.add_event(record.task_id, "exit", {"status": "failed"})
                 await self.storage.update_task(record)
                 count += 1
@@ -297,19 +317,13 @@ class Dispatcher:
         try:
             record = await self.storage.get_task(task_id)
             if record and record.status not in FINAL_STATUSES:
-                record.status = TaskStatus.cancelled if worker.cancelled() else TaskStatus.failed
+                # Отмену до первого шага `_run` (shutdown сразу после submit)
+                # или посреди `_mark_cancelled` записывает только этот колбэк.
+                cancelled = worker.cancelled()
+                record.status = TaskStatus.cancelled if cancelled else TaskStatus.failed
                 record.finished_at = self._now()
-                record.result = ExecutionResult(
-                    status=record.status.value,
-                    executor=record.decision.executor if record.decision else "",
-                    model=None,
-                    summary="",
-                    error="worker stopped unexpectedly"
-                    if record.status == TaskStatus.failed
-                    else None,
-                    # Тот же перенос meta, что и в `_mark_failed`: путь
-                    # оставшегося worktree переживает подмену результата.
-                    meta=dict(record.result.meta) if record.result else {},
+                record.result = _failed_result(
+                    record, "cancelled" if cancelled else "worker stopped unexpectedly"
                 )
                 await self.storage.update_task(record)
                 await self.storage.add_event(task_id, "exit", {"status": record.status.value})
@@ -690,22 +704,15 @@ class Dispatcher:
         if not path.exists():  # noqa: ASYNC240
             return
         cancelled = isinstance(exc, asyncio.CancelledError)
-        meta = dict(record.result.meta) if record.result else {}
-        meta["worktree"], meta["branch"] = str(path), branch
+        result = _failed_result(
+            record, "cancelled" if cancelled else f"{type(exc).__name__}: {exc}"
+        )
+        result.meta["worktree"], result.meta["branch"] = str(path), branch
         # Отмена может прийти и после удачной интеграции, когда дерево оставлено
         # по `keep_worktrees`. Готовый вердикт об интеграции не перебивается:
         # рабочая копия уже изменена, и `integrated: false` был бы ложью.
-        meta.setdefault("integrated", False)
-        record.result = ExecutionResult(
-            status="failed",
-            executor=record.decision.executor if record.decision else "",
-            model=record.result.model if record.result else None,
-            summary=record.result.summary if record.result else "",
-            # `cancelled` нет в TerminalStatus: статус задачи живёт в record.status,
-            # у результата остаётся только причина.
-            error="cancelled" if cancelled else f"{type(exc).__name__}: {exc}",
-            meta=meta,
-        )
+        result.meta.setdefault("integrated", False)
+        record.result = result
         await self.storage.update_task(record)
 
     async def _mark_cancelled(self, record: TaskRecord) -> None:
@@ -717,16 +724,7 @@ class Dispatcher:
         self._notify(record.task_id)
 
     async def _mark_failed(self, record: TaskRecord, exc: BaseException) -> None:
-        # meta уже собранного результата переносится: в ней путь оставшегося
-        # worktree, и терять его вместе с прежним результатом нельзя.
-        record.result = ExecutionResult(
-            status="failed",
-            executor=record.decision.executor if record.decision else "",
-            model=None,
-            summary="",
-            error=f"{type(exc).__name__}: {exc}",
-            meta=dict(record.result.meta) if record.result else {},
-        )
+        record.result = _failed_result(record, f"{type(exc).__name__}: {exc}")
         record.status, record.finished_at = TaskStatus.failed, self._now()
         await self.storage.add_event(record.task_id, "exit", {"status": "failed"})
         await self.storage.update_task(record)
@@ -789,8 +787,7 @@ class Dispatcher:
             )
         except worktree.WorktreeError as exc:
             # Работа цела в worktree, поэтому дерево остаётся вместе с ней.
-            result.meta["integrated"] = False
-            result.meta["integration_error"] = str(exc)
+            _not_integrated(result, str(exc))
             return
         if sha is None:
             result.meta["integrated"] = True
@@ -801,8 +798,7 @@ class Dispatcher:
         try:
             patch = await asyncio.to_thread(worktree.build_patch, tree)
         except worktree.WorktreeError as exc:
-            result.meta["integrated"] = False
-            result.meta["integration_error"] = str(exc)
+            _not_integrated(result, str(exc))
             return
         patch_path = self.settings.server.data_dir / "patches" / f"{task_id}.patch"
         try:
@@ -811,8 +807,7 @@ class Dispatcher:
         except OSError as exc:
             # Патч не лёг на диск: применять нечего, но работа цела на ветке,
             # и дерево остаётся вместе с ней.
-            result.meta["integrated"] = False
-            result.meta["integration_error"] = f"patch not written: {exc}"
+            _not_integrated(result, f"patch not written: {exc}")
             return
         result.meta["patch"] = str(patch_path)
         if hold and execution.integrate == "apply":
@@ -831,8 +826,7 @@ class Dispatcher:
             async with self._cwd_lock(req.cwd):
                 await asyncio.to_thread(worktree.apply_patch, req.cwd, patch_path)
         except worktree.WorktreeError as exc:
-            result.meta["integrated"] = False
-            result.meta["integration_error"] = str(exc)
+            _not_integrated(result, str(exc))
             await self.storage.add_event(
                 task_id, "integrate", {"ok": False, "error": str(exc)[:500]}
             )
