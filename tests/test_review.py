@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -74,6 +75,37 @@ async def _make(tmp_path: Path, results: dict[str, ExecutionResult] | None = Non
     router = CapturingRouter()
     dispatcher = Dispatcher(settings, storage, adapters, AvailabilityCache(adapters, 60), [router])
     return storage, adapters, router, dispatcher
+
+
+async def _capacity(
+    tmp_path: Path, tasks: int = 2, reviews: int = 1
+) -> tuple[Storage, dict[str, FakeAdapter], CapturingRouter, Dispatcher]:
+    """Диспетчер с явными пределами задач и ревью и незанятыми адаптерами."""
+    settings = _settings(tmp_path)
+    settings = settings.model_copy(
+        update={
+            "server": settings.server.model_copy(
+                update={"max_concurrent_tasks": tasks, "max_concurrent_reviews": reviews}
+            )
+        }
+    )
+    storage = Storage(tmp_path / "db.sqlite")
+    await storage.open()
+    adapters = {name: FakeAdapter(name) for name in settings.executors}
+    router = CapturingRouter()
+    dispatcher = Dispatcher(settings, storage, adapters, AvailabilityCache(adapters, 60), [router])
+    return storage, adapters, router, dispatcher
+
+
+def _blocked(adapters: dict[str, FakeAdapter], name: str) -> FakeAdapter:
+    """Адаптер, который стартует и висит на гейте, пока его не отпустят."""
+    gated = FakeAdapter(name, gate=asyncio.Event())
+    adapters[name] = gated
+    return gated
+
+
+async def _wait_started(adapter: FakeAdapter, seconds: float = WAIT) -> None:
+    await asyncio.wait_for(adapter.started.wait(), seconds)
 
 
 def _req(repo: Path, source: str = "codex", **kwargs) -> DispatchRequest:
@@ -166,6 +198,103 @@ async def test_review_that_edits_files_is_reported(tmp_path, git_repo):
     _, _, _, dispatcher = await _make(tmp_path, {"claude/opus": edited})
     done = await _run(dispatcher, _req(git_repo, executor="claude/opus", kind="review"))
     assert done.result.meta["warning"] == "review changed files: a.py"
+
+
+# --- отдельная ёмкость корневых ревью -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_root_review_starts_while_coding_slots_are_saturated(tmp_path, git_repo):
+    # Долгие корневые задачи (2 из 2 слотов) не должны оставлять ревью без слота.
+    _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
+    coding = _blocked(adapters, "opencode/a")
+    first = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
+    second = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
+    review = await dispatcher.submit(_req(git_repo, executor="claude/opus", kind="review"))
+    await _wait_started(coding)
+    # Ревью стартует, пока оба задачных слота заняты заблокированными задачами.
+    await _wait_started(adapters["claude/opus"])
+    for task_id in (first.task_id, second.task_id, review.task_id):
+        await dispatcher.cancel(task_id)
+
+
+@pytest.mark.asyncio
+async def test_excess_root_review_queues_in_its_own_capacity(tmp_path, git_repo):
+    # Ёмкость ревью 1: второе ревью ждёт, даже когда свободен слот задачи.
+    _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
+    reviewer = _blocked(adapters, "claude/opus")
+    waiting = _blocked(adapters, "opencode/a")
+    first = await dispatcher.submit(_req(git_repo, executor="claude/opus", kind="review"))
+    second = await dispatcher.submit(_req(git_repo, executor="opencode/a", kind="review"))
+    await _wait_started(reviewer)
+    with pytest.raises(asyncio.TimeoutError):
+        # Ревью не может стартовать при занятой ревью-ёмкости; короткий предел
+        # здесь безопасен: пока первый не отпущен, второму стартовать нечем.
+        await asyncio.wait_for(waiting.started.wait(), 0.1)
+    reviewer.gate.set()
+    await _wait_started(waiting)
+    # Первый уже завершён гейтом: отменять можно только незавершённое.
+    record = await dispatcher.get(first.task_id)
+    if record and record.status not in ("completed", "failed"):
+        await dispatcher.cancel(first.task_id)
+    await dispatcher.cancel(second.task_id)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_coding_task_releases_its_slot(tmp_path, git_repo):
+    _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
+    coding = _blocked(adapters, "opencode/a")
+    queued = _blocked(adapters, "opencode/b")
+    first = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
+    second = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
+    third = await dispatcher.submit(_req(git_repo, executor="opencode/b"))
+    await _wait_started(coding)
+    assert not queued.started.is_set()
+    await dispatcher.cancel(first.task_id)
+    # Слот освободился отменой: третья задача стартует без ожидания других.
+    await _wait_started(queued)
+    for task_id in (second.task_id, third.task_id):
+        await dispatcher.cancel(task_id)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_review_releases_review_capacity(tmp_path, git_repo):
+    _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
+    reviewer = _blocked(adapters, "claude/opus")
+    waiting = _blocked(adapters, "opencode/a")
+    first = await dispatcher.submit(_req(git_repo, executor="claude/opus", kind="review"))
+    second = await dispatcher.submit(_req(git_repo, executor="opencode/a", kind="review"))
+    coding = _blocked(adapters, "codex/sol")
+    filler = await dispatcher.submit(_req(git_repo, executor="codex/sol"))
+    await _wait_started(reviewer)
+    assert not waiting.started.is_set()
+    await dispatcher.cancel(first.task_id)
+    await _wait_started(waiting)
+    # Задачный слот никуда не делся: ревью и задача идут одновременно.
+    assert coding.started.is_set()
+    for task_id in (second.task_id, filler.task_id):
+        await dispatcher.cancel(task_id)
+
+
+@pytest.mark.asyncio
+async def test_nested_work_bypasses_both_capacities(tmp_path, git_repo):
+    # Вложенная работа (hop > 0) не ждёт ни пул: иначе исполнитель в подзадаче
+    # ждал бы слот, занятый его же родителем, — взаимная блокировка.
+    _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
+    coding = _blocked(adapters, "opencode/a")
+    reviewer = _blocked(adapters, "claude/opus")
+    parent = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
+    filler = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
+    review = await dispatcher.submit(_req(git_repo, executor="claude/opus", kind="review"))
+    await _wait_started(coding)
+    await _wait_started(reviewer)
+    nested = _blocked(adapters, "opencode/b")
+    child = await dispatcher.submit(
+        _req(git_repo, executor="opencode/b", hop=1, parent_task_id=parent.task_id)
+    )
+    await _wait_started(nested)
+    for task_id in (filler.task_id, review.task_id, child.task_id):
+        await dispatcher.cancel(task_id)
 
 
 # --- адаптеры в режиме только чтения ------------------------------------------

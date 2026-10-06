@@ -1,7 +1,8 @@
 server:
   host: 127.0.0.1
   port: 7433
-  max_concurrent_tasks: 2
+  max_concurrent_tasks: 2     # корневые задачи на правку; максимум корневых процессов демона = это число + max_concurrent_reviews
+  max_concurrent_reviews: 1   # корневые ревью в собственной ёмкости: долгие задачи их не блокируют, лишние ревью ждут
   data_dir: ~/.local/share/agent-dispatch
 
 mcp:

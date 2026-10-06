@@ -6,6 +6,8 @@ cwd: /repo/project
 # Delegation
 This task was delegated by codex via AgentDispatch (hop 0 of 2).
 You may split this task into at most 2 independent subtasks and delegate each with the AgentDispatch `dispatch` tool; the router picks the best agent for each. Do not delegate the whole task as-is. Subtasks share this working tree: give each a disjoint `files` list.
+# Ownership
+You own the implementation, the regression tests and deterministic evals for the affected scope, and nothing else. Run only what your change touches: no repeats of green unchanged checks, no full-repo suite for unrelated scope, no paid evals (caller-owned). The caller owns independent review, the final combined gate and the commit.
 # Rules
 Do not commit or push: leave all changes in the working tree, the caller reviews and commits.
 

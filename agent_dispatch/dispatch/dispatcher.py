@@ -109,6 +109,10 @@ class Dispatcher:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._events: dict[str, asyncio.Event] = {}
         self._semaphore = asyncio.Semaphore(settings.server.max_concurrent_tasks)
+        # Ёмкость ревью отдельная: долгая корневая задача не должна оставлять
+        # ревью без слота, и лишние ревью не должны вытеснять задачи. Максимум
+        # корневых CLI-процессов демона из-за этого равен сумме двух пределов.
+        self._review_semaphore = asyncio.Semaphore(settings.server.max_concurrent_reviews)
         # Lock на рабочую копию вместе со счётчиком тех, кто его держит или ждёт:
         # запись живёт ровно столько, сколько нужна.
         self._cwd_locks: dict[str, tuple[asyncio.Lock, int]] = {}
@@ -409,7 +413,15 @@ class Dispatcher:
         mode = req.workspace_mode or self.settings.execution.workspace_mode
         if review:
             mode = "in_place"
-        semaphore = self._semaphore if req.hop == 0 else contextlib.nullcontext()
+        # Корневая задача и корневое ревью ходят в разные пулы; вложенная
+        # работа (hop > 0) мимо обоих, иначе исполнитель в подзадаче ждал бы
+        # слот своего же родителя — взаимная блокировка.
+        if req.hop > 0:
+            semaphore = contextlib.nullcontext()
+        elif review:
+            semaphore = self._review_semaphore
+        else:
+            semaphore = self._semaphore
         # В режиме worktree исполнители не делят дерево, поэтому lock нужен
         # только на время переноса результата обратно в рабочую копию.
         lock = (

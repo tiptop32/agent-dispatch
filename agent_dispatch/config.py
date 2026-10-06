@@ -19,7 +19,16 @@ class _ConfigModel(BaseModel):
 class ServerSettings(_ConfigModel):
     host: str = "127.0.0.1"
     port: int = 7433
-    max_concurrent_tasks: int = 2
+    #: Корневые задачи на правку (hop 0, kind: task) идут через этот пул.
+    #: Корневые ревью имеют собственный `max_concurrent_reviews`, поэтому
+    #: долгая задача не съедает ёмкость ревью и наоборот. Отсюда максимум
+    #: корневых CLI-процессов демона равен сумме обоих пределов
+    #: (max_concurrent_tasks + max_concurrent_reviews), а не только этому числу.
+    max_concurrent_tasks: int = Field(2, ge=1)
+    #: Собственная ёмкость корневых ревью (hop 0, kind: review). Лишние ревью
+    #: ждут своей очереди, задачи их не блокируют. Вложенная работа (hop > 0)
+    #: идёт мимо обоих пулов, как раньше.
+    max_concurrent_reviews: int = Field(1, ge=1)
     data_dir: Path = Path("~/.local/share/agent-dispatch")
 
     @model_validator(mode="after")

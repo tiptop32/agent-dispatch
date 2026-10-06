@@ -270,6 +270,31 @@ def test_max_children_defaults_to_two(tmp_config_dir: Path) -> None:
     assert load_settings(tmp_config_dir).routing.max_children == 2
 
 
+def test_concurrency_limits_have_working_defaults(tmp_config_dir: Path) -> None:
+    settings = load_settings(tmp_config_dir)
+
+    assert settings.server.max_concurrent_tasks == 2
+    assert settings.server.max_concurrent_reviews == 1
+
+
+@pytest.mark.parametrize("value", [0, -1])
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("max_concurrent_tasks", r"server\.max_concurrent_tasks"),
+        ("max_concurrent_reviews", r"server\.max_concurrent_reviews"),
+    ],
+)
+def test_concurrency_limits_reject_zero_and_negatives(
+    tmp_config_dir: Path, field: str, message: str, value: int
+) -> None:
+    import yaml
+
+    (tmp_config_dir / "config.yaml").write_text(yaml.safe_dump({"server": {field: value}}))
+    with pytest.raises(ConfigError, match=message):
+        load_settings(tmp_config_dir)
+
+
 @pytest.mark.parametrize(
     ("rule", "message"),
     [

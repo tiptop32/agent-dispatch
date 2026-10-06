@@ -13,6 +13,35 @@ from agent_dispatch.executors.result_parser import extract_result_block, normali
 from agent_dispatch.models import ExecutionResult, Usage
 
 
+def _has_auto_option(args: list[str]) -> bool:
+    return any(arg == "--no-auto" or arg == "--auto" or arg.startswith("--auto=") for arg in args)
+
+
+def _without_auto_enable(args: list[str]) -> list[str]:
+    """Remove auto-approval while retaining explicit false forms."""
+    result: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--auto":
+            value = args[index + 1].lower() if index + 1 < len(args) else None
+            if value in {"true", "false"}:
+                if value == "false":
+                    result.extend(args[index : index + 2])
+                index += 2
+                continue
+            index += 1
+            continue
+        if arg.startswith("--auto="):
+            if arg.partition("=")[2].lower() == "false":
+                result.append(arg)
+            index += 1
+            continue
+        result.append(arg)
+        index += 1
+    return result
+
+
 class OpenCodeAdapter(BaseExecutorAdapter):
     def __init__(
         self, name: str, settings: ExecutorSettings, base_env: dict[str, str] | None = None
@@ -21,12 +50,22 @@ class OpenCodeAdapter(BaseExecutorAdapter):
             raise ValueError("opencode executor requires model")
         super().__init__(name, settings, base_env)
 
-    async def execute(self, ctx: RunContext) -> ExecutionResult:
+    def build_argv(self, ctx: RunContext) -> list[str]:
         extra = self.settings.extra_args
         if ctx.read_only:
             # Встроенный агент `plan` в OpenCode запрещает правку файлов.
-            extra = [*strip_flags(extra, {"--agent"}), "--agent", "plan"]
-        argv = [
+            # Автоодобрение в режиме ревью ослабило бы read-only защиту.
+            # Явные opt-out формы оставляем как дополнительный запрет.
+            extra = [
+                *_without_auto_enable(strip_flags(extra, {"--agent"})),
+                "--agent",
+                "plan",
+            ]
+        elif not _has_auto_option(extra):
+            # Headless-запуск: без `--auto` OpenCode спрашивает разрешение на
+            # инструменты. Явную настройку пользователя не переопределяем.
+            extra = [*extra, "--auto"]
+        return [
             self.command,
             "run",
             "--format",
@@ -38,6 +77,9 @@ class OpenCodeAdapter(BaseExecutorAdapter):
             *extra,
             ctx.prompt,
         ]
+
+    async def execute(self, ctx: RunContext) -> ExecutionResult:
+        argv = self.build_argv(ctx)
         return await self._execute_common(
             ctx,
             argv,

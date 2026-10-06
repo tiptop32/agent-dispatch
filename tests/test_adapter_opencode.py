@@ -58,7 +58,7 @@ async def test_opencode_ok_argv_model_usage(git_repo, tmp_path):
     assert result.usage.input_tokens == 81586 and result.usage.output_tokens == 71
     args = (tmp_path / "cap.argv").read_text().splitlines()
     assert args[:7] == ["run", "--format", "json", "--dir", str(git_repo), "--model", "kimi"]
-    assert args[-2:] == ["--quiet", "do task"]
+    assert args[-3:] == ["--quiet", "--auto", "do task"]
 
 
 @pytest.mark.asyncio
@@ -73,6 +73,73 @@ async def test_opencode_special_results(git_repo, tmp_path, fake, expected):
     assert result.status == expected
     if expected == "failed":
         assert result.error == "No cookie auth credentials found"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra_args", "expected_tail"),
+    [
+        (["--no-auto"], ["--no-auto", "do task"]),
+        (["--auto=false"], ["--auto=false", "do task"]),
+        (["--auto", "false"], ["--auto", "false", "do task"]),
+        (["--auto"], ["--auto", "do task"]),
+        (["--auto=true"], ["--auto=true", "do task"]),
+        (["--auto", "true"], ["--auto", "true", "do task"]),
+    ],
+)
+async def test_opencode_task_preserves_explicit_auto_configuration(
+    git_repo, tmp_path, extra_args, expected_tail
+):
+    cap = tmp_path / "cap"
+    adapter = OpenCodeAdapter(
+        "opencode",
+        ExecutorSettings(
+            adapter="opencode",
+            command=str(ROOT / "fakes/opencode_ok.sh"),
+            model="m",
+            extra_args=extra_args,
+        ),
+    )
+
+    result = await adapter.execute(ctx(git_repo, tmp_path, FAKE_CAPTURE=str(cap)))
+
+    args = (tmp_path / "cap.argv").read_text().splitlines()
+    assert args[-len(expected_tail) :] == expected_tail
+    assert result.status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("extra_args", "expected_tail"),
+    [
+        (["--agent=build", "--auto"], ["--agent", "plan", "do task"]),
+        (["--agent", "build", "--auto=true"], ["--agent", "plan", "do task"]),
+        (["--auto", "true"], ["--agent", "plan", "do task"]),
+        (["--no-auto"], ["--no-auto", "--agent", "plan", "do task"]),
+        (["--auto=false"], ["--auto=false", "--agent", "plan", "do task"]),
+        (["--auto", "false"], ["--auto", "false", "--agent", "plan", "do task"]),
+    ],
+)
+async def test_opencode_read_only_forces_plan_and_removes_only_auto_enable(
+    git_repo, tmp_path, extra_args, expected_tail
+):
+    cap = tmp_path / "cap"
+    adapter = OpenCodeAdapter(
+        "opencode",
+        ExecutorSettings(
+            adapter="opencode",
+            command=str(ROOT / "fakes/opencode_ok.sh"),
+            model="m",
+            extra_args=extra_args,
+        ),
+    )
+    review = ctx(git_repo, tmp_path, FAKE_CAPTURE=str(cap)).model_copy(update={"read_only": True})
+
+    result = await adapter.execute(review)
+
+    args = (tmp_path / "cap.argv").read_text().splitlines()
+    assert args[-len(expected_tail) :] == expected_tail
+    assert result.status == "completed"
 
 
 @pytest.mark.asyncio

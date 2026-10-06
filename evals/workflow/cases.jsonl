@@ -1,0 +1,5 @@
+{"id": "task-claude-prompt-root", "kind": "task", "adapter": "claude", "context_mode": "prompt", "hop": 0}
+{"id": "task-codex-summary-nested", "kind": "task", "adapter": "codex", "context_mode": "prompt+summary", "hop": 1}
+{"id": "task-opencode-full-root", "kind": "task", "adapter": "opencode", "context_mode": "full", "hop": 0}
+{"id": "review-claude-summary-root", "kind": "review", "adapter": "claude", "context_mode": "prompt+summary", "hop": 0}
+{"id": "review-codex-full-nested", "kind": "review", "adapter": "codex", "context_mode": "full", "hop": 1}

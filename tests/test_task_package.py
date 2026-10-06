@@ -114,6 +114,29 @@ def test_render_prompt_full_contains_git_commands_and_fixed_state():
     assert " src/client.py | 2 +-" in rendered
 
 
+def test_render_prompt_task_assigns_ownership():
+    rendered = render_prompt(TaskPackage(request=request()), "claude", settings())
+    assert "# Ownership" in rendered
+    assert "You own the implementation, the regression tests and deterministic evals" in rendered
+    assert "no repeats of green unchanged checks" in rendered
+    assert "no paid evals" in rendered
+    assert "The caller owns independent review, the final combined gate and the commit" in rendered
+
+
+def test_render_prompt_review_ownership_is_findings_only():
+    rendered = render_prompt(TaskPackage(request=request(kind="review")), "claude", settings())
+    assert "Findings only" in rendered
+    assert "the caller fixes, reruns what is needed and commits" in rendered
+    assert "Do not rerun green checks unchanged by the diff" in rendered
+    assert "You own the implementation" not in rendered
+
+
+def test_render_prompt_task_ownership_forbids_executor_commit():
+    rendered = render_prompt(TaskPackage(request=request()), "claude", settings())
+    ownership = rendered.split("# Ownership", 1)[1].split("# Rules", 1)[0]
+    assert "commit" not in ownership.replace("final combined gate and the commit", "")
+
+
 def test_render_prompt_none_context_is_rendered_as_none():
     rendered = render_prompt(TaskPackage(request=request(context=None)), "claude", settings())
     assert "# Context\n(none)" in rendered
