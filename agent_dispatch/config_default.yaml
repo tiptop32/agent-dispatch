@@ -24,7 +24,7 @@ routing:
   min_confidence: 0.60        # ниже: решение не несёт информации, идёт fallback_executor
   autonomous_confidence: 0.85  # выше: решению можно доверять без присмотра
   min_margin: 0.10
-  fallback_executor: codex
+  fallback_executor: codex     # или список [a, b]: первый доступный, остальные в резерве
   max_hops: 2
   max_children: 2
   corporate_min_confidence: 0.0  # порог уверенности ответа о корп. данных; 0 = доверять любому

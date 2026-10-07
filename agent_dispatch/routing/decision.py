@@ -13,7 +13,7 @@ from agent_dispatch.models import (
 
 from .base import Router, RouterError
 from .claude_local import ClaudeLocalRouter
-from .guards import post_guards, single_candidate_decision
+from .guards import fallback_unavailable, pick_fallback, post_guards, single_candidate_decision
 from .jev import JevRouter
 
 
@@ -36,18 +36,18 @@ async def decide_with_fallback(
             events.append(
                 GuardEvent(reason=GuardReason.router_unavailable, detail=f"{router.name}: {exc}")
             )
-    fallback = settings.routing.fallback_executor
+    fallback = pick_fallback(settings, names)
     extra_events: list[GuardEvent] = []
     meta: dict[str, str] = {}
-    if fallback not in names:
+    if fallback is None:
         fallback = names[0]
-        warning = f"fallback executor unavailable: {settings.routing.fallback_executor}"
+        warning = fallback_unavailable(settings)
         meta["warning"] = warning
         extra_events.append(
             GuardEvent(
                 reason=GuardReason.unavailable,
                 detail=warning,
-                executor=settings.routing.fallback_executor,
+                executor=settings.routing.fallback_chain[0],
             )
         )
     decision = RouteDecision(

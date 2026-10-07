@@ -203,3 +203,52 @@ def test_post_ok_no_mutation_or_events():
     # Уверенный выбор помечается как autonomous, но не подменяется.
     assert out.confidence_tier == "autonomous"
     assert out.model_copy(update={"confidence_tier": None}) == d
+
+
+def chain_settings(chain):
+    return Settings.model_validate(
+        {
+            "routing": {"fallback_executor": chain},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "codex": {"adapter": "codex"},
+                "opencode/kimi": {"adapter": "opencode", "model": "kimi"},
+            },
+        }
+    )
+
+
+def test_post_fallback_chain_takes_first_available_member():
+    """Первый в цепочке остывает: слабое решение уходит к следующему, а не к top1."""
+    from agent_dispatch.models import RouteDecision, RouterKind
+
+    d = RouteDecision(
+        router=RouterKind.jev, executor="claude", confidence=0.5, scores={"claude": 0.9}
+    )
+    out, events = post_guards(d, chain_settings(["opencode/kimi", "codex"]), ["claude", "codex"])
+    assert out.executor == "codex"
+    assert "warning" not in out.meta
+    assert [e.reason for e in events] == [GuardReason.low_confidence]
+
+
+def test_post_fallback_chain_prefers_head_when_available():
+    from agent_dispatch.models import RouteDecision, RouterKind
+
+    d = RouteDecision(
+        router=RouterKind.jev, executor="claude", confidence=0.5, scores={"claude": 0.9}
+    )
+    candidates_ = ["claude", "codex", "opencode/kimi"]
+    out, _ = post_guards(d, chain_settings(["opencode/kimi", "codex"]), candidates_)
+    assert out.executor == "opencode/kimi"
+
+
+def test_post_fallback_chain_exhausted_keeps_top1_with_warning():
+    from agent_dispatch.models import RouteDecision, RouterKind
+
+    d = RouteDecision(
+        router=RouterKind.jev, executor="claude", confidence=0.5, scores={"claude": 0.9}
+    )
+    out, events = post_guards(d, chain_settings(["opencode/kimi", "codex"]), ["claude"])
+    assert out.executor == "claude"
+    assert out.meta["warning"] == "fallback executor unavailable: opencode/kimi, codex"
+    assert events[-1].reason == GuardReason.unavailable

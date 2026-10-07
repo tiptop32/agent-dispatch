@@ -297,7 +297,7 @@ class Dispatcher:
 
     def _fallback_decision(self, reason: GuardReason) -> RouteDecision:
         return RouteDecision(
-            executor=self.settings.routing.fallback_executor,
+            executor=self.settings.routing.fallback_chain[0],
             confidence=0,
             scores={},
             router=RouterKind.fallback,

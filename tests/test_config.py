@@ -45,6 +45,36 @@ def test_fallback_executor_must_exist(tmp_config_dir: Path) -> None:
         load_settings()
 
 
+@pytest.mark.parametrize(
+    ("value", "chain"),
+    [("codex", ["codex"]), (["opencode/kimi", "codex"], ["opencode/kimi", "codex"])],
+)
+def test_fallback_executor_accepts_name_or_ordered_chain(
+    tmp_config_dir: Path, value, chain
+) -> None:
+    settings = Settings.model_validate(
+        {
+            "routing": {"fallback_executor": value},
+            "executors": {
+                "codex": {"adapter": "codex"},
+                "opencode/kimi": {"adapter": "opencode", "model": "kimi"},
+            },
+        }
+    )
+    assert settings.routing.fallback_chain == chain
+
+
+@pytest.mark.parametrize("value", [["codex", "missing"], []])
+def test_fallback_chain_members_must_exist_and_chain_is_not_empty(
+    tmp_config_dir: Path, value
+) -> None:
+    (tmp_config_dir / "config.yaml").write_text(
+        "routing:\n  fallback_executor: " + repr(value).replace("'", "") + "\n"
+    )
+    with pytest.raises(ConfigError, match=r"routing\.fallback_executor"):
+        load_settings()
+
+
 def test_opencode_executor_requires_model(tmp_config_dir: Path) -> None:
     (tmp_config_dir / "config.yaml").write_text(
         """executors:

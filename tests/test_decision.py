@@ -131,3 +131,22 @@ def test_build_routers_by_backend():
         {"router": {"backend": "claude_local"}, "executors": {"codex": {"adapter": "codex"}}}
     )
     assert [r.name for r in build_routers(s, httpx.AsyncClient())] == ["claude_local"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_chain_skips_unavailable_head_without_warning():
+    """Роутеры недоступны, голова цепочки остывает: берётся следующий из цепочки."""
+    s = Settings.model_validate(
+        {
+            "routing": {"fallback_executor": ["opencode/kimi", "codex"]},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "codex": {"adapter": "codex"},
+                "opencode/kimi": {"adapter": "opencode", "model": "kimi"},
+            },
+        }
+    )
+    d, events = await decide_with_fallback(
+        DispatchRequest(task="x", cwd="."), {"claude": "c", "codex": "x"}, s, [Bad()]
+    )
+    assert d.executor == "codex" and "warning" not in d.meta and len(events) == 1

@@ -64,7 +64,9 @@ class RoutingSettings(_ConfigModel):
     min_confidence: float = 0.60
     autonomous_confidence: float = 0.85
     min_margin: float = 0.10
-    fallback_executor: str = "codex"
+    #: Куда уходит задача без уверенного решения роутера. Строка или упорядоченный
+    #: список: берётся первый доступный кандидат, остальные идут резервом.
+    fallback_executor: str | list[str] = "codex"
     max_hops: int = Field(2, ge=0)
     max_children: int = Field(2, ge=0)
     #: Порог уверенности ответа Jev о корпоративных данных. Ответ ниже порога не
@@ -112,6 +114,13 @@ class RoutingSettings(_ConfigModel):
                 if target not in adapters:
                     raise ValueError(f"review_only.{source}: unknown adapter {target!r}")
         return self
+
+    @property
+    def fallback_chain(self) -> list[str]:
+        """`fallback_executor` в виде списка в порядке предпочтения."""
+        if isinstance(self.fallback_executor, str):
+            return [self.fallback_executor]
+        return list(self.fallback_executor)
 
 
 class ExecutionSettings(_ConfigModel):
@@ -182,10 +191,12 @@ class Settings(_ConfigModel):
 
     @model_validator(mode="after")
     def validate_references(self) -> Settings:
-        if self.routing.fallback_executor not in self.executors:
-            raise ValueError(
-                f"routing.fallback_executor: unknown executor {self.routing.fallback_executor!r}"
-            )
+        chain = self.routing.fallback_chain
+        if not chain:
+            raise ValueError("routing.fallback_executor: empty list")
+        for name in chain:
+            if name not in self.executors:
+                raise ValueError(f"routing.fallback_executor: unknown executor {name!r}")
         names = set(self.executors)
         for source, targets in self.escalation.items():
             if source not in names:

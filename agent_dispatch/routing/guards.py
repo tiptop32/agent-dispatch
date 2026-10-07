@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from agent_dispatch.config import Settings
 from agent_dispatch.executors.workspace import is_git_repo
 from agent_dispatch.models import (
@@ -104,6 +106,16 @@ def classify_confidence(confidence: float, settings: Settings) -> ConfidenceTier
     return "fallback"
 
 
+def pick_fallback(settings: Settings, candidates: Iterable[str]) -> str | None:
+    """Первый доступный исполнитель из цепочки `fallback_executor`, иначе None."""
+    allowed = set(candidates)
+    return next((name for name in settings.routing.fallback_chain if name in allowed), None)
+
+
+def fallback_unavailable(settings: Settings) -> str:
+    return "fallback executor unavailable: " + ", ".join(settings.routing.fallback_chain)
+
+
 def post_guards(
     decision: RouteDecision, settings: Settings, candidates: list[str]
 ) -> tuple[RouteDecision, list[GuardEvent]]:
@@ -122,23 +134,30 @@ def post_guards(
     top1 = ranked[0][0] if ranked else (candidates[0] if candidates else result.executor)
     top_score = ranked[0][1] if ranked else result.confidence
     second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    weak = False
     if result.confidence < settings.routing.min_confidence:
-        result.executor = settings.routing.fallback_executor
+        weak = True
         result.reason = GuardReason.low_confidence
         events.append(
             _event(GuardReason.low_confidence, f"confidence {decision.confidence} below threshold")
         )
     elif top_score - second_score < settings.routing.min_margin - 1e-9:
-        result.executor = settings.routing.fallback_executor
+        weak = True
         result.reason = GuardReason.low_margin
         events.append(
             _event(GuardReason.low_margin, f"margin {top_score - second_score} below threshold")
         )
-    if result.executor == settings.routing.fallback_executor and result.executor not in candidates:
-        result.executor = top1
-        warning = f"fallback executor unavailable: {settings.routing.fallback_executor}"
-        result.meta["warning"] = warning
-        events.append(_event(GuardReason.unavailable, warning, settings.routing.fallback_executor))
+    if weak:
+        fallback = pick_fallback(settings, candidates)
+        if fallback is not None:
+            result.executor = fallback
+        else:
+            result.executor = top1
+            warning = fallback_unavailable(settings)
+            result.meta["warning"] = warning
+            events.append(
+                _event(GuardReason.unavailable, warning, settings.routing.fallback_chain[0])
+            )
     if candidates and result.executor not in allowed:
         chosen = result.executor
         result.executor = top1
