@@ -90,6 +90,18 @@ env = { AGENT_DISPATCH_SOURCE_AGENT = "codex" }
 tool_timeout_sec = 120
 ```
 
+For daemon or GUI launches, install `scripts/codex-agent-lb` as
+`~/.local/bin/codex`. It loads only `AGENT_LB_API_KEY` from
+`~/.config/agent-lb/env` when the variable is missing, then runs the current
+native Codex binary. Keep one `KEY=value` (or `export KEY=value`) entry per
+line and protect the file. The launcher uses the first nonempty matching key,
+returns exit `78` when none is available, and follows the unpinned
+`standalone/current` native binary. Reinstalling Codex may replace a global
+launcher, so configure the explicit launcher path in the executor command for
+durable daemon behavior. Make the script executable with `chmod +x`.
+
+Run the deterministic launcher eval with `uv run python -m evals.launcher`.
+
 OpenCode (`~/.config/opencode/opencode.json`):
 
 ```json
