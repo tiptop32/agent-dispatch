@@ -28,6 +28,9 @@ class RunContext(BaseModel):
     prompt: str
     #: Ревью: исполнитель только читает. Адаптер переводит CLI в режим без правок.
     read_only: bool = False
+    #: Сессия CLI, которую продолжает follow-up. Адаптер кладёт id сессии своего
+    #: запуска в `result.meta.session_id`, следующий follow-up передаёт его сюда.
+    resume_session: str | None = None
 
 
 def strip_flags(

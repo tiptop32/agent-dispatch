@@ -1,5 +1,17 @@
 # Task
 {{ task }}
+{% if followup %}
+
+# Previous attempt
+This continues task {{ followup.task_id }}, done by {{ followup.executor }} with status `{{ followup.status }}`. {% if review %}It reviewed the same working copy; answer the follow-up below.{% else %}Its changes are already in the working tree; build on them instead of starting over.{% endif %} The task above is what the caller wants now.
+{% if followup.original_task %}Original task: {{ followup.original_task }}
+{% endif %}Its request: {{ followup.task }}
+Changed files: {{ followup.changed_files | join(", ") or "(none)" }}
+{% if followup.error %}Error: {{ followup.error }}
+{% endif %}{% if followup.verification %}Verification: {{ followup.verification }}
+{% endif %}Report of that attempt:
+{{ followup.summary or "(empty)" }}
+{% endif %}
 {% if review %}
 
 # Review only
@@ -24,6 +36,13 @@ cwd: {{ cwd }}
 {{ constraints | bullets }}
 ## Success criteria
 {{ success_criteria | bullets }}
+{% endif %}
+{% if verify and not review %}
+# Verification
+After you finish, AgentDispatch itself runs these commands; the task counts as done only if every one exits 0:
+{{ verify | bullets }}
+Make them pass by fixing the code, not by editing or weakening these checks or the tests they run.
+
 {% endif %}
 # Time budget
 Your time budget is {{ time_budget_seconds }} seconds (~{{ time_budget_minutes }} minutes); at that point the run is killed by a hard timeout. Keep any single command well under it. Do not rerun a long test suite you have already run on the touched scope. Stop and report your result before the budget runs out: a timeout with unreported work looks like a failure, not a result.

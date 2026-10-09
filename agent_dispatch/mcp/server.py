@@ -17,11 +17,13 @@ from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
 from agent_dispatch.models import (
     ContextMode,
     DispatchRequest,
+    FollowupRequest,
     RouteDecision,
     RouterKind,
     SourceAgent,
     TaskStatus,
     TaskView,
+    VerificationInfo,
 )
 from agent_dispatch.serve_state import ServeState
 
@@ -38,6 +40,11 @@ def _agent(value: str | None, default: SourceAgent | None = None) -> SourceAgent
 KIND_HINT = (
     "kind='task' (default) changes code; kind='review' asks for a read-only review "
     "of the working copy and returns findings without editing files."
+)
+VERIFY_HINT = (
+    " Pass `verify` with shell commands (e.g. the test command for the touched scope, "
+    "written for `cwd`): AgentDispatch runs them itself after the executor, and a "
+    "failure counts as not done and escalates."
 )
 
 
@@ -124,7 +131,31 @@ def _route_lines(decision: RouteDecision) -> list[str]:
 
 
 #: Поля `result.meta`, которые компактный ответ показывает вызывающему.
-_META_LINES = ("warning", "cooldown_until", "branch", "worktree", "patch", "integration_error")
+_META_LINES = (
+    "warning",
+    "resume_failed",
+    "cooldown_until",
+    "budget",
+    "branch",
+    "worktree",
+    "patch",
+    "integration_error",
+)
+
+
+def _verification_line(info: VerificationInfo) -> str:
+    """Итог проверки демона одной строкой; вывод упавшей команды обрезан."""
+    text = f"verified: {info.result}"
+    if info.result == "failed" and info.commands:
+        failed = info.commands[-1]
+        how = failed.failure_reason
+        tail = " | ".join(line for line in failed.output_tail.splitlines()[-3:] if line.strip())
+        text += f" ({failed.command}: {how}){f' {tail[-300:]}' if tail else ''}"
+    if info.contradicts_report:
+        text += "; executor reported tests passed"
+    if info.tests_changed:
+        text += f"; tests changed: {', '.join(info.tests_changed)}"
+    return text
 
 
 def _task_text(view: TaskView, verbose: bool = False) -> str:
@@ -153,6 +184,8 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
         lines.extend(_route_lines(view.decision))
     if view.escalated_from:
         lines.append(f"escalated_from: {view.escalated_from}")
+    if view.request.followup_of:
+        lines.append(f"followup_of: {view.request.followup_of}")
     if result:
         escalated_to = result.meta.get("escalated_to")
         if escalated_to:
@@ -164,6 +197,8 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
             if result.tests.command:
                 tests += f" ({result.tests.command})"
             lines.append(f"tests: {tests}")
+        if result.verification:
+            lines.append(_verification_line(result.verification))
         if result.error:
             lines.append(f"error: {result.error[:500]}")
         for key in _META_LINES:
@@ -262,6 +297,7 @@ def build_server(
         timeout_seconds: int | None,
         verbose: bool,
         kind: str = "task",
+        verify: list[str] | None = None,
     ) -> str:
         try:
             wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
@@ -280,6 +316,7 @@ def build_server(
                 wait_seconds=wait,
                 timeout_seconds=timeout_seconds,
                 kind=kind,
+                verify=verify or [],
             )
             return _task_text(await client.submit(req), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
@@ -288,7 +325,7 @@ def build_server(
     @server.tool(
         description=(
             "Dispatch a coding task to the selected executor. Do not re-dispatch an "
-            "already delegated task unless escalation is allowed. " + KIND_HINT
+            "already delegated task unless escalation is allowed. " + KIND_HINT + VERIFY_HINT
         )
     )
     async def dispatch(
@@ -303,6 +340,7 @@ def build_server(
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
         kind: str = "task",
+        verify: list[str] | None = None,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -319,13 +357,16 @@ def build_server(
             timeout_seconds,
             verbose,
             kind,
+            verify,
         )
 
     @server.tool(
         description=(
             "Dispatch a coding task to a specific executor. Use only when the executor "
             "is known; do not re-dispatch delegated work unless escalation is allowed. "
-            "Executors out of usage limits are refused: call `executors` first. " + KIND_HINT
+            "Executors out of usage limits are refused: call `executors` first. "
+            + KIND_HINT
+            + VERIFY_HINT
         )
     )
     async def dispatch_to(
@@ -341,6 +382,7 @@ def build_server(
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
         kind: str = "task",
+        verify: list[str] | None = None,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -357,6 +399,7 @@ def build_server(
             timeout_seconds,
             verbose,
             kind,
+            verify,
         )
 
     @server.tool(
@@ -372,6 +415,45 @@ def build_server(
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
         return _executors_text(rows, settings, _source())
+
+    @server.tool(
+        description=(
+            "Continue a finished delegated task with a new message instead of dispatching it "
+            "again: the same executor picks it up in its own CLI session when possible, "
+            "otherwise with the previous attempt's report. Use it for corrections, a failed "
+            "check or a timeout. `verify` defaults to the previous task's commands."
+        )
+    )
+    async def followup(
+        task_id: str,
+        message: str,
+        verify: list[str] | None = None,
+        allow_escalation: bool = True,
+        wait_seconds: int | None = None,
+        timeout_seconds: int | None = None,
+        verbose: bool = False,
+    ) -> str:
+        try:
+            wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
+            client = await get_client(wait)
+            # Источник, hop и родитель вызывающего, как у `dispatch`: иначе
+            # follow-up обходил бы `review_only` и встал бы вложенным вызовом в
+            # корневую очередь за своим же родителем.
+            caller = _request(message, ".", settings)
+            body = FollowupRequest(
+                message=message,
+                verify=verify,
+                allow_escalation=allow_escalation,
+                wait_seconds=wait,
+                timeout_seconds=timeout_seconds,
+                source_agent=caller.source_agent,
+                parent_task_id=caller.parent_task_id,
+                root_agent=caller.root_agent,
+                hop=caller.hop,
+            )
+            return _task_text(await client.followup(task_id, body), verbose)
+        except (DaemonUnavailable, RuntimeError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
 
     @server.tool(description="Get the current result of a delegated task by task_id.")
     async def status(task_id: str, wait_seconds: int = 0, verbose: bool = False) -> str:

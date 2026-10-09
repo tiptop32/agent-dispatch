@@ -94,6 +94,7 @@ class OpenCodeAdapter(BaseExecutorAdapter):
             ctx.cwd,
             "--model",
             self.settings.model,
+            *(["--session", ctx.resume_session] if ctx.resume_session else []),
             *extra,
             ctx.prompt,
         ]
@@ -118,6 +119,7 @@ class OpenCodeAdapter(BaseExecutorAdapter):
         input_tokens = output_tokens = 0
         cost = 0.0
         error_message = None
+        session = None
         for line in outcome.stdout.splitlines():
             try:
                 event = json.loads(line)
@@ -125,6 +127,8 @@ class OpenCodeAdapter(BaseExecutorAdapter):
                 continue
             if not isinstance(event, dict):
                 continue
+            if session is None and isinstance(event.get("sessionID"), str):
+                session = event["sessionID"]
             if event.get("type") == "text" and isinstance(event.get("part"), dict):
                 text_parts.append(str(event["part"].get("text", "")))
             elif event.get("type") == "tool_use" and isinstance(event.get("part"), dict):
@@ -188,4 +192,6 @@ class OpenCodeAdapter(BaseExecutorAdapter):
                     )
                 }
             )
+        if session:
+            result.meta["session_id"] = session
         return result

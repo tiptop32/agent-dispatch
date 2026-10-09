@@ -11,8 +11,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_dispatch.config import Settings
+from agent_dispatch.dispatch import followup, verify
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
-from agent_dispatch.dispatch.task_package import build_task_package, render_prompt
+from agent_dispatch.dispatch.task_package import (
+    Followup,
+    build_task_package,
+    render_prompt,
+    rewrite_repo_prefix,
+)
 from agent_dispatch.executors import workspace, worktree
 from agent_dispatch.executors.base import ExecutorAdapter, RunContext
 from agent_dispatch.executors.env import child_env
@@ -22,6 +28,7 @@ from agent_dispatch.models import (
     FINAL_STATUSES,
     DispatchRequest,
     ExecutionResult,
+    FollowupRequest,
     GuardEvent,
     GuardReason,
     RouteDecision,
@@ -187,6 +194,35 @@ class Dispatcher:
                 "root_agent": parent.root_agent,
             }
         )
+
+    async def followup(self, task_id: str, body: FollowupRequest) -> TaskRecord:
+        """Продолжить готовую задачу тем же исполнителем (`dispatch/followup.py`)."""
+        record = await self.get(task_id)
+        if record is None:
+            raise KeyError(task_id)
+        link = followup.continued_link(await self._chain_links(record))
+        executor: str | None = link.decision.executor if link.decision else None
+        if executor in self.availability.unavailable():
+            # Исполнитель остывает: роутер выберет другого, итог прошлой
+            # попытки уйдёт ему в промпт.
+            executor = None
+        return await self.submit(followup.followup_request(link, body, executor))
+
+    async def _chain_links(self, record: TaskRecord) -> list[TaskRecord]:
+        """Звенья цепочки эскалации от `record` до последнего, как их видит `wait`."""
+        chain = [record]
+        seen = {record.task_id}
+        while record.result is not None:
+            child_id = record.result.meta.get("escalated_to")
+            if not child_id or child_id in seen:
+                break
+            child = await self.get(child_id)
+            if child is None:
+                break
+            seen.add(child.task_id)
+            record = child
+            chain.append(record)
+        return chain
 
     def _track_cleanup(self, coro: Coroutine[None, None, None]) -> None:
         task = asyncio.create_task(coro)
@@ -403,6 +439,11 @@ class Dispatcher:
         """Маршрутизация и guard'ы. None значит, что задача уже закрыта отказом."""
         record.status = TaskStatus.routing
         await self.storage.update_task(record)
+        budget = await self._daily_budget_guard()
+        if budget is not None:
+            # До роутера: исчерпанный бюджет не тратят и на решение Jev.
+            await self._guard_failure(record, budget)
+            return None
         exclude: set[str] = set()
         if record.escalated_from is not None and record.request.executor is None:
             # Повторная маршрутизация после сбоя исполнителя: те, кто уже брал
@@ -440,6 +481,23 @@ class Dispatcher:
             )
             return None
         return decision, adapter
+
+    async def _daily_budget_guard(self, extra: float = 0.0) -> GuardEvent | None:
+        """Отказ `budget`, если расходы с местной полуночи (плюс `extra`) у лимита."""
+        limit = self.settings.routing.daily_cost_limit_usd
+        if limit is None:
+            return None
+        midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        spent = extra + await self.storage.cost_since(midnight)
+        if spent < limit:
+            return None
+        return GuardEvent(
+            reason=GuardReason.budget,
+            detail=(
+                f"daily cost limit reached: ${spent:.2f} of daily_cost_limit_usd "
+                f"${limit:.2f} since {midnight.isoformat(timespec='minutes')}"
+            ),
+        )
 
     async def _execute(
         self, record: TaskRecord, decision: RouteDecision, adapter: ExecutorAdapter
@@ -549,19 +607,23 @@ class Dispatcher:
             {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
         )
         before = await self._review_fingerprint(req) if review else None
-        try:
-            result = await adapter.execute(ctx)
-        except Exception as exc:
-            result = ExecutionResult(
-                status="failed",
-                executor=decision.executor,
-                model=None,
-                summary="",
-                error=f"{type(exc).__name__}: {exc}",
+        result = await self._call_adapter(adapter, ctx, decision)
+        if ctx.resume_session and self._resume_failed(result):
+            # Сессию не нашли или CLI другой версии не понял флаги: один раз
+            # с нуля, итог прошлой попытки идёт в промпт.
+            await self.storage.add_event(
+                task_id,
+                "resume_failed",
+                {"session": ctx.resume_session, "error": (result.error or "")[:500]},
             )
+            ctx = await self._build_context(record, decision, tree, resume=False)
+            result = await self._call_adapter(adapter, ctx, decision)
+            result.meta["resume_failed"] = True
         if review:
             await self._check_review_wrote_nothing(req, before, result)
         await self._note_executor_failure(record, decision, result)
+        if not review and req.verify and result.status in ("completed", "partial"):
+            await self._verify(record, result, tree)
         # Ревью, после которого изменилась рабочая копия, не эскалируется:
         # иначе вызывающий получил бы ответ следующего ревьюера без
         # предупреждения о правках первого.
@@ -578,6 +640,102 @@ class Dispatcher:
             hold = plan is not None and plan.hands_off
             await self._finish_worktree(req, tree, result, task_id, hold=hold)
         return result, plan
+
+    async def _verify(
+        self, record: TaskRecord, result: ExecutionResult, tree: worktree.Worktree | None
+    ) -> None:
+        """Запустить команды `verify` там, где работал исполнитель, и судить по ним.
+
+        В worktree работа сначала коммитится на ветку задачи, а после проверки
+        дерево возвращается к этому коммиту: кэши и отчёты, которые оставила
+        проверка, не должны попасть в патч вызывающему.
+        """
+        req = record.request
+        cwd, commands = Path(req.cwd), list(req.verify)
+        committed = False
+        if tree is not None:
+            try:
+                await asyncio.to_thread(
+                    worktree.commit, tree, f"agent-dispatch: task {record.task_id[:8]}"
+                )
+                committed = True
+            except worktree.WorktreeError as exc:
+                # Работа цела в дереве; без коммита откат после проверки стёр
+                # бы её, поэтому артефакты проверки останутся в патче.
+                result.meta["verify_artifacts_kept"] = f"commit failed: {exc}"
+            # Команды написаны для cwd вызывающего, а исполнитель работал в
+            # корне дерева: проверка идёт в том же подкаталоге дерева, и
+            # абсолютные пути рабочей копии переписываются на дерево.
+            try:
+                root = await asyncio.to_thread(worktree.repo_root, req.cwd)
+                relative = Path(req.cwd).resolve().relative_to(root.resolve())  # noqa: ASYNC240
+            except (worktree.WorktreeError, ValueError):
+                root, relative = None, Path()
+            cwd = tree.path / relative
+            if root is not None:
+                commands = [
+                    rewrite_repo_prefix(command, str(root), str(tree.path)) or command
+                    for command in commands
+                ]
+        info = await verify.run_verification(
+            commands,
+            cwd=cwd,
+            env=child_env(self.settings),
+            timeout_seconds=self.settings.execution.verify_timeout_seconds,
+            log_path=Path(record.log_path),
+            result=result,
+        )
+        verify.apply_verification(result, info)
+        await self.storage.add_event(
+            record.task_id,
+            "verify",
+            {
+                "result": info.result,
+                "commands": len(info.commands),
+                "tests_changed": len(info.tests_changed),
+                "contradicts_report": info.contradicts_report,
+            },
+        )
+        if committed and tree is not None:
+            if await self._tree_in_use(tree):
+                # Внутри дерева ещё работает подзадача: откат стёр бы её правки.
+                result.meta["verify_artifacts_kept"] = "active children"
+                return
+            try:
+                await asyncio.to_thread(worktree.discard_changes, tree)
+            except worktree.WorktreeError as exc:
+                # Работа уже в коммите: несостоявшийся откат оставляет в патче
+                # только артефакты проверки, а не отменяет результат исполнителя.
+                result.meta["verify_artifacts_kept"] = f"discard failed: {exc}"
+
+    @staticmethod
+    async def _call_adapter(
+        adapter: ExecutorAdapter, ctx: RunContext, decision: RouteDecision
+    ) -> ExecutionResult:
+        try:
+            return await adapter.execute(ctx)
+        except Exception as exc:
+            return ExecutionResult(
+                status="failed",
+                executor=decision.executor,
+                model=None,
+                summary="",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    @staticmethod
+    def _resume_failed(result: ExecutionResult) -> bool:
+        """Продолженная сессия упала, не начав работу.
+
+        Сбой исполнителя (лимит, сеть) повторился бы и с нуля, а таймаут и
+        молчание значат, что агент работал: их не повторяем.
+        """
+        if result.status != "failed" or result.changed_files:
+            return False
+        error = result.error or ""
+        if error == "timeout" or error.startswith("stalled:"):
+            return False
+        return classify_failure(result) is None
 
     @staticmethod
     async def _review_fingerprint(req: DispatchRequest) -> str | None:
@@ -603,7 +761,12 @@ class Dispatcher:
             result.meta["warning"] = "working copy changed during the review"
 
     async def _build_context(
-        self, record: TaskRecord, decision: RouteDecision, tree: worktree.Worktree | None
+        self,
+        record: TaskRecord,
+        decision: RouteDecision,
+        tree: worktree.Worktree | None,
+        *,
+        resume: bool = True,
     ) -> RunContext:
         """Task Package и prompt под адаптер выбранного исполнителя."""
         req = record.request
@@ -614,6 +777,10 @@ class Dispatcher:
             str(tree.path) if tree else None,
             tree.branch if tree else None,
         )
+        session = None
+        if req.followup_of:
+            attempt, session = await self._followup(req, decision, tree, resume=resume)
+            package = package.model_copy(update={"followup": attempt})
         prompt = await asyncio.to_thread(
             render_prompt,
             package,
@@ -642,7 +809,48 @@ class Dispatcher:
             task_id=record.task_id,
             prompt=prompt,
             read_only=req.kind == "review",
+            resume_session=session,
         )
+
+    async def _followup(
+        self,
+        req: DispatchRequest,
+        decision: RouteDecision,
+        tree: worktree.Worktree | None,
+        *,
+        resume: bool,
+    ) -> tuple[Followup | None, str | None]:
+        """Итог продолжаемой задачи и сессия CLI, если её можно продолжить.
+
+        Сессию продолжает только тот же исполнитель в том же каталоге: claude
+        ищет сессии по cwd, а у прошлого запуска в worktree дерева уже нет.
+        """
+        previous = await self.get(req.followup_of) if req.followup_of else None
+        if previous is None or previous.result is None or previous.decision is None:
+            return None, None
+        session = previous.result.meta.get("session_id")
+        same_place = (
+            tree is None
+            and not await self._worktree_meta(previous.task_id)
+            and Path(previous.request.cwd).resolve() == Path(req.cwd).resolve()  # noqa: ASYNC240
+        )
+        resumed = bool(
+            resume
+            and isinstance(session, str)
+            and session
+            and same_place
+            and previous.decision.executor == decision.executor
+        )
+        original = previous
+        seen = {previous.task_id}
+        while original.request.followup_of and original.request.followup_of not in seen:
+            seen.add(original.request.followup_of)
+            earlier = await self.get(original.request.followup_of)
+            if earlier is None:
+                break
+            original = earlier
+        described = followup.describe(previous, original, resumed=resumed)
+        return described, session if resumed else None
 
     async def _note_executor_failure(
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
@@ -734,16 +942,50 @@ class Dispatcher:
         failure = result.meta.get("executor_failure")
         if failure:
             reason = f"executor_{failure}"
-        tried = await self._escalation_chain(record)
+        links = await self._escalation_links(record)
+        tried = [executor for _, executor in links]
         # Цепочка эскалации подчиняется тому же правилу ревью, что и роутер:
         # иначе задача Codex дошла бы до Claude через `codex/sol: [claude/opus]`.
         unavailable = self.availability.unavailable() | review_only_executors(
             record.request, self.settings
         )
         nxt = next_executor(decision.executor, self.settings, tried, unavailable)
-        return EscalationPlan(
+        plan = EscalationPlan(
             reason=reason, tried=tried, executor=nxt, reroute=nxt is None and bool(failure)
         )
+        if not plan.hands_off:
+            return plan
+        stop = await self._budget_stop(links, result)
+        if stop is None:
+            return plan
+        # Звено, которое бюджет всё равно не пустит, не должно удерживать
+        # работу (`integration_held`): цепочка кончается здесь, работа
+        # интегрируется, как у любой исчерпанной цепочки.
+        return EscalationPlan(reason=f"{reason}; {stop}", tried=tried)
+
+    async def _budget_stop(
+        self, links: list[tuple[str, str]], result: ExecutionResult
+    ) -> str | None:
+        """Причина не эскалировать по деньгам или None; цифры идут в `meta.budget`.
+
+        Текущий результат ещё не записан в базу, его цена прибавляется
+        отдельно; подзадачи звеньев и завершённые за сутки задачи уже там.
+        """
+        current = result.usage.cost_usd if result.usage and result.usage.cost_usd else 0.0
+        routing = self.settings.routing
+        if routing.max_chain_cost_usd is not None:
+            spent = current + await self.storage.tree_cost([task_id for task_id, _ in links])
+            if spent >= routing.max_chain_cost_usd:
+                result.meta["budget"] = {
+                    "chain_cost_usd": round(spent, 4),
+                    "limit_usd": routing.max_chain_cost_usd,
+                }
+                return f"chain cost ${spent:.2f} reached max_chain_cost_usd"
+        guard = await self._daily_budget_guard(extra=current)
+        if guard is not None:
+            result.meta["budget"] = {"daily_limit_usd": routing.daily_cost_limit_usd}
+            return guard.detail
+        return None
 
     async def _finalize(
         self,
@@ -786,8 +1028,13 @@ class Dispatcher:
             {"from": decision.executor, "to": plan.executor or "router", "reason": plan.reason},
         )
         # `executor: None` отдаёт задачу роутеру; уже пробовавшие исключает `_prepare`.
+        update: dict[str, object] = {"executor": plan.executor}
+        if record.request.followup_of:
+            # Звено follow-up продолжает упавшую попытку, а не задачу до неё:
+            # иначе следующий исполнитель видел бы устаревший отчёт.
+            update["followup_of"] = record.task_id
         child = await self.submit(
-            record.request.model_copy(update={"executor": plan.executor}),
+            record.request.model_copy(update=update),
             escalated_from=record.task_id,
         )
         result.meta["escalated_to"] = child.task_id
@@ -943,14 +1190,11 @@ class Dispatcher:
     async def _drop_worktree(
         self, tree: worktree.Worktree, *, keep_branch: bool, result: ExecutionResult
     ) -> None:
-        tree_path = tree.path.expanduser().resolve()
-        for active in await self.storage.list_active_tasks():
-            active_cwd = Path(active.request.cwd).expanduser().resolve()  # noqa: ASYNC240
-            if active_cwd == tree_path or tree_path in active_cwd.parents:
-                result.meta["worktree"] = str(tree.path)
-                result.meta["branch"] = tree.branch
-                result.meta["worktree_kept"] = "active children"
-                return
+        if await self._tree_in_use(tree):
+            result.meta["worktree"] = str(tree.path)
+            result.meta["branch"] = tree.branch
+            result.meta["worktree_kept"] = "active children"
+            return
         try:
             await asyncio.to_thread(worktree.remove, tree, keep_branch=keep_branch)
         except worktree.WorktreeError as exc:
@@ -960,8 +1204,21 @@ class Dispatcher:
         if not keep_branch:
             result.meta.pop("branch", None)
 
+    async def _tree_in_use(self, tree: worktree.Worktree) -> bool:
+        """В дереве cwd незавершённой задачи: убирать или откатывать его нельзя."""
+        tree_path = tree.path.expanduser().resolve()
+        for active in await self.storage.list_active_tasks():
+            active_cwd = Path(active.request.cwd).expanduser().resolve()  # noqa: ASYNC240
+            if active_cwd == tree_path or tree_path in active_cwd.parents:
+                return True
+        return False
+
     async def _escalation_chain(self, record: TaskRecord) -> list[str]:
-        chain: list[str] = []
+        return [executor for _, executor in await self._escalation_links(record)]
+
+    async def _escalation_links(self, record: TaskRecord) -> list[tuple[str, str]]:
+        """Звенья цепочки эскалации от первого к текущему: (task_id, executor)."""
+        chain: list[tuple[str, str]] = []
         current: TaskRecord | None = record
         seen = {record.task_id}
         # Без предела глубины: от циклов защищает `seen`, а усечённая цепочка
@@ -969,7 +1226,7 @@ class Dispatcher:
         # и она перестала бы быть конечной.
         while current is not None:
             if current.decision is not None:
-                chain.append(current.decision.executor)
+                chain.append((current.task_id, current.decision.executor))
             previous_id = current.escalated_from
             if previous_id is None or previous_id in seen:
                 break

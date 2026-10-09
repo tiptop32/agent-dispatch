@@ -75,6 +75,7 @@ class GuardReason(StrEnum):
     max_children = "max_children"
     escalated = "escalated"
     review_only = "review_only"
+    budget = "budget"
 
 
 #: `task` меняет файлы, `review` только читает и возвращает замечания.
@@ -99,6 +100,13 @@ class DispatchRequest(_Model):
     root_agent: SourceAgent | None = None
     hop: int = Field(0, ge=0)
     workspace_mode: Literal["in_place", "worktree"] | None = None
+    #: Shell-команды, которые демон сам запускает после исполнителя (обычно
+    #: тесты). Задача считается сделанной, только если все вышли с кодом 0:
+    #: самоотчёт исполнителя о тестах не проверка.
+    verify: list[str] = Field(default_factory=list)
+    #: Задача, которую продолжает этот запрос. Его `task` — новое сообщение
+    #: исполнителю, остальное демон берёт из продолжаемой задачи.
+    followup_of: str | None = None
 
     @field_validator("files")
     @classmethod
@@ -108,6 +116,25 @@ class DispatchRequest(_Model):
             if path.is_absolute() or PureWindowsPath(file_name).is_absolute() or ".." in path.parts:
                 raise ValueError("files must contain relative paths without '..'")
         return files
+
+
+class FollowupRequest(_Model):
+    """Продолжение готовой задачи тем же исполнителем, по возможности в его сессии."""
+
+    message: str = Field(min_length=1)
+    #: None — те же команды проверки, что у продолжаемой задачи.
+    verify: list[str] | None = None
+    allow_escalation: bool = True
+    wait_seconds: int = Field(1800, ge=0)
+    timeout_seconds: int | None = None
+    #: Кто просит продолжения. Заданный `source_agent` заменяет источник, hop и
+    #: родителя продолжаемой задачи: guards (`review_only`, глубина, квоты) судят
+    #: того, кто вызывает сейчас, а вложенный вызов не встаёт в корневую очередь
+    #: за своим же родителем. None — всё как у продолжаемой задачи (CLI, API).
+    source_agent: SourceAgent | None = None
+    parent_task_id: str | None = None
+    root_agent: SourceAgent | None = None
+    hop: int = Field(0, ge=0)
 
 
 class Judgment(_Model):
@@ -155,6 +182,32 @@ class TestsInfo(_Model):
     output_tail: str | None = None
 
 
+class VerifyCommand(_Model):
+    command: str
+    exit_code: int | None = None
+    timed_out: bool = False
+    duration_ms: int = 0
+    output_tail: str = ""
+
+    @property
+    def failure_reason(self) -> str:
+        """Почему команда не прошла: для ошибки, промпта follow-up и ответа MCP."""
+        return "timed out" if self.timed_out else f"exit {self.exit_code}"
+
+
+class VerificationInfo(_Model):
+    """Проверка, которую демон провёл сам, а не со слов исполнителя."""
+
+    result: Literal["passed", "failed"]
+    #: Выполненные команды; после первой упавшей остальные не запускаются.
+    commands: list[VerifyCommand] = Field(default_factory=list)
+    #: Изменённые файлы, похожие на тесты. Не приговор (задача могла требовать
+    #: тестов), а указатель для вызывающего: проверку можно «пройти», ослабив её.
+    tests_changed: list[str] = Field(default_factory=list)
+    #: Исполнитель отчитался `tests: passed`, а проверка упала.
+    contradicts_report: bool = False
+
+
 class Usage(_Model):
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -168,6 +221,7 @@ class ExecutionResult(_Model):
     summary: str
     changed_files: list[str] = Field(default_factory=list)
     tests: TestsInfo | None = None
+    verification: VerificationInfo | None = None
     confidence: float | None = None
     needs_escalation: bool = False
     error: str | None = None

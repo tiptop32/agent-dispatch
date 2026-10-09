@@ -9,6 +9,10 @@ def should_escalate(result: ExecutionResult) -> str | None:
         return "failed"
     if result.needs_escalation or result.status == "needs_escalation":
         return "needs_escalation"
+    if result.verification is not None and result.verification.result == "failed":
+        # Проверка демона сильнее самоотчёта: исполнитель мог написать
+        # `tests: passed`, не запуская их.
+        return "verification_failed"
     if result.tests is not None and result.tests.result == "failed":
         return "tests_failed"
     if result.status == "partial" and result.meta.get("parse_error") and not result.changed_files:

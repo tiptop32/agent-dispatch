@@ -13,7 +13,14 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from agent_dispatch import __version__
-from agent_dispatch.models import FINAL_STATUSES, DispatchRequest, TaskRecord, TaskView
+from agent_dispatch.dispatch.followup import FollowupError
+from agent_dispatch.models import (
+    FINAL_STATUSES,
+    DispatchRequest,
+    FollowupRequest,
+    TaskRecord,
+    TaskView,
+)
 
 
 class FeedbackRequest(BaseModel):
@@ -103,6 +110,21 @@ def build_router() -> APIRouter:
         deps = _deps(request)
         record = await deps.dispatcher.submit(req)
         record = await deps.dispatcher.wait(record.task_id, min(req.wait_seconds, MAX_WAIT_SECONDS))
+        response.status_code = 200 if record.status in FINAL_STATUSES else 202
+        return to_view(record)
+
+    @router.post("/tasks/{task_id}/followup")
+    async def followup(task_id: str, body: FollowupRequest, request: Request, response: Response):
+        deps = _deps(request)
+        try:
+            record = await deps.dispatcher.followup(task_id, body)
+        except KeyError:
+            raise HTTPException(404, "task not found") from None
+        except FollowupError as exc:
+            raise HTTPException(409, str(exc)) from None
+        record = await deps.dispatcher.wait(
+            record.task_id, min(body.wait_seconds, MAX_WAIT_SECONDS)
+        )
         response.status_code = 200 if record.status in FINAL_STATUSES else 202
         return to_view(record)
 

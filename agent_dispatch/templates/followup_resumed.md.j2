@@ -1,0 +1,24 @@
+# Follow-up
+This continues your previous run in this session (AgentDispatch task {{ followup.task_id }}, status `{{ followup.status }}`). {% if not review %}The working tree still has your changes. {% endif %}The caller now asks:
+
+{{ task }}
+{% if followup.verification %}
+
+The previous verification: {{ followup.verification }}
+{% endif %}
+{% if verify and not review %}
+
+# Verification
+After you finish, AgentDispatch itself runs these commands; the task counts as done only if every one exits 0:
+{{ verify | bullets }}
+Make them pass by fixing the code, not by editing or weakening these checks or the tests they run.
+{% endif %}
+
+# Time budget
+Your time budget is {{ time_budget_seconds }} seconds (~{{ time_budget_minutes }} minutes); at that point the run is killed by a hard timeout. Stop and report your result before the budget runs out.
+
+# Rules
+{% if review %}Do not edit files, commit or push.{% else %}Do not commit or push: leave all changes in the working tree, the caller reviews and commits.{% endif %} The delegation rules of the original task still apply.
+
+# Result format
+{{ result_instructions }}

@@ -96,6 +96,15 @@ class RoutingSettings(_ConfigModel):
     #: но не задачу на правку. По умолчанию Codex не тратит токены Claude на
     #: работу, которую делает сам, а просит у него только ревью.
     review_only: dict[str, list[str]] = Field(default_factory=lambda: {"codex": ["claude"]})
+    #: Потолок расходов цепочки эскалации вместе с подзадачами её звеньев, в
+    #: долларах. Дошла до него — следующее звено не запускается. Считаются только
+    #: расходы, о которых сообщил CLI (claude, opencode; codex цену не сообщает).
+    #: null выключает.
+    max_chain_cost_usd: float | None = Field(None, gt=0)
+    #: Потолок расходов за локальные сутки: исполнители и решения роутера. Дошли
+    #: до него — новые задачи, подзадачи и звенья эскалации получают отказ
+    #: `budget` до полуночи. null выключает.
+    daily_cost_limit_usd: float | None = Field(None, gt=0)
 
     @model_validator(mode="after")
     def validate_thresholds(self) -> RoutingSettings:
@@ -137,6 +146,9 @@ class ExecutionSettings(_ConfigModel):
     #: Убить executor, если он столько секунд ничего не пишет в stdout/stderr;
     #: 0 отключает. Жёсткий routing.default_timeout_seconds всё равно действует.
     idle_timeout_seconds: int = Field(900, ge=0)
+    #: Предел на каждую команду `verify` из запроса. Зависшая проверка
+    #: считается упавшей.
+    verify_timeout_seconds: int = Field(600, ge=1)
 
 
 class ExecutorSettings(_ConfigModel):
