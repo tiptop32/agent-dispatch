@@ -17,7 +17,7 @@ from agent_dispatch.config import (
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.dispatch.escalation import should_escalate
 from agent_dispatch.dispatch.task_package import build_task_package, render_prompt
-from agent_dispatch.dispatch.verify import is_test_path
+from agent_dispatch.dispatch.verify import OUTPUT_TAIL, _output_tail, is_test_path
 from agent_dispatch.executors import worktree
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
@@ -329,3 +329,33 @@ def test_prompt_lists_verification_commands(tmp_path, git_repo):
 
     without = render_prompt(build_task_package(_req(git_repo, []), settings), "codex", settings)
     assert "# Verification" not in without
+
+
+def test_output_tail_keeps_both_streams():
+    stdout = "x" * 5000 + "\nFAILED tests/test_a.py::test_a"
+    stderr = "DeprecationWarning\n" * 500
+    tail = _output_tail(stdout, stderr)
+    assert "FAILED tests/test_a.py::test_a" in tail and "[stderr]" in tail
+    assert len(tail) <= OUTPUT_TAIL + len("\n[stderr]\n")
+    assert _output_tail("only out", "") == "only out"
+    assert _output_tail("", "only err") == "only err"
+
+
+@pytest.mark.asyncio
+async def test_failed_rollback_after_verification_keeps_the_result(tmp_path, git_repo, monkeypatch):
+    async def edit(ctx):
+        (Path(ctx.cwd) / "a.py").write_text("x = 2\n")
+
+    def broken_discard(tree):
+        raise worktree.WorktreeError("git reset failed")
+
+    monkeypatch.setattr(worktree, "discard_changes", broken_discard)
+    _, adapters, dispatcher = await _make(tmp_path, workspace_mode="worktree")
+    adapters["codex"].on_execute = edit
+    record = await dispatcher.submit(_req(git_repo, ["true"]))
+    done = await _finish(dispatcher, record.task_id)
+
+    assert done.status == TaskStatus.completed
+    assert done.result.verification.result == "passed"
+    assert done.result.meta["verify_artifacts_kept"] == "discard failed: git reset failed"
+    assert (git_repo / "a.py").read_text() == "x = 2\n"

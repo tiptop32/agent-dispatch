@@ -238,3 +238,23 @@ def test_budgets_are_off_by_default(tmp_config_dir):
 def test_budget_must_be_positive(field):
     with pytest.raises(ValueError):
         RoutingSettings(**{field: 0})
+
+
+@pytest.mark.asyncio
+async def test_daily_limit_stops_escalation_at_planning(tmp_path, git_repo):
+    # Запуск сам доводит сутки до лимита: звено, которое бюджет всё равно не
+    # пустит, не создаётся, и работа не удерживается ради него.
+    settings = _settings(tmp_path, daily_cost_limit_usd=1.0)
+    storage, adapters, _, dispatcher = await _dispatcher(
+        tmp_path, settings, {"codex": _failed(1.5)}
+    )
+    record = await dispatcher.submit(
+        DispatchRequest(task="fix", cwd=str(git_repo), executor="codex")
+    )
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    assert done.task_id == record.task_id and done.status == TaskStatus.failed
+    assert done.result.meta["budget"] == {"daily_limit_usd": 1.0}
+    assert "escalated_to" not in done.result.meta
+    assert not adapters["claude"].calls
+    assert len(await storage.list_tasks()) == 1

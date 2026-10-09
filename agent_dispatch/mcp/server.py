@@ -148,7 +148,7 @@ def _verification_line(info: VerificationInfo) -> str:
     text = f"verified: {info.result}"
     if info.result == "failed" and info.commands:
         failed = info.commands[-1]
-        how = "timeout" if failed.timed_out else f"exit {failed.exit_code}"
+        how = failed.failure_reason
         tail = " | ".join(line for line in failed.output_tail.splitlines()[-3:] if line.strip())
         text += f" ({failed.command}: {how}){f' {tail[-300:]}' if tail else ''}"
     if info.contradicts_report:
@@ -436,12 +436,20 @@ def build_server(
         try:
             wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
             client = await get_client(wait)
+            # Источник, hop и родитель вызывающего, как у `dispatch`: иначе
+            # follow-up обходил бы `review_only` и встал бы вложенным вызовом в
+            # корневую очередь за своим же родителем.
+            caller = _request(message, ".", settings)
             body = FollowupRequest(
                 message=message,
                 verify=verify,
                 allow_escalation=allow_escalation,
                 wait_seconds=wait,
                 timeout_seconds=timeout_seconds,
+                source_agent=caller.source_agent,
+                parent_task_id=caller.parent_task_id,
+                root_agent=caller.root_agent,
+                hop=caller.hop,
             )
             return _task_text(await client.followup(task_id, body), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:

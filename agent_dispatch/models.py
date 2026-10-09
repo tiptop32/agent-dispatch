@@ -127,6 +127,14 @@ class FollowupRequest(_Model):
     allow_escalation: bool = True
     wait_seconds: int = Field(1800, ge=0)
     timeout_seconds: int | None = None
+    #: Кто просит продолжения. Заданный `source_agent` заменяет источник, hop и
+    #: родителя продолжаемой задачи: guards (`review_only`, глубина, квоты) судят
+    #: того, кто вызывает сейчас, а вложенный вызов не встаёт в корневую очередь
+    #: за своим же родителем. None — всё как у продолжаемой задачи (CLI, API).
+    source_agent: SourceAgent | None = None
+    parent_task_id: str | None = None
+    root_agent: SourceAgent | None = None
+    hop: int = Field(0, ge=0)
 
 
 class Judgment(_Model):
@@ -180,6 +188,11 @@ class VerifyCommand(_Model):
     timed_out: bool = False
     duration_ms: int = 0
     output_tail: str = ""
+
+    @property
+    def failure_reason(self) -> str:
+        """Почему команда не прошла: для ошибки, промпта follow-up и ответа MCP."""
+        return "timed out" if self.timed_out else f"exit {self.exit_code}"
 
 
 class VerificationInfo(_Model):

@@ -31,6 +31,17 @@ def is_test_path(path: str) -> bool:
     )
 
 
+def _output_tail(stdout: str, stderr: str) -> str:
+    """Хвост вывода с обоих потоков: предупреждения в stderr не должны вытеснить
+    итог тестов из stdout, и наоборот."""
+    if not stderr.strip():
+        return stdout[-OUTPUT_TAIL:]
+    if not stdout.strip():
+        return stderr[-OUTPUT_TAIL:]
+    half = OUTPUT_TAIL // 2
+    return f"{stdout[-half:]}\n[stderr]\n{stderr[-half:]}"
+
+
 async def run_verification(
     commands: list[str],
     *,
@@ -48,9 +59,9 @@ async def run_verification(
     done: list[VerifyCommand] = []
     passed = True
     for command in commands:
-        with log_path.open("a") as log_file:
-            log_file.write(f"\n[verify] $ {command}\n")
         try:
+            with log_path.open("a") as log_file:
+                log_file.write(f"\n[verify] $ {command}\n")
             outcome = await run_cli(
                 ["/bin/sh", "-c", command],
                 cwd=cwd,
@@ -63,14 +74,13 @@ async def run_verification(
             done.append(VerifyCommand(command=command, output_tail=f"cannot start: {exc}"))
             passed = False
             break
-        output = outcome.stdout + outcome.stderr
         done.append(
             VerifyCommand(
                 command=command,
                 exit_code=outcome.exit_code,
                 timed_out=outcome.timed_out,
                 duration_ms=outcome.duration_ms,
-                output_tail=output[-OUTPUT_TAIL:],
+                output_tail=_output_tail(outcome.stdout, outcome.stderr),
             )
         )
         if outcome.timed_out or outcome.exit_code != 0:
@@ -100,5 +110,4 @@ def apply_verification(result: ExecutionResult, info: VerificationInfo) -> None:
         result.status = "partial"
     failed = info.commands[-1] if info.commands else None
     if failed is not None and result.error is None:
-        how = "timed out" if failed.timed_out else f"exit {failed.exit_code}"
-        result.error = f"verification failed ({how}): {failed.command[:200]}"
+        result.error = f"verification failed ({failed.failure_reason}): {failed.command[:200]}"

@@ -57,5 +57,7 @@ CREATE TABLE IF NOT EXISTS cooldowns (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id ON tasks(parent_task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_finished_at ON tasks(finished_at);
+CREATE INDEX IF NOT EXISTS idx_routing_decisions_created_at ON routing_decisions(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);
 CREATE INDEX IF NOT EXISTS idx_routing_decisions_task_id ON routing_decisions(task_id);

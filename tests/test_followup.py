@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -17,7 +18,8 @@ from agent_dispatch.config import (
     ServerSettings,
     Settings,
 )
-from agent_dispatch.dispatch.dispatcher import Dispatcher, FollowupError
+from agent_dispatch.dispatch.dispatcher import Dispatcher
+from agent_dispatch.dispatch.followup import FollowupError, continued_link
 from agent_dispatch.executors.base import RunContext
 from agent_dispatch.executors.claude import ClaudeAdapter
 from agent_dispatch.executors.codex import CodexAdapter
@@ -29,6 +31,8 @@ from agent_dispatch.models import (
     FollowupRequest,
     RouteDecision,
     RouterKind,
+    SourceAgent,
+    TaskRecord,
     TaskStatus,
     VerificationInfo,
     VerifyCommand,
@@ -423,3 +427,136 @@ async def test_followup_endpoint(tmp_path, git_repo):
     assert ok.json()["request"]["followup_of"] == task_id
     assert missing.status_code == 404
     await dispatcher.shutdown()
+
+
+# --- регрессии ревью ----------------------------------------------------------
+
+
+def _link(
+    task_id: str,
+    *,
+    status: TaskStatus = TaskStatus.completed,
+    executor: str | None = "codex",
+    meta: dict | None = None,
+) -> TaskRecord:
+    now = datetime.now(UTC)
+    return TaskRecord(
+        task_id=task_id,
+        parent_task_id=None,
+        escalated_from=None,
+        root_agent=SourceAgent.cli,
+        source_agent=SourceAgent.cli,
+        hop=0,
+        request=DispatchRequest(task="t", cwd="."),
+        status=status,
+        decision=(
+            RouteDecision(executor=executor, confidence=1, scores={}, router=RouterKind.override)
+            if executor
+            else None
+        ),
+        result=ExecutionResult(
+            status="failed" if not executor else "completed",
+            executor=executor or "",
+            model=None,
+            summary="",
+            meta=meta or {},
+        ),
+        log_path="",
+        created_at=now,
+        started_at=now,
+        finished_at=now,
+    )
+
+
+def test_guard_refused_last_link_is_skipped():
+    chain = [_link("a"), _link("b", status=TaskStatus.failed, executor=None)]
+    assert continued_link(chain).task_id == "a"
+
+
+def test_chain_that_never_ran_is_refused():
+    with pytest.raises(FollowupError, match="never reached an executor"):
+        continued_link([_link("a", status=TaskStatus.failed, executor=None)])
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {"integrated": False, "patch": "/p.patch", "commit": "abc"},
+        # Сбой коммита, отмена, перезапуск демона: только дерево и ветка.
+        {"integrated": False, "worktree": "/wt/x", "branch": "agent-dispatch/x"},
+    ],
+)
+def test_work_outside_the_working_copy_is_refused(meta):
+    with pytest.raises(FollowupError, match="not in the working copy"):
+        continued_link([_link("a", meta=meta)])
+
+
+def test_integrated_worktree_run_is_continued():
+    meta = {"integrated": True, "patch": "/p.patch", "commit": "abc"}
+    assert continued_link([_link("a", meta=meta)]).task_id == "a"
+
+
+@pytest.mark.asyncio
+async def test_followup_is_judged_by_the_current_caller(tmp_path, git_repo):
+    _, adapters, dispatcher = await _make(tmp_path)
+    adapters["claude"].results = [_ok("claude", "c1")]
+    first = await _done(
+        dispatcher, (await dispatcher.submit(_req(git_repo, executor="claude"))).task_id
+    )
+
+    # Codex вправе отдать Claude только ревью: follow-up от codex на правку
+    # должен получить тот же отказ, что и прямой dispatch.
+    record = await dispatcher.followup(
+        first.task_id, FollowupRequest(message="more", source_agent=SourceAgent.codex)
+    )
+    done = await _done(dispatcher, record.task_id)
+
+    assert done.request.source_agent == SourceAgent.codex
+    assert done.status == TaskStatus.failed
+    assert done.result.meta["guard"] == "review_only"
+    assert len(adapters["claude"].calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_escalated_followup_link_describes_the_failed_followup(tmp_path, git_repo):
+    _, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].results = [
+        _ok("codex", "s1", summary="first pass"),
+        # Изменения есть: это провал работы, а не продолжения сессии, и он
+        # эскалируется, а не повторяется с нуля.
+        ExecutionResult(
+            status="failed",
+            executor="codex",
+            model=None,
+            summary="followup broke",
+            changed_files=["a.py"],
+        ),
+    ]
+    first = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
+    record = await dispatcher.followup(first.task_id, FollowupRequest(message="also None"))
+    final = await _done(dispatcher, record.task_id)
+
+    assert final.decision.executor == "claude"
+    assert final.request.followup_of == record.task_id
+    prompt = adapters["claude"].calls[-1].prompt
+    assert "followup broke" in prompt and "first pass" not in prompt
+    assert "Original task: fix tests" in prompt
+
+
+@pytest.mark.asyncio
+async def test_followup_chain_keeps_the_original_task_in_the_prompt(tmp_path, git_repo):
+    _, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].results = [_ok("codex", None)] * 3
+    first = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
+    second = await _done(
+        dispatcher,
+        (await dispatcher.followup(first.task_id, FollowupRequest(message="fix the test"))).task_id,
+    )
+    await _done(
+        dispatcher,
+        (await dispatcher.followup(second.task_id, FollowupRequest(message="handle None"))).task_id,
+    )
+
+    prompt = adapters["codex"].calls[-1].prompt
+    assert "Original task: fix tests" in prompt
+    assert "Its request: fix the test" in prompt

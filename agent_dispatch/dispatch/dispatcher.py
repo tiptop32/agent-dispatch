@@ -11,10 +11,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_dispatch.config import Settings
-from agent_dispatch.dispatch import verify
+from agent_dispatch.dispatch import followup, verify
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import (
-    FOLLOWUP_SUMMARY_LIMIT,
     Followup,
     build_task_package,
     render_prompt,
@@ -96,10 +95,6 @@ def _failed_result(
         error=error,
         meta=dict(previous.meta if previous else {}) if meta is None else meta,
     )
-
-
-class FollowupError(ValueError):
-    """Продолжить задачу нельзя: она ещё идёт или её работы нет в рабочей копии."""
 
 
 def _not_integrated(result: ExecutionResult, error: str) -> None:
@@ -201,48 +196,21 @@ class Dispatcher:
         )
 
     async def followup(self, task_id: str, body: FollowupRequest) -> TaskRecord:
-        """Продолжить готовую задачу тем же исполнителем.
-
-        Продолжается последнее звено цепочки эскалации: его работа и лежит в
-        рабочей копии. Follow-up всегда идёт in_place: worktree от HEAD не
-        увидел бы перенесённого, но не закоммиченного результата.
-        """
+        """Продолжить готовую задачу тем же исполнителем (`dispatch/followup.py`)."""
         record = await self.get(task_id)
         if record is None:
             raise KeyError(task_id)
-        last = await self._last_link(record)
-        if last.status not in FINAL_STATUSES:
-            raise FollowupError(f"task {last.task_id} is still {last.status.value}")
-        if last.decision is None or last.result is None or not last.result.executor:
-            raise FollowupError(f"task {last.task_id} never reached an executor")
-        meta = last.result.meta
-        if meta.get("integrated") is False and (meta.get("commit") or meta.get("patch")):
-            where = meta.get("patch") or meta.get("branch")
-            raise FollowupError(
-                f"work of task {last.task_id} is not in the working copy (integrated: false): "
-                f"apply {where} first or dispatch a new task"
-            )
-        executor: str | None = last.decision.executor
+        link = followup.continued_link(await self._chain_links(record))
+        executor: str | None = link.decision.executor if link.decision else None
         if executor in self.availability.unavailable():
             # Исполнитель остывает: роутер выберет другого, итог прошлой
             # попытки уйдёт ему в промпт.
             executor = None
-        req = last.request.model_copy(
-            update={
-                "task": body.message,
-                "executor": executor,
-                "followup_of": last.task_id,
-                "allow_escalation": body.allow_escalation,
-                "wait_seconds": body.wait_seconds,
-                "timeout_seconds": body.timeout_seconds or last.request.timeout_seconds,
-                "verify": last.request.verify if body.verify is None else body.verify,
-                "workspace_mode": "in_place",
-            }
-        )
-        return await self.submit(req)
+        return await self.submit(followup.followup_request(link, body, executor))
 
-    async def _last_link(self, record: TaskRecord) -> TaskRecord:
-        """Последнее звено цепочки эскалации, как его видит `wait`."""
+    async def _chain_links(self, record: TaskRecord) -> list[TaskRecord]:
+        """Звенья цепочки эскалации от `record` до последнего, как их видит `wait`."""
+        chain = [record]
         seen = {record.task_id}
         while record.result is not None:
             child_id = record.result.meta.get("escalated_to")
@@ -253,7 +221,8 @@ class Dispatcher:
                 break
             seen.add(child.task_id)
             record = child
-        return record
+            chain.append(record)
+        return chain
 
     def _track_cleanup(self, coro: Coroutine[None, None, None]) -> None:
         task = asyncio.create_task(coro)
@@ -513,12 +482,13 @@ class Dispatcher:
             return None
         return decision, adapter
 
-    async def _daily_budget_guard(self) -> GuardEvent | None:
+    async def _daily_budget_guard(self, extra: float = 0.0) -> GuardEvent | None:
+        """Отказ `budget`, если расходы с местной полуночи (плюс `extra`) у лимита."""
         limit = self.settings.routing.daily_cost_limit_usd
         if limit is None:
             return None
         midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
-        spent = await self.storage.cost_since(midnight)
+        spent = extra + await self.storage.cost_since(midnight)
         if spent < limit:
             return None
         return GuardEvent(
@@ -731,7 +701,12 @@ class Dispatcher:
                 # Внутри дерева ещё работает подзадача: откат стёр бы её правки.
                 result.meta["verify_artifacts_kept"] = "active children"
                 return
-            await asyncio.to_thread(worktree.discard_changes, tree)
+            try:
+                await asyncio.to_thread(worktree.discard_changes, tree)
+            except worktree.WorktreeError as exc:
+                # Работа уже в коммите: несостоявшийся откат оставляет в патче
+                # только артефакты проверки, а не отменяет результат исполнителя.
+                result.meta["verify_artifacts_kept"] = f"discard failed: {exc}"
 
     @staticmethod
     async def _call_adapter(
@@ -804,8 +779,8 @@ class Dispatcher:
         )
         session = None
         if req.followup_of:
-            followup, session = await self._followup(req, decision, tree, resume=resume)
-            package = package.model_copy(update={"followup": followup})
+            attempt, session = await self._followup(req, decision, tree, resume=resume)
+            package = package.model_copy(update={"followup": attempt})
         prompt = await asyncio.to_thread(
             render_prompt,
             package,
@@ -853,8 +828,7 @@ class Dispatcher:
         previous = await self.get(req.followup_of) if req.followup_of else None
         if previous is None or previous.result is None or previous.decision is None:
             return None, None
-        result = previous.result
-        session = result.meta.get("session_id")
+        session = previous.result.meta.get("session_id")
         same_place = (
             tree is None
             and not await self._worktree_meta(previous.task_id)
@@ -867,27 +841,16 @@ class Dispatcher:
             and same_place
             and previous.decision.executor == decision.executor
         )
-        verification = None
-        if result.verification and result.verification.result == "failed":
-            failed = result.verification.commands[-1] if result.verification.commands else None
-            if failed is not None:
-                how = "timed out" if failed.timed_out else f"exit {failed.exit_code}"
-                verification = f"`{failed.command}` failed ({how}):\n{failed.output_tail[-1500:]}"
-        summary = result.summary
-        if len(summary) > FOLLOWUP_SUMMARY_LIMIT:
-            summary = "... " + summary[-FOLLOWUP_SUMMARY_LIMIT:]
-        followup = Followup(
-            task_id=previous.task_id,
-            executor=previous.decision.executor,
-            status=previous.status.value,
-            resumed=resumed,
-            task=previous.request.task[:FOLLOWUP_SUMMARY_LIMIT],
-            summary=summary,
-            changed_files=result.changed_files,
-            error=(result.error or "")[:500] or None,
-            verification=verification,
-        )
-        return followup, session if resumed else None
+        original = previous
+        seen = {previous.task_id}
+        while original.request.followup_of and original.request.followup_of not in seen:
+            seen.add(original.request.followup_of)
+            earlier = await self.get(original.request.followup_of)
+            if earlier is None:
+                break
+            original = earlier
+        described = followup.describe(previous, original, resumed=resumed)
+        return described, session if resumed else None
 
     async def _note_executor_failure(
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
@@ -990,20 +953,39 @@ class Dispatcher:
         plan = EscalationPlan(
             reason=reason, tried=tried, executor=nxt, reroute=nxt is None and bool(failure)
         )
-        cap = self.settings.routing.max_chain_cost_usd
-        if cap is None or not plan.hands_off:
+        if not plan.hands_off:
             return plan
-        # Текущий результат ещё не записан в базу, его цена прибавляется
-        # отдельно; подзадачи звеньев уже там.
-        spent = await self.storage.tree_cost([task_id for task_id, _ in links])
-        if result.usage and result.usage.cost_usd:
-            spent += result.usage.cost_usd
-        if spent < cap:
+        stop = await self._budget_stop(links, result)
+        if stop is None:
             return plan
-        result.meta["budget"] = {"chain_cost_usd": round(spent, 4), "limit_usd": cap}
-        return EscalationPlan(
-            reason=f"{reason}; chain cost ${spent:.2f} reached max_chain_cost_usd", tried=tried
-        )
+        # Звено, которое бюджет всё равно не пустит, не должно удерживать
+        # работу (`integration_held`): цепочка кончается здесь, работа
+        # интегрируется, как у любой исчерпанной цепочки.
+        return EscalationPlan(reason=f"{reason}; {stop}", tried=tried)
+
+    async def _budget_stop(
+        self, links: list[tuple[str, str]], result: ExecutionResult
+    ) -> str | None:
+        """Причина не эскалировать по деньгам или None; цифры идут в `meta.budget`.
+
+        Текущий результат ещё не записан в базу, его цена прибавляется
+        отдельно; подзадачи звеньев и завершённые за сутки задачи уже там.
+        """
+        current = result.usage.cost_usd if result.usage and result.usage.cost_usd else 0.0
+        routing = self.settings.routing
+        if routing.max_chain_cost_usd is not None:
+            spent = current + await self.storage.tree_cost([task_id for task_id, _ in links])
+            if spent >= routing.max_chain_cost_usd:
+                result.meta["budget"] = {
+                    "chain_cost_usd": round(spent, 4),
+                    "limit_usd": routing.max_chain_cost_usd,
+                }
+                return f"chain cost ${spent:.2f} reached max_chain_cost_usd"
+        guard = await self._daily_budget_guard(extra=current)
+        if guard is not None:
+            result.meta["budget"] = {"daily_limit_usd": routing.daily_cost_limit_usd}
+            return guard.detail
+        return None
 
     async def _finalize(
         self,
@@ -1046,8 +1028,13 @@ class Dispatcher:
             {"from": decision.executor, "to": plan.executor or "router", "reason": plan.reason},
         )
         # `executor: None` отдаёт задачу роутеру; уже пробовавшие исключает `_prepare`.
+        update: dict[str, object] = {"executor": plan.executor}
+        if record.request.followup_of:
+            # Звено follow-up продолжает упавшую попытку, а не задачу до неё:
+            # иначе следующий исполнитель видел бы устаревший отчёт.
+            update["followup_of"] = record.task_id
         child = await self.submit(
-            record.request.model_copy(update={"executor": plan.executor}),
+            record.request.model_copy(update=update),
             escalated_from=record.task_id,
         )
         result.meta["escalated_to"] = child.task_id

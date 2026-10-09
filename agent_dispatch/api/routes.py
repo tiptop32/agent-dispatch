@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from agent_dispatch import __version__
-from agent_dispatch.dispatch.dispatcher import FollowupError
+from agent_dispatch.dispatch.followup import FollowupError
 from agent_dispatch.models import (
     FINAL_STATUSES,
     DispatchRequest,

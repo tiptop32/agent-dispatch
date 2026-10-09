@@ -26,6 +26,8 @@ class Followup(BaseModel):
     #: поэтому промпт короткий. Иначе итог прошлой попытки идёт в промпт.
     resumed: bool = False
     task: str = ""
+    #: Исходная задача цепочки follow-up, если прошлое звено само было follow-up.
+    original_task: str = ""
     summary: str = ""
     changed_files: list[str] = []
     error: str | None = None
