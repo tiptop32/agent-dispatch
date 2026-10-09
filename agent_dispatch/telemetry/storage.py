@@ -183,6 +183,39 @@ class Storage:
             current = row[0]
         return result
 
+    async def tree_cost(self, task_ids: list[str]) -> float:
+        """Расходы задач и всех их подзадач по `parent_task_id`, в долларах."""
+        if not task_ids:
+            return 0.0
+        marks = ", ".join("?" for _ in task_ids)
+        row = self._db.execute(
+            "WITH RECURSIVE tree(task_id) AS ("
+            f" SELECT task_id FROM tasks WHERE task_id IN ({marks})"
+            " UNION SELECT t.task_id FROM tasks t JOIN tree ON t.parent_task_id = tree.task_id)"
+            " SELECT COALESCE(SUM(json_extract(result_json, '$.usage.cost_usd')), 0)"
+            " FROM tasks WHERE task_id IN (SELECT task_id FROM tree)",
+            task_ids,
+        ).fetchone()
+        return float(row[0])
+
+    async def cost_since(self, since: datetime) -> float:
+        """Расходы исполнителей и роутера с момента `since`, в долларах.
+
+        Задача считается по времени завершения: цена известна только с
+        результатом. Незавершённые задачи сюда не попадают.
+        """
+        stamp = _dt(since)
+        tasks = self._db.execute(
+            "SELECT COALESCE(SUM(json_extract(result_json, '$.usage.cost_usd')), 0)"
+            " FROM tasks WHERE finished_at >= ?",
+            (stamp,),
+        ).fetchone()
+        decisions = self._db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM routing_decisions WHERE created_at >= ?",
+            (stamp,),
+        ).fetchone()
+        return float(tasks[0]) + float(decisions[0])
+
     async def list_tasks(self, since: datetime | None = None, limit: int = 100) -> list[TaskRecord]:
         if since is None:
             rows = self._db.execute(

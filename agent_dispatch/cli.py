@@ -120,6 +120,7 @@ def _request(
     timeout: int | None = None,
     allow_escalation: bool = True,
     kind: str = "task",
+    verify: list[str] | None = None,
 ) -> DispatchRequest:
     return DispatchRequest(
         task=task,
@@ -133,6 +134,7 @@ def _request(
         wait_seconds=wait,
         timeout_seconds=timeout,
         allow_escalation=allow_escalation,
+        verify=verify or [],
     )
 
 
@@ -152,6 +154,8 @@ def _print_task(view: TaskView, as_json: bool) -> None:
     typer.echo(f"status: {view.status}")
     typer.echo(f"executor: {executor}")
     typer.echo(f"changed_files: {','.join(result.changed_files) if result else ''}")
+    if result and result.verification:
+        typer.echo(f"verified: {result.verification.result}")
     typer.echo(f"summary: {result.summary if result else ''}")
     if view.status not in FINAL_STATUSES:
         typer.echo(f"still running: agent-dispatch status {view.task_id}")
@@ -210,6 +214,11 @@ def dispatch(
     kind: str = typer.Option(
         "task", help="task changes code; review reads the working copy and reports findings."
     ),
+    verify: list[str] | None = typer.Option(  # noqa: B008
+        None,
+        "--verify",
+        help="Shell command the daemon runs after the executor; non-zero exit escalates.",
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     views = asyncio.run(
@@ -226,6 +235,7 @@ def dispatch(
                 timeout=timeout,
                 allow_escalation=not no_escalation,
                 kind=kind,
+                verify=verify,
             ),
             wait,
             poll_seconds,

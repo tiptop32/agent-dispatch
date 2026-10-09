@@ -22,6 +22,7 @@ from agent_dispatch.models import (
     SourceAgent,
     TaskStatus,
     TaskView,
+    VerificationInfo,
 )
 from agent_dispatch.serve_state import ServeState
 
@@ -38,6 +39,11 @@ def _agent(value: str | None, default: SourceAgent | None = None) -> SourceAgent
 KIND_HINT = (
     "kind='task' (default) changes code; kind='review' asks for a read-only review "
     "of the working copy and returns findings without editing files."
+)
+VERIFY_HINT = (
+    " Pass `verify` with shell commands (e.g. the test command for the touched scope, "
+    "written for `cwd`): AgentDispatch runs them itself after the executor, and a "
+    "failure counts as not done and escalates."
 )
 
 
@@ -124,7 +130,30 @@ def _route_lines(decision: RouteDecision) -> list[str]:
 
 
 #: Поля `result.meta`, которые компактный ответ показывает вызывающему.
-_META_LINES = ("warning", "cooldown_until", "branch", "worktree", "patch", "integration_error")
+_META_LINES = (
+    "warning",
+    "cooldown_until",
+    "budget",
+    "branch",
+    "worktree",
+    "patch",
+    "integration_error",
+)
+
+
+def _verification_line(info: VerificationInfo) -> str:
+    """Итог проверки демона одной строкой; вывод упавшей команды обрезан."""
+    text = f"verified: {info.result}"
+    if info.result == "failed" and info.commands:
+        failed = info.commands[-1]
+        how = "timeout" if failed.timed_out else f"exit {failed.exit_code}"
+        tail = " | ".join(line for line in failed.output_tail.splitlines()[-3:] if line.strip())
+        text += f" ({failed.command}: {how}){f' {tail[-300:]}' if tail else ''}"
+    if info.contradicts_report:
+        text += "; executor reported tests passed"
+    if info.tests_changed:
+        text += f"; tests changed: {', '.join(info.tests_changed)}"
+    return text
 
 
 def _task_text(view: TaskView, verbose: bool = False) -> str:
@@ -164,6 +193,8 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
             if result.tests.command:
                 tests += f" ({result.tests.command})"
             lines.append(f"tests: {tests}")
+        if result.verification:
+            lines.append(_verification_line(result.verification))
         if result.error:
             lines.append(f"error: {result.error[:500]}")
         for key in _META_LINES:
@@ -262,6 +293,7 @@ def build_server(
         timeout_seconds: int | None,
         verbose: bool,
         kind: str = "task",
+        verify: list[str] | None = None,
     ) -> str:
         try:
             wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
@@ -280,6 +312,7 @@ def build_server(
                 wait_seconds=wait,
                 timeout_seconds=timeout_seconds,
                 kind=kind,
+                verify=verify or [],
             )
             return _task_text(await client.submit(req), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
@@ -288,7 +321,7 @@ def build_server(
     @server.tool(
         description=(
             "Dispatch a coding task to the selected executor. Do not re-dispatch an "
-            "already delegated task unless escalation is allowed. " + KIND_HINT
+            "already delegated task unless escalation is allowed. " + KIND_HINT + VERIFY_HINT
         )
     )
     async def dispatch(
@@ -303,6 +336,7 @@ def build_server(
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
         kind: str = "task",
+        verify: list[str] | None = None,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -319,13 +353,16 @@ def build_server(
             timeout_seconds,
             verbose,
             kind,
+            verify,
         )
 
     @server.tool(
         description=(
             "Dispatch a coding task to a specific executor. Use only when the executor "
             "is known; do not re-dispatch delegated work unless escalation is allowed. "
-            "Executors out of usage limits are refused: call `executors` first. " + KIND_HINT
+            "Executors out of usage limits are refused: call `executors` first. "
+            + KIND_HINT
+            + VERIFY_HINT
         )
     )
     async def dispatch_to(
@@ -341,6 +378,7 @@ def build_server(
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
         kind: str = "task",
+        verify: list[str] | None = None,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -357,6 +395,7 @@ def build_server(
             timeout_seconds,
             verbose,
             kind,
+            verify,
         )
 
     @server.tool(

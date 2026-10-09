@@ -42,6 +42,12 @@ routing:
   # источник -> адаптеры, которым он отдаёт только ревью (kind: review), не задачи
   review_only:
     codex: [claude]
+  # потолок расходов цепочки эскалации с подзадачами, $; null выключает.
+  # Считается только цена, которую сообщает CLI (claude, opencode; codex нет).
+  max_chain_cost_usd: null
+  # потолок расходов за локальные сутки (исполнители и роутер), $; null выключает.
+  # Дошли до него: новые задачи и звенья эскалации получают отказ budget.
+  daily_cost_limit_usd: null
 
 execution:
   workspace_mode: in_place    # worktree: каждому исполнителю свой git worktree
@@ -50,6 +56,7 @@ execution:
   integrate: apply            # apply: патч в рабочую копию; branch: только ветка; manual: ничего не трогать
   keep_worktrees: false
   idle_timeout_seconds: 900
+  verify_timeout_seconds: 600 # предел на каждую команду verify из запроса
 
 executors:
   claude:

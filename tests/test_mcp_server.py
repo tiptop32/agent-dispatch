@@ -367,3 +367,41 @@ async def test_compact_output_shows_cooldown_and_review_warning(tmp_path):
     text = (await call(settings(tmp_path), "status", {"task_id": "t1"})).content[0].text
     assert "warning: review changed files: a.py" in text
     assert "cooldown_until: 2026-10-03T00:01:00+00:00" in text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dispatch_sends_verify_commands(tmp_path):
+    request = respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(200, json=view().model_dump(mode="json"))
+    )
+    await call(
+        settings(tmp_path),
+        "dispatch",
+        {"task": "fix", "cwd": ".", "verify": ["uv run pytest tests -q"]},
+    )
+    assert '"verify":["uv run pytest tests -q"]' in request.calls[0].request.content.decode()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compact_output_shows_failed_verification_and_budget(tmp_path):
+    payload = view(status="partial").model_dump(mode="json")
+    payload["result"]["verification"] = model_types.VerificationInfo(
+        result="failed",
+        commands=[
+            model_types.VerifyCommand(
+                command="pytest -q", exit_code=1, output_tail="collected 3\n\nFAILED test_a\n"
+            )
+        ],
+        tests_changed=["tests/test_a.py"],
+        contradicts_report=True,
+    ).model_dump(mode="json")
+    payload["result"]["meta"] = {"budget": {"chain_cost_usd": 2.1, "limit_usd": 2.0}}
+    respx.get("http://127.0.0.1:7433/tasks/t1").mock(return_value=httpx.Response(200, json=payload))
+    text = (await call(settings(tmp_path), "status", {"task_id": "t1"})).content[0].text
+    assert (
+        "verified: failed (pytest -q: exit 1) collected 3 | FAILED test_a; "
+        "executor reported tests passed; tests changed: tests/test_a.py"
+    ) in text
+    assert "budget: {'chain_cost_usd': 2.1, 'limit_usd': 2.0}" in text

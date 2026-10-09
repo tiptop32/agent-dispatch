@@ -114,6 +114,12 @@ def commit(worktree: Worktree, message: str) -> str | None:
     if add.returncode != 0:
         raise WorktreeError(add.stderr.strip() or "git add failed")
     if _git(["diff", "--cached", "--quiet"], worktree.path).returncode == 0:
+        # Индекс чист, но работа уже может лежать коммитом на ветке: демон
+        # коммитит до проверки `verify`. Тогда результат это HEAD, а не «пусто».
+        if worktree.base:
+            head = _git(["rev-parse", "HEAD"], worktree.path)
+            if head.returncode == 0 and head.stdout.strip() != worktree.base:
+                return head.stdout.strip()
         return None
     result = _git(
         [*_identity(worktree.path), "commit", "--no-verify", "-m", message], worktree.path
@@ -141,6 +147,19 @@ def build_patch(worktree: Worktree) -> str:
     if diff.returncode != 0:
         raise WorktreeError(diff.stderr.strip() or "git diff failed")
     return diff.stdout
+
+
+def discard_changes(worktree: Worktree) -> None:
+    """Вернуть дерево к его HEAD: убрать правки и неотслеживаемые файлы.
+
+    Только для собственного дерева демона после коммита работы: так артефакты
+    проверки (кэши, отчёты покрытия) не попадают в патч. Игнорируемые файлы
+    не трогаются, в патч они и так не идут.
+    """
+    for args in (["reset", "--hard", "-q", "HEAD"], ["clean", "-fdq"]):
+        result = _git(args, worktree.path)
+        if result.returncode != 0:
+            raise WorktreeError(result.stderr.strip() or f"git {args[0]} failed")
 
 
 @dataclass

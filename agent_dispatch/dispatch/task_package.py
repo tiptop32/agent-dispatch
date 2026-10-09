@@ -83,7 +83,7 @@ def _bullets(value: list[str]) -> str:
     return "\n".join(f"- {item}" for item in value) if value else "- (none)"
 
 
-def _rewrite_repo_prefix(text: str | None, repo_root: str, worktree: str) -> str | None:
+def rewrite_repo_prefix(text: str | None, repo_root: str, worktree: str) -> str | None:
     """Абсолютные пути исходной рабочей копии → пути worktree, только внутри префикса.
 
     Вызывающий пишет пути своего cwd (`/x/repo/...`) где угодно в тексте, а
@@ -101,7 +101,7 @@ def _rewrite_repo_prefix(text: str | None, repo_root: str, worktree: str) -> str
 def _rewrite_file_list(files: list[str] | None, repo_root: str, worktree: str) -> list[str] | None:
     if not files:
         return files
-    return [_rewrite_repo_prefix(item, repo_root, worktree) or item for item in files]
+    return [rewrite_repo_prefix(item, repo_root, worktree) or item for item in files]
 
 
 def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Settings) -> str:
@@ -117,16 +117,17 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
     env.filters["bullets"] = _bullets
     req = package.request
     worktree = package.worktree
-    task, context, files = req.task, req.context, req.files
+    task, context, files, checks = req.task, req.context, req.files, req.verify
     if worktree:
         # В worktree-режиме вызывающий мог написать абсолютные пути исходной
         # рабочей копии: переписываем их на пути worktree, иначе агент правит
         # чужую рабочую копию мимо своего дерева (opencode --auto одобряет
         # external_directory). Оба пути остаются в промпте.
         root = package.repo_root or req.cwd
-        task = _rewrite_repo_prefix(task, root, worktree)
-        context = _rewrite_repo_prefix(context, root, worktree)
+        task = rewrite_repo_prefix(task, root, worktree)
+        context = rewrite_repo_prefix(context, root, worktree)
         files = _rewrite_file_list(files, root, worktree)
+        checks = _rewrite_file_list(checks, root, worktree)
     if adapter_kind == "codex":
         instructions = "Report the outcome using the structured output schema: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation."  # noqa: E501
     else:
@@ -143,6 +144,7 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         files=files,
         constraints=req.constraints,
         success_criteria=req.success_criteria,
+        verify=checks,
         context_mode=req.context_mode.value,
         git_status=package.git_status or "",
         git_diff_stat=package.git_diff_stat or "",
