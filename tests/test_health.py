@@ -73,6 +73,18 @@ def test_stall_after_codex_lost_the_api_is_a_network_failure():
             id="reconnects-but-changed-files",
         ),
         pytest.param(
+            # Таймаут с изменёнными файлами приходит как partial: исполнитель не виноват.
+            ExecutionResult(
+                status="partial",
+                executor="x",
+                model=None,
+                summary="дописал модуль",
+                error="timeout",
+                changed_files=["src/app/main.py"],
+            ),
+            id="partial-timeout",
+        ),
+        pytest.param(
             # Протухший OAuth MCP-сервера в stderr codex: сам codex работает дальше.
             _failed(
                 "ERROR codex_rmcp_client::oauth::refresh_transaction: error=failed to refresh "

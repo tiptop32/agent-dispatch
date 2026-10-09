@@ -19,7 +19,9 @@ from agent_dispatch.config import (
 )
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.executors import worktree
+from agent_dispatch.executors.process import ProcessOutcome
 from agent_dispatch.executors.registry import AvailabilityCache
+from agent_dispatch.executors.result_parser import normalize
 from agent_dispatch.models import DispatchRequest, ExecutionResult, TaskStatus
 from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
@@ -33,9 +35,9 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout
 
 
-async def _make(tmp_path: Path, **execution):
+async def _make(tmp_path: Path, *, max_tasks: int = 2, **execution):
     settings = Settings(
-        server=ServerSettings(data_dir=tmp_path, max_concurrent_tasks=2),
+        server=ServerSettings(data_dir=tmp_path, max_concurrent_tasks=max_tasks),
         routing=RoutingSettings(fallback_executor="codex"),
         execution=ExecutionSettings(workspace_mode="worktree", **execution),
         executors={"codex": ExecutorSettings(adapter="codex", description="codex")},
@@ -284,6 +286,88 @@ def _holds(gate: asyncio.Event):
 
 
 @pytest.mark.asyncio
+async def test_parent_worktree_is_kept_until_nested_child_finishes(tmp_path, git_repo):
+    _, storage, adapters, dispatcher = await _make(tmp_path, max_tasks=1)
+    child_gate = asyncio.Event()
+    child_started = asyncio.Event()
+    submitted = []
+
+    async def nested(ctx):
+        if submitted:
+            (Path(ctx.cwd) / "child.py").write_text("child = True\n")
+            child_started.set()
+            await child_gate.wait()
+            return
+        child = await dispatcher.submit(_req(Path(ctx.cwd)))
+        submitted.append(child)
+        await child_started.wait()
+
+    adapters["codex"].on_execute = nested
+    parent = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(parent.task_id, WAIT)
+    tree_path = Path(adapters["codex"].calls[0].cwd)
+
+    assert done.status == "completed"
+    assert tree_path.is_dir()  # noqa: ASYNC240
+    assert done.result.meta["worktree_kept"] == "active children"
+    assert done.result.meta["worktree"] == str(tree_path)
+    assert done.result.meta["branch"]
+
+    child_gate.set()
+    child = await dispatcher.wait(submitted[0].task_id, WAIT)
+    stored_child = await storage.get_task(submitted[0].task_id)
+    assert child.status == "completed" and child.result.meta["integrated"] is True
+    assert stored_child.parent_task_id == parent.task_id and stored_child.hop == parent.hop + 1
+    assert (tree_path / "child.py").read_text() == "child = True\n"
+
+
+@pytest.mark.asyncio
+async def test_missing_queued_cwd_fails_cleanly_and_finalizes(tmp_path, git_repo):
+    _, storage, adapters, dispatcher = await _make(tmp_path, max_tasks=1)
+    gate = asyncio.Event()
+    adapters["codex"].on_execute = _holds(gate)
+    first = await dispatcher.submit(_req(git_repo))
+    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+
+    doomed = git_repo / "doomed"
+    doomed.mkdir()
+    queued = await dispatcher.submit(_req(doomed))
+    for _ in range(100):
+        if (await storage.get_task(queued.task_id)).decision is not None:
+            break
+        await asyncio.sleep(0.01)
+    doomed.rmdir()
+    gate.set()
+    await dispatcher.wait(first.task_id, WAIT)
+    done = await dispatcher.wait(queued.task_id, WAIT)
+
+    assert done.status == "failed" and done.finished_at is not None
+    assert done.result.error == f"cwd does not exist: {doomed} (parent worktree removed?)"
+    assert "FileNotFoundError" not in done.result.error
+    assert any(event["kind"] == "exit" for event in await storage.list_events(queued.task_id))
+
+
+@pytest.mark.asyncio
+async def test_hop_zero_request_inside_worktree_inherits_its_parent(tmp_path, git_repo):
+    _, _, adapters, dispatcher = await _make(tmp_path, max_tasks=1)
+    gate = asyncio.Event()
+    adapters["codex"].gate = gate
+    parent = await dispatcher.submit(_req(git_repo, root_agent="claude"))
+    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    parent_tree = Path(adapters["codex"].calls[0].cwd)
+
+    child = await dispatcher.submit(_req(parent_tree, hop=0))
+
+    assert child.parent_task_id == parent.task_id
+    assert child.request.parent_task_id == parent.task_id
+    assert child.hop == child.request.hop == parent.hop + 1
+    assert child.root_agent == child.request.root_agent == parent.root_agent
+    gate.set()
+    await dispatcher.wait(parent.task_id, WAIT)
+    await dispatcher.wait(child.task_id, WAIT)
+
+
+@pytest.mark.asyncio
 async def test_cancelled_task_keeps_the_worktree_and_reports_it(tmp_path, git_repo):
     _, _, adapters, dispatcher = await _make(tmp_path)
     adapters["codex"].on_execute = _holds(asyncio.Event())
@@ -479,6 +563,50 @@ async def test_escalated_work_is_held_on_its_branch_and_the_next_executor_integr
     branch = parent.result.meta["branch"]
     assert _git(git_repo, "show", f"{branch}:a.py") == "x = 'half'\n"
     assert Path(parent.result.meta["patch"]).is_file()  # noqa: ASYNC240
+
+
+@pytest.mark.asyncio
+async def test_timed_out_work_with_changed_files_is_partial_and_not_escalated(tmp_path, git_repo):
+    # Таймаут с изменёнными файлами — это partial: эскалации нет, судит
+    # вызывающий по дифу. Результат строится через normalize, как это делают
+    # настоящие адаптеры из ProcessOutcome и git-дифа.
+    settings = Settings(
+        server=ServerSettings(data_dir=tmp_path, max_concurrent_tasks=2),
+        routing=RoutingSettings(fallback_executor="codex"),
+        execution=ExecutionSettings(workspace_mode="worktree"),
+        executors={
+            "codex": ExecutorSettings(adapter="codex", description="codex"),
+            "claude": ExecutorSettings(adapter="claude", description="claude"),
+        },
+        escalation={"codex": ["claude"]},
+    )
+    storage = Storage(tmp_path / "db.sqlite")
+    await storage.open()
+    outcome = ProcessOutcome(exit_code=0, stdout="out", stderr="", timed_out=True, duration_ms=12)
+    adapters = {
+        "codex": FakeAdapter(
+            "codex",
+            result=normalize(None, outcome, ["a.py"], "codex", None),
+            on_execute=_writes("x = 'half'\n"),
+        ),
+        "claude": FakeAdapter("claude", on_execute=_writes("x = 'done'\n")),
+    }
+    dispatcher = Dispatcher(
+        settings, storage, adapters, AvailabilityCache(adapters, 60), [FakeRouter()]
+    )
+
+    first = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(first.task_id, WAIT)
+
+    assert done.status == "partial"
+    assert done.result.error == "timeout"
+    assert done.result.meta["timed_out"] is True
+    # Эскалации нет: звено claude не стартовало, работа легла в рабочую копию.
+    kinds = {event["kind"] for event in await storage.list_events(first.task_id)}
+    assert "escalate" not in kinds
+    assert done.result.meta["integrated"] is True
+    assert "integration_held" not in done.result.meta
+    assert (git_repo / "a.py").read_text() == "x = 'half'\n"
 
 
 @pytest.mark.asyncio

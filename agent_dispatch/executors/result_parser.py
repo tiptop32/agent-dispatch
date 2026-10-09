@@ -47,12 +47,23 @@ def normalize(
             meta=meta,
         )
     if outcome.timed_out:
+        if changed_files:
+            meta["timed_out"] = True
+            return ExecutionResult(
+                status="partial",
+                executor=executor,
+                model=model,
+                summary=_tail(outcome.stdout),
+                changed_files=changed_files,
+                error="timeout",
+                meta=meta,
+            )
         return ExecutionResult(
             status="failed",
             executor=executor,
             model=model,
             summary=_tail(outcome.stdout),
-            changed_files=changed_files or [],
+            changed_files=[],
             error="timeout",
             meta=meta,
         )

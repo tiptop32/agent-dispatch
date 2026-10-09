@@ -21,6 +21,7 @@ def make_task(
     parent: str | None = None,
     status: str = "queued",
     created: datetime | None = None,
+    assigned: bool = False,
 ) -> TaskRecord:
     return TaskRecord(
         task_id=task_id or uuid4().hex,
@@ -31,7 +32,7 @@ def make_task(
         hop=0,
         request=DispatchRequest(task="x", cwd="/tmp"),
         status=status,
-        decision=None,
+        decision=decision() if assigned else None,
         result=None,
         log_path="/tmp/x.log",
         created_at=created or datetime.now(UTC),
@@ -121,12 +122,15 @@ async def test_task_exists(storage: Storage):
     assert await storage.task_exists(task.task_id)
 
 
-async def test_count_children_excludes_cancelled(storage: Storage):
+async def test_count_children_excludes_unassigned_and_cancelled(storage: Storage):
     parent = make_task()
     await storage.insert_task(parent)
+    assigned = make_task(parent=parent.task_id, assigned=True)
+    await storage.insert_task(assigned)
     await storage.insert_task(make_task(parent=parent.task_id))
-    await storage.insert_task(make_task(parent=parent.task_id, status="cancelled"))
+    await storage.insert_task(make_task(parent=parent.task_id, status="cancelled", assigned=True))
     assert await storage.count_children(parent.task_id) == 1
+    assert await storage.count_children(parent.task_id, exclude_task_id=assigned.task_id) == 0
 
 
 async def test_ancestors_chain_and_depth_cap(storage: Storage):
@@ -198,10 +202,10 @@ async def test_count_children_can_exclude_escalation_retries(storage: Storage):
     parent = make_task()
     await storage.insert_task(parent)
     for escalated in (None, parent.task_id, None):
-        child = make_task(parent=parent.task_id)
+        child = make_task(parent=parent.task_id, assigned=True)
         child.escalated_from = escalated
         await storage.insert_task(child)
-    await storage.insert_task(make_task(parent=parent.task_id, status="cancelled"))
+    await storage.insert_task(make_task(parent=parent.task_id, status="cancelled", assigned=True))
     assert await storage.count_children(parent.task_id) == 3
     assert await storage.count_children(parent.task_id, exclude_escalated=True) == 2
 

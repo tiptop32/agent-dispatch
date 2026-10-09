@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_dispatch.models import (
+    FINAL_STATUSES,
     DispatchRequest,
     ExecutionResult,
     RouteDecision,
@@ -149,12 +150,24 @@ class Storage:
             is not None
         )
 
-    async def count_children(self, parent_task_id: str, exclude_escalated: bool = False) -> int:
-        """Дети родителя без cancelled; с exclude_escalated не считаются ретраи эскалации."""
-        query = "SELECT COUNT(*) FROM tasks WHERE parent_task_id=? AND status != 'cancelled'"
+    async def count_children(
+        self,
+        parent_task_id: str,
+        exclude_escalated: bool = False,
+        exclude_task_id: str | None = None,
+    ) -> int:
+        """Дети, которым назначен исполнитель; отказанные попытки квоту не занимают."""
+        query = (
+            "SELECT COUNT(*) FROM tasks WHERE parent_task_id=?"
+            " AND status != 'cancelled' AND executor IS NOT NULL"
+        )
+        params: list[str] = [parent_task_id]
         if exclude_escalated:
             query += " AND escalated_from IS NULL"
-        row = self._db.execute(query, (parent_task_id,)).fetchone()
+        if exclude_task_id is not None:
+            query += " AND task_id != ?"
+            params.append(exclude_task_id)
+        row = self._db.execute(query, params).fetchone()
         return int(row[0])
 
     async def ancestors(self, task_id: str) -> list[str]:
@@ -180,6 +193,15 @@ class Storage:
                 "SELECT * FROM tasks WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
                 (_dt(since), limit),
             ).fetchall()
+        return [self._task_from_row(row) for row in rows]
+
+    async def list_active_tasks(self) -> list[TaskRecord]:
+        """Задачи, чьи cwd ещё могут использоваться выполняющимся процессом."""
+        statuses = sorted(status.value for status in FINAL_STATUSES)
+        rows = self._db.execute(
+            f"SELECT * FROM tasks WHERE status NOT IN ({', '.join('?' for _ in statuses)})",
+            statuses,
+        ).fetchall()
         return [self._task_from_row(row) for row in rows]
 
     async def add_decision(

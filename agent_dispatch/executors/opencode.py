@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 
 from agent_dispatch.config import ExecutorSettings
 from agent_dispatch.executors.base import (
@@ -42,6 +43,25 @@ def _without_auto_enable(args: list[str]) -> list[str]:
     return result
 
 
+def review_permissions_env() -> str:
+    """OPENCODE_PERMISSION для ревью: читать /tmp разрешено, править — нет.
+
+    Ревью идёт с `--agent plan` и без `--auto`, поэтому чтение лога в /tmp,
+    названного вызывающим, иначе автоотклоняется (проверено живьём на
+    opencode 1.18.35: без переменной чтение «auto-rejecting», с ней файл
+    читается). Обычным задачам переменную не ставим: там своё `--auto`.
+    """
+    return json.dumps(
+        {
+            "external_directory": {
+                "/tmp/*": "allow",
+                "/private/tmp/*": "allow",
+                f"{tempfile.gettempdir()}/*": "allow",
+            }
+        }
+    )
+
+
 class OpenCodeAdapter(BaseExecutorAdapter):
     def __init__(
         self, name: str, settings: ExecutorSettings, base_env: dict[str, str] | None = None
@@ -79,6 +99,10 @@ class OpenCodeAdapter(BaseExecutorAdapter):
         ]
 
     async def execute(self, ctx: RunContext) -> ExecutionResult:
+        if ctx.read_only:
+            ctx = ctx.model_copy(
+                update={"env": {**ctx.env, "OPENCODE_PERMISSION": review_permissions_env()}}
+            )
         argv = self.build_argv(ctx)
         return await self._execute_common(
             ctx,

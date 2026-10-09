@@ -15,6 +15,7 @@ from agent_dispatch.config import load_settings
 from agent_dispatch.doctor import (
     Check,
     _install_check,
+    codex_env_check,
     format_checks,
     install_check,
     run_checks,
@@ -25,6 +26,9 @@ from agent_dispatch.serve_state import ServeState, write_state
 runner = CliRunner()
 FAKE = Path(__file__).parent / "fakes" / "version_only.sh"
 JEV_RESPONSE = Path(__file__).parent / "fixtures" / "jev" / "response_ok.json"
+CODEX_ENV_VARS_LINE = (
+    'env_vars = ["AGENT_DISPATCH_HOP", "AGENT_DISPATCH_TASK_ID", "AGENT_DISPATCH_ROOT_AGENT"]'
+)
 
 
 def _package_tree(root: Path, files: dict[str, str]) -> Path:
@@ -61,6 +65,99 @@ def _configure(
 
 def _state(port: int = 17434) -> ServeState:
     return ServeState(pid=os.getpid(), port=port, token="secret", started_at=datetime.now(UTC))
+
+
+@pytest.fixture(autouse=True)
+def _no_codex_config(tmp_path_factory, monkeypatch):
+    """Проверка codex смотрит в tmp CODEX_HOME, а не в настоящий ~/.codex."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path_factory.mktemp("codex")))
+
+
+def _codex_config(tmp_path: Path, body: str) -> Path:
+    path = tmp_path / "config.toml"
+    path.write_text(body)
+    return path
+
+
+def test_codex_env_check_warns_with_the_line_to_add(tmp_path):
+    path = _codex_config(
+        tmp_path, '[mcp_servers.agent-dispatch]\ncommand = "agent-dispatch"\nargs = ["mcp"]\n'
+    )
+
+    check = codex_env_check(path)
+
+    assert not check.ok
+    assert "does not forward AGENT_DISPATCH_HOP" in check.detail
+    assert CODEX_ENV_VARS_LINE in check.detail
+    assert "[mcp_servers.agent-dispatch]" in check.detail
+
+
+def test_codex_env_check_lists_each_missing_var(tmp_path):
+    path = _codex_config(
+        tmp_path,
+        '[mcp_servers.agent-dispatch]\nenv_vars = ["AGENT_DISPATCH_HOP"]\n',
+    )
+
+    check = codex_env_check(path)
+
+    assert not check.ok
+    assert "does not forward AGENT_DISPATCH_TASK_ID, AGENT_DISPATCH_ROOT_AGENT" in check.detail
+
+
+def test_codex_env_check_ok_when_all_vars_forwarded(tmp_path):
+    path = _codex_config(
+        tmp_path,
+        "[mcp_servers.agent-dispatch]\n" + CODEX_ENV_VARS_LINE + "\n",
+    )
+
+    check = codex_env_check(path)
+
+    assert check.ok and "forwarded" in check.detail
+
+
+def test_codex_env_check_skips_without_codex_config(tmp_path):
+    check = codex_env_check(tmp_path / "config.toml")
+    assert check.ok and "skipped" in check.detail
+
+
+def test_codex_env_check_skips_without_agent_dispatch_server(tmp_path):
+    path = _codex_config(tmp_path, '[mcp_servers.other]\ncommand = "x"\n')
+
+    check = codex_env_check(path)
+
+    assert check.ok and "no agent-dispatch server" in check.detail
+
+
+def test_codex_env_check_uses_codex_home(monkeypatch, tmp_path):
+    _codex_config(
+        tmp_path,
+        "[mcp_servers.agent-dispatch]\n" + CODEX_ENV_VARS_LINE + "\n",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    assert doctor_module._codex_env_check().ok
+
+
+def test_codex_env_check_reports_broken_toml(tmp_path):
+    path = _codex_config(tmp_path, "[mcp_servers.agent-dispatch\n")
+
+    check = codex_env_check(path)
+
+    assert not check.ok and "cannot parse" in check.detail
+
+
+@pytest.mark.asyncio
+async def test_run_checks_includes_codex_env_vars_check(tmp_config_dir, monkeypatch, tmp_path):
+    monkeypatch.setenv(
+        "CODEX_HOME",
+        str(_codex_config(tmp_path, '[mcp_servers.agent-dispatch]\ncommand = "x"\n').parent),
+    )
+    settings = _configure(tmp_config_dir)
+
+    checks = await run_checks(settings)
+
+    check = next(c for c in checks if c.name == "codex-env-vars")
+    assert not check.ok and CODEX_ENV_VARS_LINE in check.detail
 
 
 @pytest.fixture(autouse=True)

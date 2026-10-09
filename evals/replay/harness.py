@@ -29,6 +29,11 @@ from agent_dispatch.models import ExecutionResult
 #: Ошибки валидации, которые `_coerce` теперь исправляет сам.
 _FORMAT_ERRORS = ("is not of type 'number'", "None is not of type")
 
+#: Отказ guard'а до запуска исполнителя (не сбой CLI): соседей слишком много,
+#: исполнитель недоступен или его выводил из ротации лимит. У таких задач
+#: исполнитель пустой или стоит `meta.guard`, а ошибка повторяет текст guard'а.
+_GUARD_ERROR_MARKERS = ("sibling count", "executor is unavailable", "after quota")
+
 
 @dataclass
 class Task:
@@ -42,13 +47,25 @@ class Task:
     result: ExecutionResult | None
     source_agent: str = "unknown"
     kind: str = "task"
+    started_at: datetime | None = None
+
+
+def guard_refusal(task: Task) -> bool:
+    """Задача, которую демон не запускал: guard отклонил её до исполнителя."""
+    if not task.executor:
+        return True
+    meta = task.result.meta if task.result else {}
+    if meta.get("guard"):
+        return True
+    error = (task.result.error or "") if task.result else ""
+    return any(marker in error for marker in _GUARD_ERROR_MARKERS)
 
 
 def load(db_path: Path) -> list[Task]:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = conn.execute(
-            "select task_id, coalesce(executor, ''), status, created_at, finished_at,"
+            "select task_id, coalesce(executor, ''), status, created_at, started_at, finished_at,"
             " coalesce(duration_ms, 0), escalated_from, result_json, source_agent,"
             " coalesce(json_extract(request_json, '$.kind'), 'task')"
             " from tasks order by created_at"
@@ -61,12 +78,13 @@ def load(db_path: Path) -> list[Task]:
             executor=row[1],
             status=row[2],
             created_at=datetime.fromisoformat(row[3]),
-            finished_at=datetime.fromisoformat(row[4]) if row[4] else None,
-            duration_ms=row[5],
-            escalated_from=row[6],
-            result=ExecutionResult.model_validate_json(row[7]) if row[7] else None,
-            source_agent=row[8],
-            kind=row[9],
+            started_at=datetime.fromisoformat(row[4]) if row[4] else None,
+            finished_at=datetime.fromisoformat(row[5]) if row[5] else None,
+            duration_ms=row[6],
+            escalated_from=row[7],
+            result=ExecutionResult.model_validate_json(row[8]) if row[8] else None,
+            source_agent=row[9],
+            kind=row[10],
         )
         for row in rows
     ]
@@ -78,6 +96,16 @@ def default_limit_group(executor: str) -> str:
     return adapter if adapter in {"claude", "codex"} else executor
 
 
+def _window(times: list[datetime]) -> dict | None:
+    """Первый и последний случай секции: старые проблемы не читаются как живые."""
+    if not times:
+        return None
+    return {
+        "first": min(times).isoformat(timespec="seconds"),
+        "last": max(times).isoformat(timespec="seconds"),
+    }
+
+
 def replay(
     tasks: list[Task],
     cooldown: int = 900,
@@ -87,26 +115,20 @@ def replay(
     review_only: dict[str, list[str]] | None = None,
     local_tz: tzinfo | None = None,
     recheck: Callable[[str], bool] = lambda _executor: False,
+    since: datetime | None = None,
 ) -> dict:
+    if since is not None:
+        tasks = [task for task in tasks if task.created_at >= since]
     by_id = {task.task_id: task for task in tasks}
     review_only = {"codex": ["claude"]} if review_only is None else review_only
     failures: list[dict] = []
-    avoidable: list[dict] = []
-    # Группа лимита -> момент, до которого она остывала бы; capacity держит
-    # только своего исполнителя (ключ `executor:<name>`).
-    down_until: dict[str, datetime] = {}
+    failure_times: list[datetime] = []
+    # Остывания сбоев: (ключ, когда сбой кончился, до какого момента остывание).
+    # Момент сравнения берётся от запуска задачи, а не от её создания.
+    cooldowns: list[tuple[str, datetime, datetime]] = []
     for task in tasks:
-        keys = (limit_group(task.executor), f"executor:{task.executor}")
-        until = max((down_until[key] for key in keys if key in down_until), default=None)
-        if until is not None and task.created_at < until:
-            avoidable.append(
-                {
-                    "task_id": task.task_id[:8],
-                    "executor": task.executor,
-                    "status": task.status,
-                    "minutes": round(task.duration_ms / 60000, 1),
-                }
-            )
+        if guard_refusal(task):
+            continue
         kind = classify_failure(task.result) if task.result else None
         if kind is not None and task.finished_at is not None:
             error = task.result.error or ""
@@ -127,13 +149,40 @@ def replay(
                     "hours": round(seconds / 3600, 2),
                 }
             )
+            failure_times.append(task.finished_at)
             key = (
                 limit_group(task.executor)
                 if failure_scope(kind, error) == "group"
                 else f"executor:{task.executor}"
             )
-            moment = task.finished_at + timedelta(seconds=seconds)
-            down_until[key] = max(moment, down_until.get(key, moment))
+            cooldowns.append((key, task.finished_at, task.finished_at + timedelta(seconds=seconds)))
+
+    avoidable: list[dict] = []
+    avoidable_times: list[datetime] = []
+    for task in tasks:
+        # Никогда не запущенную задачу и отказ guard'а сопоставлять с остыванием
+        # нечем: исполнитель не выбирался и не тратил минуты.
+        if guard_refusal(task) or task.started_at is None:
+            continue
+        keys = (limit_group(task.executor), f"executor:{task.executor}")
+        until = max(
+            (
+                moment
+                for key, finished, moment in cooldowns
+                if key in keys and finished <= task.started_at
+            ),
+            default=None,
+        )
+        if until is not None and task.started_at < until:
+            avoidable.append(
+                {
+                    "task_id": task.task_id[:8],
+                    "executor": task.executor,
+                    "status": task.status,
+                    "minutes": round(task.duration_ms / 60000, 1),
+                }
+            )
+            avoidable_times.append(task.started_at)
 
     restricted = [
         task
@@ -143,6 +192,7 @@ def replay(
     ]
 
     held: list[dict] = []
+    held_times: list[datetime] = []
     for child in tasks:
         parent = by_id.get(child.escalated_from or "")
         if parent is None or parent.result is None:
@@ -156,13 +206,16 @@ def replay(
                     "child_integrated": child_meta.get("integrated"),
                 }
             )
+            if parent.finished_at is not None:
+                held_times.append(parent.finished_at)
 
     partial = [task for task in tasks if task.status == "partial" and task.result]
-    format_only = [
-        task.task_id[:8]
+    format_only_tasks = [
+        task
         for task in partial
         if any(error in task.result.meta.get("parse_error", "") for error in _FORMAT_ERRORS)
     ]
+    format_only = [task.task_id[:8] for task in format_only_tasks]
     return {
         "tasks": len(tasks),
         "cooldown_seconds": cooldown,
@@ -179,14 +232,30 @@ def replay(
         "review_only_runs": len(restricted),
         "review_only_failed": sum(1 for task in restricted if task.status == "failed"),
         "review_only_minutes": round(sum(task.duration_ms for task in restricted) / 60000, 1),
+        "section_windows": {
+            "executor_failures": _window(failure_times),
+            "avoidable_runs": _window(avoidable_times),
+            "integrations_to_hold": _window(held_times),
+            "partial_from_report_format": _window([task.created_at for task in format_only_tasks]),
+            "review_only_runs": _window([task.created_at for task in restricted]),
+        },
     }
 
 
 def render(report: dict) -> str:
+    windows = report.get("section_windows", {})
+
+    def window(key: str) -> str:
+        info = windows.get(key)
+        if not info:
+            return ""
+        return f" (cases {info['first']} … {info['last']})"
+
     lines = [
         f"tasks: {report['tasks']}",
         f"executor failures (cooldown {report['cooldown_seconds']}s, quota until reset or "
-        f"{report['quota_cooldown_seconds']}s): {len(report['executor_failures'])}",
+        f"{report['quota_cooldown_seconds']}s): {len(report['executor_failures'])}"
+        + window("executor_failures"),
     ]
     lines += [
         f"  {row['task_id']} {row['executor']}: {row['kind']} for {row['hours']} h"
@@ -194,7 +263,7 @@ def render(report: dict) -> str:
     ]
     lines.append(
         f"runs sent to an executor that was already down: {len(report['avoidable_runs'])}, "
-        f"{report['avoidable_minutes']} min"
+        f"{report['avoidable_minutes']} min" + window("avoidable_runs")
     )
     lines += [
         f"  {row['task_id']} {row['executor']} {row['status']} {row['minutes']} min"
@@ -203,13 +272,16 @@ def render(report: dict) -> str:
     lines.append(
         f"half-done work integrated before an escalation: {len(report['integrations_to_hold'])}, "
         f"next executor's integration failed: {report['integration_conflicts_prevented']}"
+        + window("integrations_to_hold")
     )
     lines.append(
         f"partial results: {report['partial']}, "
         f"from report format only: {len(report['partial_from_report_format'])}"
+        + window("partial_from_report_format")
     )
     lines.append(
         f"work given to a review-only executor: {report['review_only_runs']} runs, "
         f"{report['review_only_failed']} failed, {report['review_only_minutes']} min"
+        + window("review_only_runs")
     )
     return "\n".join(lines)

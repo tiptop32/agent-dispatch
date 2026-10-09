@@ -5,6 +5,7 @@ import importlib.metadata
 import json
 import os
 import time
+import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import url2pathname
@@ -103,6 +104,47 @@ def _config_check() -> Check:
     return Check(name="config", ok=True, detail=detail)
 
 
+#: Codex не передаёт родительское окружение MCP-серверам по умолчанию: без этих
+#: переменных вложенный dispatch исполнителя приходит с hop=0 и без родителя.
+CODEX_HOP_VARS = ("AGENT_DISPATCH_HOP", "AGENT_DISPATCH_TASK_ID", "AGENT_DISPATCH_ROOT_AGENT")
+CODEX_ENV_VARS_LINE = (
+    'env_vars = ["AGENT_DISPATCH_HOP", "AGENT_DISPATCH_TASK_ID", "AGENT_DISPATCH_ROOT_AGENT"]'
+)
+
+
+def codex_env_check(path: Path) -> Check:
+    """Проверяет, что MCP-сервер agent-dispatch в codex получает hop-переменные."""
+    name = "codex-env-vars"
+    if not path.is_file():
+        return Check(name=name, ok=True, detail=f"no codex config ({path}), skipped")
+    try:
+        with path.open("rb") as fh:
+            config = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return Check(name=name, ok=False, detail=f"cannot parse {path}: {exc}")
+    server = config.get("mcp_servers", {}).get("agent-dispatch")
+    if not isinstance(server, dict):
+        return Check(name=name, ok=True, detail=f"no agent-dispatch server in {path}, skipped")
+    forwarded = server.get("env_vars") or []
+    missing = [var for var in CODEX_HOP_VARS if var not in forwarded]
+    if not missing:
+        return Check(name=name, ok=True, detail=f"{path}: hop vars forwarded")
+    return Check(
+        name=name,
+        ok=False,
+        detail=(
+            f"{path}: [mcp_servers.agent-dispatch] does not forward {', '.join(missing)}; "
+            f"Codex does not pass the parent env to MCP servers by default, add under "
+            f"[mcp_servers.agent-dispatch]: {CODEX_ENV_VARS_LINE}"
+        ),
+    )
+
+
+def _codex_env_check() -> Check:
+    home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    return codex_env_check(home / "config.toml")
+
+
 async def _daemon_check(settings: Settings) -> Check:
     state = read_state(settings.server.data_dir)
     if state is None or not is_running(state):
@@ -130,6 +172,7 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
             )
         )
     checks.append(await _daemon_check(settings))
+    checks.append(_codex_env_check())
     safe_env = child_env(settings)
     for name, executor in settings.executors.items():
         availability = await check_cli_version(name, executor.resolved_command, safe_env)

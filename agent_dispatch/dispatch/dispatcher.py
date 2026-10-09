@@ -131,6 +131,8 @@ class Dispatcher:
             event.set()
 
     async def submit(self, req: DispatchRequest, escalated_from: str | None = None) -> TaskRecord:
+        if req.parent_task_id is None:
+            req = await self._inherit_worktree_parent(req)
         task_id = uuid.uuid4().hex
         root = req.root_agent or req.source_agent
         log_path = self.settings.server.data_dir / "logs" / f"{task_id}.log"
@@ -158,6 +160,33 @@ class Dispatcher:
             lambda worker, tid=task_id: self._track_cleanup(self._on_worker_done(tid, worker))
         )
         return record
+
+    async def _inherit_worktree_parent(self, req: DispatchRequest) -> DispatchRequest:
+        """Восстановить родителя вложенного вызова по cwd его worktree."""
+        cwd = Path(req.cwd).expanduser().resolve()  # noqa: ASYNC240
+        base = self.settings.execution.worktree_dir or (self.settings.server.data_dir / "worktrees")
+        base = Path(base).expanduser().resolve()  # noqa: ASYNC240
+        try:
+            relative = cwd.relative_to(base)
+        except ValueError:
+            return req
+        if not relative.parts:
+            return req
+        parent = await self.storage.get_task(relative.parts[0])
+        if parent is None:
+            return req
+        parent_path, _ = self._worktree_target(parent.task_id)
+        try:
+            cwd.relative_to(parent_path.expanduser().resolve())
+        except ValueError:
+            return req
+        return req.model_copy(
+            update={
+                "parent_task_id": parent.task_id,
+                "hop": parent.hop + 1,
+                "root_agent": parent.root_agent,
+            }
+        )
 
     def _track_cleanup(self, coro: Coroutine[None, None, None]) -> None:
         task = asyncio.create_task(coro)
@@ -257,6 +286,7 @@ class Dispatcher:
         *,
         is_escalation: bool = False,
         exclude: set[str] | frozenset[str] = frozenset(),
+        current_task_id: str | None = None,
     ) -> Routing:
         await self.availability.check_all()
         review_only = review_only_executors(req, self.settings)
@@ -267,7 +297,11 @@ class Dispatcher:
         siblings = 0
         if req.parent_task_id and not is_escalation:
             # Ретраи эскалации не съедают квоту fan-out родителя, cancelled тоже.
-            siblings = await self.storage.count_children(req.parent_task_id, exclude_escalated=True)
+            siblings = await self.storage.count_children(
+                req.parent_task_id,
+                exclude_escalated=True,
+                exclude_task_id=current_task_id,
+            )
         verdict = pre_guards(req, self.settings, unavailable, parent_exists, siblings, review_only)
         names = candidates(self.settings, unavailable | review_only, req.source_agent, req.hop)
         if isinstance(verdict, GuardEvent):
@@ -375,7 +409,10 @@ class Dispatcher:
             # задачу, в выбор не входят, иначе роутер вернул бы её им же.
             exclude = set(await self._escalation_chain(record))
         routing = await self._route(
-            record.request, is_escalation=record.escalated_from is not None, exclude=exclude
+            record.request,
+            is_escalation=record.escalated_from is not None,
+            exclude=exclude,
+            current_task_id=record.task_id,
         )
         if routing.guard and routing.guard.reason != GuardReason.user_override:
             await self._guard_failure(record, routing.guard)
@@ -386,6 +423,8 @@ class Dispatcher:
                 update={"router": RouterKind.fallback, "reason": GuardReason.escalated}
             )
         record.decision = decision
+        # Решение должно быть видно в status, пока задача ждёт semaphore.
+        await self.storage.update_task(record)
         await self.storage.add_decision(record.task_id, decision, routing.candidates)
         for event in routing.events + ([routing.guard] if routing.guard else []):
             await self.storage.add_event(record.task_id, "guard", event.model_dump(mode="json"))
@@ -430,64 +469,115 @@ class Dispatcher:
             else contextlib.nullcontext()
         )
         async with semaphore, lock:
-            tree = None
             # Путь и ветка известны до создания: отмена посреди `worktree.create`
             # бросает ожидание, но поток доводит каталог до конца, и корутина
             # никогда не узнает о дереве, которое уже есть на диске.
             target = self._worktree_target(task_id) if mode == "worktree" else None
+            result: ExecutionResult
+            plan: EscalationPlan | None
             try:
-                if target is not None:
-                    tree = await asyncio.to_thread(self._create_worktree, req, task_id)
-                    await self.storage.add_event(
-                        task_id, "worktree", {"path": str(tree.path), "branch": tree.branch}
-                    )
-                ctx = await self._build_context(record, decision, tree)
-                record.status, record.started_at = TaskStatus.running, self._now()
-                await self.storage.update_task(record)
-                await self.storage.add_event(
-                    task_id,
-                    "spawn",
-                    {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
-                )
-                before = await self._review_fingerprint(req) if review else None
-                try:
-                    result = await adapter.execute(ctx)
-                except Exception as exc:
+                if decision.executor in self.availability.unavailable():
                     result = ExecutionResult(
                         status="failed",
                         executor=decision.executor,
                         model=None,
                         summary="",
-                        error=f"{type(exc).__name__}: {exc}",
+                        error=(
+                            "executor became unavailable while waiting for a slot: "
+                            f"{decision.executor}"
+                        ),
                     )
-                if review:
-                    await self._check_review_wrote_nothing(req, before, result)
-                await self._note_executor_failure(record, decision, result)
-                # Ревью, после которого изменилась рабочая копия, не эскалируется:
-                # иначе вызывающий получил бы ответ следующего ревьюера без
-                # предупреждения о правках первого.
-                plan = (
-                    None
-                    if review and result.meta.get("warning")
-                    else await self._plan_escalation(record, decision, result)
-                )
-                if tree is not None:
-                    # Работу, которую переделает следующий исполнитель, в рабочую
-                    # копию не переносим: он стартует с HEAD, и его патч лёг бы
-                    # поверх чужой недоделки с конфликтом. Она остаётся коммитом
-                    # на ветке задачи.
-                    hold = plan is not None and plan.hands_off
-                    await self._finish_worktree(req, tree, result, task_id, hold=hold)
-                await self._finalize(record, decision, result, plan)
-            except BaseException as exc:
-                # Отмена задачи это BaseException, её не ловит `except Exception`
-                # выше, и обычный путь уборки не отрабатывает. Дерево остаётся
-                # намеренно: в нём лежит незакоммиченная работа исполнителя.
-                # Но без записи в результате его не видно ни в `status`, ни
-                # вызывающему, поэтому путь и ветка уходят в meta.
+                    plan = await self._plan_escalation(record, decision, result)
+                elif not await asyncio.to_thread(Path(req.cwd).is_dir):
+                    result = ExecutionResult(
+                        status="failed",
+                        executor=decision.executor,
+                        model=None,
+                        summary="",
+                        error=f"cwd does not exist: {req.cwd} (parent worktree removed?)",
+                    )
+                    plan = await self._plan_escalation(record, decision, result)
+                else:
+                    result, plan = await self._run_executor(
+                        record, decision, adapter, target, review
+                    )
+            except asyncio.CancelledError as exc:
+                # Отмена задачи это BaseException, её не ловит обычный путь
+                # ошибок. Дерево остаётся намеренно: в нём может лежать
+                # незакоммиченная работа исполнителя.
                 if target is not None:
                     await self._note_kept_worktree(record, *target, exc)
                 raise
+            except Exception as exc:
+                # Сбой создания, подготовки или интеграции worktree не должен
+                # обходить эскалацию и финальную запись результата.
+                if target is not None:
+                    await self._note_kept_worktree(record, *target, exc)
+                result = record.result or _failed_result(record, f"{type(exc).__name__}: {exc}")
+                plan = await self._plan_escalation(record, decision, result)
+            try:
+                await self._finalize(record, decision, result, plan)
+            except asyncio.CancelledError as exc:
+                # `_finalize` уже присвоил финальный результат, но мог быть
+                # отменён до записи. Сохраняем его вместе с оставшимся деревом.
+                if target is not None:
+                    await self._note_kept_worktree(record, *target, exc)
+                raise
+
+    async def _run_executor(
+        self,
+        record: TaskRecord,
+        decision: RouteDecision,
+        adapter: ExecutorAdapter,
+        target: tuple[Path, str] | None,
+        review: bool,
+    ) -> tuple[ExecutionResult, EscalationPlan | None]:
+        """Создать workspace, запустить executor и завершить worktree."""
+        req, task_id = record.request, record.task_id
+        tree = None
+        if target is not None:
+            tree = await asyncio.to_thread(self._create_worktree, req, task_id)
+            await self.storage.add_event(
+                task_id, "worktree", {"path": str(tree.path), "branch": tree.branch}
+            )
+        ctx = await self._build_context(record, decision, tree)
+        record.status, record.started_at = TaskStatus.running, self._now()
+        await self.storage.update_task(record)
+        await self.storage.add_event(
+            task_id,
+            "spawn",
+            {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
+        )
+        before = await self._review_fingerprint(req) if review else None
+        try:
+            result = await adapter.execute(ctx)
+        except Exception as exc:
+            result = ExecutionResult(
+                status="failed",
+                executor=decision.executor,
+                model=None,
+                summary="",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        if review:
+            await self._check_review_wrote_nothing(req, before, result)
+        await self._note_executor_failure(record, decision, result)
+        # Ревью, после которого изменилась рабочая копия, не эскалируется:
+        # иначе вызывающий получил бы ответ следующего ревьюера без
+        # предупреждения о правках первого.
+        plan = (
+            None
+            if review and result.meta.get("warning")
+            else await self._plan_escalation(record, decision, result)
+        )
+        if tree is not None:
+            # Работу, которую переделает следующий исполнитель, в рабочую
+            # копию не переносим: он стартует с HEAD, и его патч лёг бы
+            # поверх чужой недоделки с конфликтом. Она остаётся коммитом
+            # на ветке задачи.
+            hold = plan is not None and plan.hands_off
+            await self._finish_worktree(req, tree, result, task_id, hold=hold)
+        return result, plan
 
     @staticmethod
     async def _review_fingerprint(req: DispatchRequest) -> str | None:
@@ -853,6 +943,14 @@ class Dispatcher:
     async def _drop_worktree(
         self, tree: worktree.Worktree, *, keep_branch: bool, result: ExecutionResult
     ) -> None:
+        tree_path = tree.path.expanduser().resolve()
+        for active in await self.storage.list_active_tasks():
+            active_cwd = Path(active.request.cwd).expanduser().resolve()  # noqa: ASYNC240
+            if active_cwd == tree_path or tree_path in active_cwd.parents:
+                result.meta["worktree"] = str(tree.path)
+                result.meta["branch"] = tree.branch
+                result.meta["worktree_kept"] = "active children"
+                return
         try:
             await asyncio.to_thread(worktree.remove, tree, keep_branch=keep_branch)
         except worktree.WorktreeError as exc:

@@ -151,3 +151,90 @@ def test_render_prompt_empty_lists_render_none_bullets():
     assert "## Relevant files\n- (none)" in rendered
     assert "## Constraints\n- (none)" in rendered
     assert "## Success criteria\n- (none)" in rendered
+
+
+def test_render_prompt_states_time_budget_from_routing_default():
+    rendered = render_prompt(TaskPackage(request=request()), "claude", settings())
+    assert "# Time budget" in rendered
+    assert "time budget is 1800 seconds (~30 minutes)" in rendered
+    assert "Do not rerun a long test suite" in rendered
+    assert "Stop and report" in rendered
+
+
+def test_render_prompt_states_requested_timeout():
+    package = TaskPackage(request=request(timeout_seconds=600))
+    rendered = render_prompt(package, "claude", settings())
+    assert "time budget is 600 seconds (~10 minutes)" in rendered
+
+
+def test_render_prompt_worktree_mode_rewrites_repo_paths():
+    req = request(
+        cwd="/repo/project",
+        task="Read /repo/project/src/client.py and fix the failing test",
+        context="pytest fails on /repo/project/tests/test_x.py",
+        files=["tests/test_x.py"],
+    )
+    # Файлы обычно относительные (валидатор запрещает абсолютные), но через
+    # model_copy абсолютный путь всё же доходит — его тоже переписываем.
+    req = req.model_copy(update={"files": ["/repo/project/tests/test_x.py"]})
+    package = TaskPackage(request=req, worktree="/wt/abc123", branch="agent-dispatch/abc123")
+    rendered = render_prompt(package, "claude", settings())
+    assert "/wt/abc123/src/client.py" in rendered
+    assert "/wt/abc123/tests/test_x.py" in rendered
+    # Оба пути остаются в промпте: cwd — worktree, repo — исходная копия.
+    assert "cwd: /wt/abc123" in rendered
+    assert "HEAD of /repo/project" in rendered
+
+
+def test_render_prompt_worktree_mode_rewrites_relative_files_verbatim():
+    req = request(cwd="/repo/project", files=["src/client.py"])
+    package = TaskPackage(request=req, worktree="/wt/abc123")
+    rendered = render_prompt(package, "claude", settings())
+    assert "- src/client.py" in rendered
+    assert "/wt/abc123/src/client.py" not in rendered
+
+
+def test_render_prompt_worktree_mode_respects_path_boundary():
+    req = request(
+        cwd="/repo/project",
+        task="Read /repo/project2/src/other.py and compare with /repo/project",
+    )
+    package = TaskPackage(request=req, worktree="/wt/abc123")
+    rendered = render_prompt(package, "claude", settings())
+    assert "/repo/project2/src/other.py" in rendered
+    # Точный корень репо переписывается, соседний путь — нет.
+    assert "compare with /wt/abc123" in rendered
+    assert "/repo/project2/wt" not in rendered
+    assert "/wt/abc1232" not in rendered
+
+
+def test_render_prompt_worktree_mode_keeps_sibling_paths_with_punctuation():
+    req = request(
+        cwd="/repo/project",
+        task="Compare /repo/project-old/a.py and /repo/project.bak with /repo/project/a.py",
+    )
+    package = TaskPackage(request=req, worktree="/wt/abc123")
+    rendered = render_prompt(package, "claude", settings())
+    assert "/repo/project-old/a.py" in rendered
+    assert "/repo/project.bak" in rendered
+    assert "with /wt/abc123/a.py" in rendered
+
+
+def test_render_prompt_worktree_mode_maps_from_repo_root_for_subdir_cwd(git_repo):
+    # Исполнитель стартует в корне worktree, даже если cwd запроса это подкаталог.
+    sub = git_repo / "pkg"
+    sub.mkdir()
+    req = request(cwd=str(sub), task=f"Fix {git_repo}/pkg/mod.py")
+    package = build_task_package(req, settings(), worktree="/wt/abc123")
+    rendered = render_prompt(package, "claude", settings())
+    assert "Fix /wt/abc123/pkg/mod.py" in rendered
+
+
+def test_render_prompt_in_place_mode_keeps_paths_verbatim():
+    req = request(
+        cwd="/repo/project",
+        task="Read /repo/project/src/client.py and fix the failing test",
+    )
+    rendered = render_prompt(TaskPackage(request=req), "claude", settings())
+    assert "/repo/project/src/client.py" in rendered
+    assert "/wt/" not in rendered

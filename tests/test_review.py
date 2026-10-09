@@ -208,12 +208,15 @@ async def test_root_review_starts_while_coding_slots_are_saturated(tmp_path, git
     # Долгие корневые задачи (2 из 2 слотов) не должны оставлять ревью без слота.
     _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
     coding = _blocked(adapters, "opencode/a")
+    # Ревьюер тоже держится гейтом: иначе он завершается до своего cancel и
+    # тест зависит от того, сколько длится отмена задач перед ним.
+    reviewer = _blocked(adapters, "claude/opus")
     first = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
     second = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
     review = await dispatcher.submit(_req(git_repo, executor="claude/opus", kind="review"))
     await _wait_started(coding)
     # Ревью стартует, пока оба задачных слота заняты заблокированными задачами.
-    await _wait_started(adapters["claude/opus"])
+    await _wait_started(reviewer)
     for task_id in (first.task_id, second.task_id, review.task_id):
         await dispatcher.cancel(task_id)
 

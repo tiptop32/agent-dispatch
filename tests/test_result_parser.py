@@ -93,6 +93,14 @@ def test_normalize_timeout_is_failed_with_timeout_error():
     assert result.error == "timeout"
 
 
+def test_normalize_timeout_with_changed_files_is_partial():
+    result = normalize(None, outcome(timed_out=True), ["a.py"], "codex", None)
+    assert result.status == "partial"
+    assert result.error == "timeout"
+    assert result.changed_files == ["a.py"]
+    assert result.meta["timed_out"] is True
+
+
 def test_normalize_stalled_is_failed_with_idle_error():
     result = normalize(None, outcome(stalled=True, idle_seconds=0.5), None, "codex", None)
     assert result.status == "failed"

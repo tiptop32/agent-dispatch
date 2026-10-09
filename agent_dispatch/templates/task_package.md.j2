@@ -25,6 +25,8 @@ cwd: {{ cwd }}
 ## Success criteria
 {{ success_criteria | bullets }}
 {% endif %}
+# Time budget
+Your time budget is {{ time_budget_seconds }} seconds (~{{ time_budget_minutes }} minutes); at that point the run is killed by a hard timeout. Keep any single command well under it. Do not rerun a long test suite you have already run on the touched scope. Stop and report your result before the budget runs out: a timeout with unreported work looks like a failure, not a result.
 {% if context_mode == "full" %}
 # Repository state
 $ git status --short

@@ -12,6 +12,8 @@ pytest fails after refactor
 - do not change public API
 ## Success criteria
 - targeted tests pass
+# Time budget
+Your time budget is 1800 seconds (~30 minutes); at that point the run is killed by a hard timeout. Keep any single command well under it. Do not rerun a long test suite you have already run on the touched scope. Stop and report your result before the budget runs out: a timeout with unreported work looks like a failure, not a result.
 # Repository state
 $ git status --short
  M src/client.py

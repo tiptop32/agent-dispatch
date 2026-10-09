@@ -87,8 +87,15 @@ Codex (`~/.codex/config.toml`):
 command = "agent-dispatch"
 args = ["mcp"]
 env = { AGENT_DISPATCH_SOURCE_AGENT = "codex" }
+env_vars = ["AGENT_DISPATCH_HOP", "AGENT_DISPATCH_TASK_ID", "AGENT_DISPATCH_ROOT_AGENT"]
 tool_timeout_sec = 120
 ```
+
+`env_vars` обязателен: Codex не передаёт родительское окружение MCP-серверам по
+умолчанию, и без него вложенный `dispatch` исполнителя приходит в демон с
+`hop=0` и без родителя — исполнитель встаёт в очередь за собственной задачей и
+теряет worktree. `agent-dispatch doctor` проверяет эту строку (проверка
+`codex-env-vars`) и печатает её, если чего-то не хватает.
 
 For daemon or GUI launches, install `scripts/codex-agent-lb` as
 `~/.local/bin/codex`. It loads only `AGENT_LB_API_KEY` from
@@ -190,7 +197,7 @@ agent-dispatch worktrees --clean --delete-branches
 
 ### Сабагенты и hop-протокол
 
-Исполнитель получает в окружении `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP`. Его собственный MCP-прокси читает их и передаёт в демон, поэтому глубина делегирования известна демону, а не модели. При `max_hops: 2` исполнитель может разбить задачу и отдать до `max_children` подзадач через тот же `dispatch` (каждую роутит Jev), а его сабагенты уже делегировать не могут.
+Исполнитель получает в окружении `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP`. Его собственный MCP-прокси читает их и передаёт в демон, поэтому глубина делегирования известна демону, а не модели. При `max_hops: 2` исполнитель может разбить задачу и отдать до `max_children` подзадач через тот же `dispatch` (каждую роутит Jev), а его сабагенты уже делегировать не могут. В Codex эти переменные должен пересылать сам MCP-сервер (`env_vars` в `[mcp_servers.agent-dispatch]`, см. выше) — это проверяет `agent-dispatch doctor`.
 
 ### Лимиты исполнителей
 

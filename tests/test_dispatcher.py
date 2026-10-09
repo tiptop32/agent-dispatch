@@ -10,6 +10,7 @@ from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     DispatchRequest,
+    ExecutionResult,
     RouterKind,
     TaskStatus,
 )
@@ -21,7 +22,12 @@ WAIT = 2.0
 
 
 def _settings(
-    tmp_path: Path, *, max_tasks: int = 2, max_children: int = 2, max_hops: int = 2
+    tmp_path: Path,
+    *,
+    max_tasks: int = 2,
+    max_children: int = 2,
+    max_hops: int = 2,
+    escalation: dict[str, list[str]] | None = None,
 ) -> Settings:
     names = {"codex": "codex", "claude": "claude", "opencode/kimi": "opencode"}
     return Settings(
@@ -33,6 +39,7 @@ def _settings(
             n: ExecutorSettings(adapter=a, model="kimi" if a == "opencode" else None, description=n)
             for n, a in names.items()
         },
+        escalation=escalation or {},
     )
 
 
@@ -156,8 +163,57 @@ async def test_max_children_guard(tmp_path, git_repo):
     _, _, _, d = await _make(tmp_path, max_children=2)
     parent = await d.submit(_req(git_repo))
     await d.wait(parent.task_id, WAIT)
-    kids = [await d.submit(_req(git_repo, parent_task_id=parent.task_id)) for _ in range(3)]
-    assert (await d.wait(kids[2].task_id, WAIT)).result.meta["guard"] == "max_children"
+    children = []
+    for _ in range(2):
+        child = await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))
+        children.append(await d.wait(child.task_id, WAIT))
+    assert [child.status for child in children] == ["completed", "completed"]
+
+    refused = await d.wait(
+        (await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))).task_id, WAIT
+    )
+    retried = await d.wait(
+        (await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))).task_id, WAIT
+    )
+    assert refused.result.meta["guard"] == "max_children"
+    assert refused.result.error == "sibling count 2 >= 2"
+    assert retried.result.error == "sibling count 2 >= 2"
+
+
+@pytest.mark.asyncio
+async def test_queued_task_is_not_spawned_after_executor_enters_cooldown(tmp_path, git_repo):
+    _, storage, adapters, dispatcher = await _make(
+        tmp_path, max_tasks=1, escalation={"codex": ["claude"]}
+    )
+    gate = asyncio.Event()
+    adapters["codex"].gate = gate
+    adapters["codex"].result = ExecutionResult(
+        status="failed",
+        executor="codex",
+        model=None,
+        summary="",
+        error="You've hit your monthly spend limit; try again tomorrow",
+    )
+
+    first = await dispatcher.submit(_req(git_repo))
+    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    second = await dispatcher.submit(_req(git_repo))
+    for _ in range(100):
+        if (await storage.get_task(second.task_id)).decision is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert (await storage.get_task(second.task_id)).decision.executor == "codex"
+    gate.set()
+
+    await dispatcher.wait(first.task_id, WAIT)
+    final = await dispatcher.wait(second.task_id, WAIT)
+    queued = await storage.get_task(second.task_id)
+
+    assert len(adapters["codex"].calls) == 1
+    assert queued.status == "failed"
+    assert queued.result.error == "executor became unavailable while waiting for a slot: codex"
+    assert queued.result.meta["escalated_to"] == final.task_id
+    assert final.status == "completed" and final.decision.executor == "claude"
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,46 @@ async def test_opencode_read_only_forces_plan_and_removes_only_auto_enable(
     args = (tmp_path / "cap.argv").read_text().splitlines()
     assert args[-len(expected_tail) :] == expected_tail
     assert result.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_opencode_read_only_env_allows_tmp_external_directory(git_repo, tmp_path):
+    cap = tmp_path / "cap"
+    adapter = OpenCodeAdapter(
+        "opencode",
+        ExecutorSettings(
+            adapter="opencode", command=str(ROOT / "fakes/opencode_env_capture.sh"), model="m"
+        ),
+    )
+    review = ctx(git_repo, tmp_path, FAKE_CAPTURE=str(cap)).model_copy(update={"read_only": True})
+
+    result = await adapter.execute(review)
+
+    assert result.status == "completed"
+    lines = (tmp_path / "cap.env").read_text().splitlines()
+    env = dict(line.split("=", 1) for line in lines if "=" in line)
+    permission = json.loads(env["OPENCODE_PERMISSION"])
+    assert permission["external_directory"]["/tmp/*"] == "allow"
+    assert permission["external_directory"]["/private/tmp/*"] == "allow"
+    assert permission["external_directory"][f"{tempfile.gettempdir()}/*"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_opencode_normal_task_env_has_no_permission_override(git_repo, tmp_path):
+    cap = tmp_path / "cap"
+    adapter = OpenCodeAdapter(
+        "opencode",
+        ExecutorSettings(
+            adapter="opencode", command=str(ROOT / "fakes/opencode_env_capture.sh"), model="m"
+        ),
+    )
+
+    result = await adapter.execute(ctx(git_repo, tmp_path, FAKE_CAPTURE=str(cap)))
+
+    assert result.status == "completed"
+    lines = (tmp_path / "cap.env").read_text().splitlines()
+    env = dict(line.split("=", 1) for line in lines if "=" in line)
+    assert "OPENCODE_PERMISSION" not in env
 
 
 @pytest.mark.asyncio

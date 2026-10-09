@@ -108,7 +108,7 @@ Endpoint `POST https://openrouter.ai/api/alpha/decisions`, модель `typesaf
 - Codex получает её через `--output-schema` в strict-варианте (`agent_result.strict.schema.json`: все ключи в `required`, `additionalProperties: false` на каждом уровне, опциональные поля nullable). Обычную схему Codex отвергает.
 - Claude и OpenCode пишут тот же JSON в fenced-блоке с тегом `agent-dispatch-result` в конце ответа; парсер берёт последний блок.
 - `tests.result` вроде «1 passed» мягко приводится к enum, приведение фиксируется в `meta.coerced`.
-- Нет блока или он невалиден → `partial` с `meta.parse_error`; ненулевой exit или таймаут → `failed`.
+- Нет блока или он невалиден → `partial` с `meta.parse_error`; ненулевой exit → `failed`. Таймаут с непустым `changed_files` → `partial` (`error: timeout`, `meta.timed_out`) — работа есть, судит вызывающий по дифу; таймаут без изменений → `failed` и эскалируется.
 
 ## Телеметрия
 
