@@ -10,6 +10,7 @@ from agent_dispatch.config import load_settings
 
 from .harness import (
     acceptance,
+    children_refusals,
     default_limit_group,
     delegations,
     load,
@@ -73,6 +74,7 @@ def main() -> int:
         review_only=settings.routing.review_only,
         recheck=lambda name: name in executors and executors[name].limit_reset == "recheck",
     )
+    report["children_refusals"] = children_refusals(tasks, settings.routing.max_children)
     report["delegations"] = delegations(tasks)
     if not args.no_git:
         report["acceptance"] = acceptance(tasks, window_hours=args.accept_window_hours)

@@ -17,6 +17,7 @@ from evals.replay.harness import (
     Task,
     acceptance,
     added_lines,
+    children_refusals,
     delegations,
     git_acceptance,
     load,
@@ -408,7 +409,17 @@ def test_replay_since_keeps_only_later_tasks(tmp_path):
     }
 
 
-def _task(task_id, status, *, executor="codex/sol", parent=None, minutes=1, result=None, cwd="/r"):
+def _task(
+    task_id,
+    status,
+    *,
+    executor="codex/sol",
+    parent=None,
+    minutes=1,
+    result=None,
+    cwd="/r",
+    parent_task_id=None,
+):
     created = datetime(2026, 9, 23, 10, 0, tzinfo=UTC)
     return Task(
         task_id=task_id,
@@ -424,6 +435,7 @@ def _task(task_id, status, *, executor="codex/sol", parent=None, minutes=1, resu
         if status in ("cancelled", "running")
         else ExecutionResult.model_validate(result or _result(status)),
         cwd=cwd,
+        parent_task_id=parent_task_id,
     )
 
 
@@ -662,3 +674,44 @@ def test_load_reads_cwd_and_routing_decisions(tmp_path):
             judgments={"capability": {"value": "fast"}},
         )
     ]
+
+
+def test_children_refusals_recount_the_quota_by_todays_rule():
+    def child(task_id, of, status="completed", **kwargs):
+        return _task(task_id, status, parent_task_id=of, **kwargs)
+
+    def refused(task_id, of, count):
+        error = f"sibling count {count} >= 2"
+        return child(task_id, of, "failed", executor="", result=_result("failed", error=error))
+
+    tasks = [
+        # Старый счётчик видел родителя и ребёнка: 2 >= 2 при одном ребёнке.
+        # Отменённый ребёнок и ретрай эскалации квоту не занимают.
+        child("a" * 32, "p1"),
+        child("b" * 32, "p1", "cancelled"),
+        child("c" * 32, "p1", parent="a" * 32),
+        refused("d" * 32, "p1", 2),
+        refused("e" * 32, "p1", 3),
+        refused("f" * 32, "p1", 4),
+        # Два настоящих ребёнка: отказ верный и сегодня.
+        child("g" * 32, "p2"),
+        child("h" * 32, "p2"),
+        refused("i" * 32, "p2", 2),
+        # Дети без отказов в отчёт не попадают.
+        child("j" * 32, "p3"),
+    ]
+    report = children_refusals(tasks, max_children=2)
+
+    assert report == {
+        "max_children": 2,
+        "refused": 4,
+        "admitted_now": 1,
+        "retries_avoided": 3,
+        "parents": [
+            {"parent": "p1", "children": 1, "refused": 3, "admitted_now": 1},
+            {"parent": "p2", "children": 2, "refused": 1, "admitted_now": 0},
+        ],
+    }
+    assert "max_children refusals: 4, today's rule (limit 2) admits 1" in render(
+        {**replay([]), "children_refusals": report}
+    )

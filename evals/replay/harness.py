@@ -75,6 +75,7 @@ class Task:
     kind: str = "task"
     started_at: datetime | None = None
     cwd: str = ""
+    parent_task_id: str | None = None
 
 
 @dataclass
@@ -104,7 +105,7 @@ def load(db_path: Path) -> list[Task]:
         rows = conn.execute(
             "select task_id, coalesce(executor, ''), status, created_at, started_at, finished_at,"
             " coalesce(duration_ms, 0), escalated_from, result_json, source_agent,"
-            " coalesce(json_extract(request_json, '$.kind'), 'task'), cwd"
+            " coalesce(json_extract(request_json, '$.kind'), 'task'), cwd, parent_task_id"
             " from tasks order by created_at"
         ).fetchall()
     finally:
@@ -123,6 +124,7 @@ def load(db_path: Path) -> list[Task]:
             source_agent=row[9],
             kind=row[10],
             cwd=row[11],
+            parent_task_id=row[12],
         )
         for row in rows
     ]
@@ -348,6 +350,59 @@ def _waste_cause(task: Task) -> str:
     if task.result.meta.get("parse_error"):
         return "no_report"
     return "task_failed"
+
+
+def children_refusals(tasks: list[Task], max_children: int = 2) -> dict:
+    """Отказы `max_children` в прошлом, пересчитанные по сегодняшнему правилу.
+
+    Сегодня (`Storage.count_children`) квоту занимают только дети родителя с
+    назначенным исполнителем, не отменённые и не ретраи эскалации; сама задача
+    и отказанные попытки не в счёт. До 2026-10-09 счётчик включал их, и лимит
+    2 пускал одного ребёнка. Ретрай отказа после допуска первой попытки не
+    случился бы, поэтому из отказов одного родителя допускается не больше, чем
+    осталось свободных мест.
+    """
+    by_parent: dict[str, list[Task]] = {}
+    for task in tasks:
+        if task.parent_task_id:
+            by_parent.setdefault(task.parent_task_id, []).append(task)
+    refused = admitted = 0
+    parents: list[dict] = []
+    for parent, children in by_parent.items():
+        refusals = [
+            task
+            for task in children
+            if (task.result and task.result.error or "").startswith("sibling count")
+            or (task.result and task.result.meta.get("guard") == "max_children")
+        ]
+        if not refusals:
+            continue
+        occupied = sum(
+            1
+            for task in children
+            if task.executor
+            and task.status != "cancelled"
+            and task.escalated_from is None
+            and task not in refusals
+        )
+        free = max(0, max_children - occupied)
+        refused += len(refusals)
+        admitted += min(free, len(refusals))
+        parents.append(
+            {
+                "parent": parent[:8],
+                "children": occupied,
+                "refused": len(refusals),
+                "admitted_now": min(free, len(refusals)),
+            }
+        )
+    return {
+        "max_children": max_children,
+        "refused": refused,
+        "admitted_now": admitted,
+        "retries_avoided": refused - admitted,
+        "parents": parents,
+    }
 
 
 def delegations(tasks: list[Task]) -> dict:
@@ -646,6 +701,18 @@ def render(report: dict) -> str:
         f"{report['review_only_failed']} failed, {report['review_only_minutes']} min"
         + window("review_only_runs")
     )
+    if "children_refusals" in report:
+        info = report["children_refusals"]
+        lines.append(
+            f"max_children refusals: {info['refused']}, today's rule "
+            f"(limit {info['max_children']}) admits {info['admitted_now']}, "
+            f"the other {info['retries_avoided']} were retries of a refusal"
+        )
+        lines += [
+            f"  {row['parent']}: {row['children']} assigned child(ren), "
+            f"{row['refused']} refused, {row['admitted_now']} admitted now"
+            for row in info["parents"]
+        ]
     if "delegations" in report:
         info = report["delegations"]
         causes = ", ".join(f"{cause} {n}" for cause, n in info["wasted_by_cause"].items())
