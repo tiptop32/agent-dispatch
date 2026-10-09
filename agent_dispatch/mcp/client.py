@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from agent_dispatch.models import DispatchRequest, RouteDecision, TaskView
+from agent_dispatch.models import DispatchRequest, FollowupRequest, RouteDecision, TaskView
 from agent_dispatch.serve_state import ServeState
 
 
@@ -47,6 +47,17 @@ class DispatchClient:
 
     async def submit(self, req: DispatchRequest) -> TaskView:
         response = await self._request("POST", "/tasks", json=req.model_dump(mode="json"))
+        return TaskView.model_validate(response.json())
+
+    async def followup(self, task_id: str, body: FollowupRequest) -> TaskView:
+        try:
+            response = await self._request(
+                "POST", f"/tasks/{task_id}/followup", json=body.model_dump(mode="json")
+            )
+        except RuntimeError as exc:
+            if str(exc).startswith("404"):
+                raise ValueError(f"task not found: {task_id}") from exc
+            raise
         return TaskView.model_validate(response.json())
 
     async def status(self, task_id: str, wait: int = 0) -> TaskView:

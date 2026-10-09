@@ -104,6 +104,9 @@ class DispatchRequest(_Model):
     #: тесты). Задача считается сделанной, только если все вышли с кодом 0:
     #: самоотчёт исполнителя о тестах не проверка.
     verify: list[str] = Field(default_factory=list)
+    #: Задача, которую продолжает этот запрос. Его `task` — новое сообщение
+    #: исполнителю, остальное демон берёт из продолжаемой задачи.
+    followup_of: str | None = None
 
     @field_validator("files")
     @classmethod
@@ -113,6 +116,17 @@ class DispatchRequest(_Model):
             if path.is_absolute() or PureWindowsPath(file_name).is_absolute() or ".." in path.parts:
                 raise ValueError("files must contain relative paths without '..'")
         return files
+
+
+class FollowupRequest(_Model):
+    """Продолжение готовой задачи тем же исполнителем, по возможности в его сессии."""
+
+    message: str = Field(min_length=1)
+    #: None — те же команды проверки, что у продолжаемой задачи.
+    verify: list[str] | None = None
+    allow_escalation: bool = True
+    wait_seconds: int = Field(1800, ge=0)
+    timeout_seconds: int | None = None
 
 
 class Judgment(_Model):

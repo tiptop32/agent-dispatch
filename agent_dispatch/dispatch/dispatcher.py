@@ -14,6 +14,8 @@ from agent_dispatch.config import Settings
 from agent_dispatch.dispatch import verify
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import (
+    FOLLOWUP_SUMMARY_LIMIT,
+    Followup,
     build_task_package,
     render_prompt,
     rewrite_repo_prefix,
@@ -27,6 +29,7 @@ from agent_dispatch.models import (
     FINAL_STATUSES,
     DispatchRequest,
     ExecutionResult,
+    FollowupRequest,
     GuardEvent,
     GuardReason,
     RouteDecision,
@@ -93,6 +96,10 @@ def _failed_result(
         error=error,
         meta=dict(previous.meta if previous else {}) if meta is None else meta,
     )
+
+
+class FollowupError(ValueError):
+    """Продолжить задачу нельзя: она ещё идёт или её работы нет в рабочей копии."""
 
 
 def _not_integrated(result: ExecutionResult, error: str) -> None:
@@ -192,6 +199,61 @@ class Dispatcher:
                 "root_agent": parent.root_agent,
             }
         )
+
+    async def followup(self, task_id: str, body: FollowupRequest) -> TaskRecord:
+        """Продолжить готовую задачу тем же исполнителем.
+
+        Продолжается последнее звено цепочки эскалации: его работа и лежит в
+        рабочей копии. Follow-up всегда идёт in_place: worktree от HEAD не
+        увидел бы перенесённого, но не закоммиченного результата.
+        """
+        record = await self.get(task_id)
+        if record is None:
+            raise KeyError(task_id)
+        last = await self._last_link(record)
+        if last.status not in FINAL_STATUSES:
+            raise FollowupError(f"task {last.task_id} is still {last.status.value}")
+        if last.decision is None or last.result is None or not last.result.executor:
+            raise FollowupError(f"task {last.task_id} never reached an executor")
+        meta = last.result.meta
+        if meta.get("integrated") is False and (meta.get("commit") or meta.get("patch")):
+            where = meta.get("patch") or meta.get("branch")
+            raise FollowupError(
+                f"work of task {last.task_id} is not in the working copy (integrated: false): "
+                f"apply {where} first or dispatch a new task"
+            )
+        executor: str | None = last.decision.executor
+        if executor in self.availability.unavailable():
+            # Исполнитель остывает: роутер выберет другого, итог прошлой
+            # попытки уйдёт ему в промпт.
+            executor = None
+        req = last.request.model_copy(
+            update={
+                "task": body.message,
+                "executor": executor,
+                "followup_of": last.task_id,
+                "allow_escalation": body.allow_escalation,
+                "wait_seconds": body.wait_seconds,
+                "timeout_seconds": body.timeout_seconds or last.request.timeout_seconds,
+                "verify": last.request.verify if body.verify is None else body.verify,
+                "workspace_mode": "in_place",
+            }
+        )
+        return await self.submit(req)
+
+    async def _last_link(self, record: TaskRecord) -> TaskRecord:
+        """Последнее звено цепочки эскалации, как его видит `wait`."""
+        seen = {record.task_id}
+        while record.result is not None:
+            child_id = record.result.meta.get("escalated_to")
+            if not child_id or child_id in seen:
+                break
+            child = await self.get(child_id)
+            if child is None:
+                break
+            seen.add(child.task_id)
+            record = child
+        return record
 
     def _track_cleanup(self, coro: Coroutine[None, None, None]) -> None:
         task = asyncio.create_task(coro)
@@ -575,16 +637,18 @@ class Dispatcher:
             {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
         )
         before = await self._review_fingerprint(req) if review else None
-        try:
-            result = await adapter.execute(ctx)
-        except Exception as exc:
-            result = ExecutionResult(
-                status="failed",
-                executor=decision.executor,
-                model=None,
-                summary="",
-                error=f"{type(exc).__name__}: {exc}",
+        result = await self._call_adapter(adapter, ctx, decision)
+        if ctx.resume_session and self._resume_failed(result):
+            # Сессию не нашли или CLI другой версии не понял флаги: один раз
+            # с нуля, итог прошлой попытки идёт в промпт.
+            await self.storage.add_event(
+                task_id,
+                "resume_failed",
+                {"session": ctx.resume_session, "error": (result.error or "")[:500]},
             )
+            ctx = await self._build_context(record, decision, tree, resume=False)
+            result = await self._call_adapter(adapter, ctx, decision)
+            result.meta["resume_failed"] = True
         if review:
             await self._check_review_wrote_nothing(req, before, result)
         await self._note_executor_failure(record, decision, result)
@@ -670,6 +734,35 @@ class Dispatcher:
             await asyncio.to_thread(worktree.discard_changes, tree)
 
     @staticmethod
+    async def _call_adapter(
+        adapter: ExecutorAdapter, ctx: RunContext, decision: RouteDecision
+    ) -> ExecutionResult:
+        try:
+            return await adapter.execute(ctx)
+        except Exception as exc:
+            return ExecutionResult(
+                status="failed",
+                executor=decision.executor,
+                model=None,
+                summary="",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    @staticmethod
+    def _resume_failed(result: ExecutionResult) -> bool:
+        """Продолженная сессия упала, не начав работу.
+
+        Сбой исполнителя (лимит, сеть) повторился бы и с нуля, а таймаут и
+        молчание значат, что агент работал: их не повторяем.
+        """
+        if result.status != "failed" or result.changed_files:
+            return False
+        error = result.error or ""
+        if error == "timeout" or error.startswith("stalled:"):
+            return False
+        return classify_failure(result) is None
+
+    @staticmethod
     async def _review_fingerprint(req: DispatchRequest) -> str | None:
         try:
             return await asyncio.to_thread(workspace.fingerprint, req.cwd)
@@ -693,7 +786,12 @@ class Dispatcher:
             result.meta["warning"] = "working copy changed during the review"
 
     async def _build_context(
-        self, record: TaskRecord, decision: RouteDecision, tree: worktree.Worktree | None
+        self,
+        record: TaskRecord,
+        decision: RouteDecision,
+        tree: worktree.Worktree | None,
+        *,
+        resume: bool = True,
     ) -> RunContext:
         """Task Package и prompt под адаптер выбранного исполнителя."""
         req = record.request
@@ -704,6 +802,10 @@ class Dispatcher:
             str(tree.path) if tree else None,
             tree.branch if tree else None,
         )
+        session = None
+        if req.followup_of:
+            followup, session = await self._followup(req, decision, tree, resume=resume)
+            package = package.model_copy(update={"followup": followup})
         prompt = await asyncio.to_thread(
             render_prompt,
             package,
@@ -732,7 +834,60 @@ class Dispatcher:
             task_id=record.task_id,
             prompt=prompt,
             read_only=req.kind == "review",
+            resume_session=session,
         )
+
+    async def _followup(
+        self,
+        req: DispatchRequest,
+        decision: RouteDecision,
+        tree: worktree.Worktree | None,
+        *,
+        resume: bool,
+    ) -> tuple[Followup | None, str | None]:
+        """Итог продолжаемой задачи и сессия CLI, если её можно продолжить.
+
+        Сессию продолжает только тот же исполнитель в том же каталоге: claude
+        ищет сессии по cwd, а у прошлого запуска в worktree дерева уже нет.
+        """
+        previous = await self.get(req.followup_of) if req.followup_of else None
+        if previous is None or previous.result is None or previous.decision is None:
+            return None, None
+        result = previous.result
+        session = result.meta.get("session_id")
+        same_place = (
+            tree is None
+            and not await self._worktree_meta(previous.task_id)
+            and Path(previous.request.cwd).resolve() == Path(req.cwd).resolve()  # noqa: ASYNC240
+        )
+        resumed = bool(
+            resume
+            and isinstance(session, str)
+            and session
+            and same_place
+            and previous.decision.executor == decision.executor
+        )
+        verification = None
+        if result.verification and result.verification.result == "failed":
+            failed = result.verification.commands[-1] if result.verification.commands else None
+            if failed is not None:
+                how = "timed out" if failed.timed_out else f"exit {failed.exit_code}"
+                verification = f"`{failed.command}` failed ({how}):\n{failed.output_tail[-1500:]}"
+        summary = result.summary
+        if len(summary) > FOLLOWUP_SUMMARY_LIMIT:
+            summary = "... " + summary[-FOLLOWUP_SUMMARY_LIMIT:]
+        followup = Followup(
+            task_id=previous.task_id,
+            executor=previous.decision.executor,
+            status=previous.status.value,
+            resumed=resumed,
+            task=previous.request.task[:FOLLOWUP_SUMMARY_LIMIT],
+            summary=summary,
+            changed_files=result.changed_files,
+            error=(result.error or "")[:500] or None,
+            verification=verification,
+        )
+        return followup, session if resumed else None
 
     async def _note_executor_failure(
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult

@@ -17,6 +17,7 @@ from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
 from agent_dispatch.models import (
     ContextMode,
     DispatchRequest,
+    FollowupRequest,
     RouteDecision,
     RouterKind,
     SourceAgent,
@@ -132,6 +133,7 @@ def _route_lines(decision: RouteDecision) -> list[str]:
 #: Поля `result.meta`, которые компактный ответ показывает вызывающему.
 _META_LINES = (
     "warning",
+    "resume_failed",
     "cooldown_until",
     "budget",
     "branch",
@@ -182,6 +184,8 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
         lines.extend(_route_lines(view.decision))
     if view.escalated_from:
         lines.append(f"escalated_from: {view.escalated_from}")
+    if view.request.followup_of:
+        lines.append(f"followup_of: {view.request.followup_of}")
     if result:
         escalated_to = result.meta.get("escalated_to")
         if escalated_to:
@@ -411,6 +415,37 @@ def build_server(
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
         return _executors_text(rows, settings, _source())
+
+    @server.tool(
+        description=(
+            "Continue a finished delegated task with a new message instead of dispatching it "
+            "again: the same executor picks it up in its own CLI session when possible, "
+            "otherwise with the previous attempt's report. Use it for corrections, a failed "
+            "check or a timeout. `verify` defaults to the previous task's commands."
+        )
+    )
+    async def followup(
+        task_id: str,
+        message: str,
+        verify: list[str] | None = None,
+        allow_escalation: bool = True,
+        wait_seconds: int | None = None,
+        timeout_seconds: int | None = None,
+        verbose: bool = False,
+    ) -> str:
+        try:
+            wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
+            client = await get_client(wait)
+            body = FollowupRequest(
+                message=message,
+                verify=verify,
+                allow_escalation=allow_escalation,
+                wait_seconds=wait,
+                timeout_seconds=timeout_seconds,
+            )
+            return _task_text(await client.followup(task_id, body), verbose)
+        except (DaemonUnavailable, RuntimeError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
 
     @server.tool(description="Get the current result of a delegated task by task_id.")
     async def status(task_id: str, wait_seconds: int = 0, verbose: bool = False) -> str:

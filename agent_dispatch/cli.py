@@ -14,7 +14,13 @@ from agent_dispatch.executors import worktree
 from agent_dispatch.mcp import autostart
 from agent_dispatch.mcp import server as mcp_server
 from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
-from agent_dispatch.models import FINAL_STATUSES, DispatchRequest, SourceAgent, TaskView
+from agent_dispatch.models import (
+    FINAL_STATUSES,
+    DispatchRequest,
+    FollowupRequest,
+    SourceAgent,
+    TaskView,
+)
 from agent_dispatch.server import run_server
 
 app = typer.Typer(
@@ -71,16 +77,20 @@ def _daemon_call(operation: str, *args: object, start: bool = False) -> Any:
 
 async def _dispatch_and_wait(
     settings: Settings,
-    request: DispatchRequest,
+    request: DispatchRequest | tuple[str, FollowupRequest],
     wait: int,
     poll_seconds: float,
 ) -> list[TaskView]:
+    """Отправить задачу (или follow-up: `(task_id, body)`) и идти за эскалацией."""
     started = time.monotonic()
     client = await _open_client(settings, wait, True)
     views: list[TaskView] = []
     seen: set[str] = set()
     async with client:
-        view = await client.submit(request)
+        if isinstance(request, tuple):
+            view = await client.followup(*request)
+        else:
+            view = await client.submit(request)
         while True:
             if view.status in FINAL_STATUSES:
                 views.append(view)
@@ -241,6 +251,42 @@ def dispatch(
             poll_seconds,
         )
     )
+    if as_json:
+        _print_task(views[-1], True)
+    else:
+        for index, view in enumerate(views):
+            if index:
+                typer.echo(f"escalated to {view.task_id}")
+            _print_task(view, False)
+
+
+@app.command(help="Continue a finished task with a new message, in the executor's session.")
+def followup(
+    task_id: str,
+    message: str,
+    verify: list[str] | None = typer.Option(  # noqa: B008
+        None, "--verify", help="Replace the previous task's verify commands."
+    ),
+    wait: int = typer.Option(1800, min=0),
+    timeout: int | None = typer.Option(None, min=1),
+    poll_seconds: float = typer.Option(2.0, "--poll", min=0.0, help="Polling interval in seconds."),
+    no_escalation: bool = typer.Option(False, "--no-escalation"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    body = FollowupRequest(
+        message=message,
+        verify=verify,
+        allow_escalation=not no_escalation,
+        wait_seconds=wait,
+        timeout_seconds=timeout,
+    )
+    try:
+        views = asyncio.run(
+            _dispatch_and_wait(load_settings(), (task_id, body), wait, poll_seconds)
+        )
+    except (RuntimeError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
     if as_json:
         _print_task(views[-1], True)
     else:

@@ -96,6 +96,7 @@ async def test_tools_exact(tmp_path):
             "route",
             "dispatch",
             "dispatch_to",
+            "followup",
             "status",
             "executors",
         }
@@ -405,3 +406,29 @@ async def test_compact_output_shows_failed_verification_and_budget(tmp_path):
         "executor reported tests passed; tests changed: tests/test_a.py"
     ) in text
     assert "budget: {'chain_cost_usd': 2.1, 'limit_usd': 2.0}" in text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_followup_tool_posts_the_message_and_shows_the_link(tmp_path):
+    payload = view().model_dump(mode="json")
+    payload["request"]["followup_of"] = "t0"
+    request = respx.post("http://127.0.0.1:7433/tasks/t0/followup").mock(
+        return_value=httpx.Response(200, json=payload)
+    )
+    result = await call(
+        settings(tmp_path), "followup", {"task_id": "t0", "message": "also handle None"}
+    )
+    body = request.calls[0].request.content.decode()
+    assert '"message":"also handle None"' in body and '"verify":null' in body
+    assert "followup_of: t0" in result.content[0].text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_followup_tool_reports_a_refusal(tmp_path):
+    respx.post("http://127.0.0.1:7433/tasks/t0/followup").mock(
+        return_value=httpx.Response(409, json={"detail": "task t0 is still running"})
+    )
+    result = await call(settings(tmp_path), "followup", {"task_id": "t0", "message": "x"})
+    assert result.is_error and "still running" in result.content[0].text

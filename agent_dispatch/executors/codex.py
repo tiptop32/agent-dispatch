@@ -42,6 +42,9 @@ class CodexAdapter(BaseExecutorAdapter):
                 str(last_path),
                 *(["-m", self.settings.model] if self.settings.model else []),
                 *extra,
+                # Флаги exec стоят до подкоманды: так их разбирает сам `exec`
+                # в любой версии, а не только там, где они помечены global.
+                *(["resume", ctx.resume_session] if ctx.resume_session else []),
                 "-",
             ]
             return await self._execute_common(
@@ -70,12 +73,15 @@ class CodexAdapter(BaseExecutorAdapter):
         model = self.settings.model
         usage = None
         error_message = None
+        session = None
         for line in outcome.stdout.splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if isinstance(event, dict):
+                if event.get("type") == "thread.started" and event.get("thread_id"):
+                    session = str(event["thread_id"])
                 if event.get("type") in {"thread.started", "turn.started"} and event.get("model"):
                     model = event["model"]
                 if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
@@ -90,4 +96,6 @@ class CodexAdapter(BaseExecutorAdapter):
             result = result.model_copy(update={"error": error_message})
         if usage is not None:
             result = result.model_copy(update={"usage": usage})
+        if session:
+            result.meta["session_id"] = session
         return result

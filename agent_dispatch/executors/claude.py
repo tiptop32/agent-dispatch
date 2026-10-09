@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 
 from agent_dispatch.executors.base import (
     BaseExecutorAdapter,
@@ -49,11 +50,15 @@ class ClaudeAdapter(BaseExecutorAdapter):
                 ),
                 *READ_ONLY_ARGS,
             ]
+        # id новой сессии задаёт демон, а не CLI: при таймауте JSON в конце не
+        # напечатается, а продолжить именно такую задачу полезнее всего.
+        session = ctx.resume_session or str(uuid.uuid4())
         argv = [
             self.command,
             "-p",
             "--output-format",
             "json",
+            *(["--resume", session] if ctx.resume_session else ["--session-id", session]),
             "--add-dir",
             ctx.cwd,
             *(["--model", self.settings.model] if self.settings.model else []),
@@ -63,11 +68,13 @@ class ClaudeAdapter(BaseExecutorAdapter):
             ctx,
             argv,
             stdin=ctx.prompt,
-            parse_result=self._parse_result,
+            parse_result=lambda outcome, changed: self._parse_result(outcome, changed, session),
             run_cli_fn=run_cli,
         )
 
-    def _parse_result(self, outcome: ProcessOutcome, changed: list[str]) -> ExecutionResult:
+    def _parse_result(
+        self, outcome: ProcessOutcome, changed: list[str], session: str | None = None
+    ) -> ExecutionResult:
         model = self.settings.model
         usage = None
         raw = None
@@ -75,6 +82,7 @@ class ClaudeAdapter(BaseExecutorAdapter):
         try:
             payload = json.loads(outcome.stdout)
             if isinstance(payload, dict):
+                session = str(payload.get("session_id") or session or "") or None
                 result_text = str(payload.get("result", ""))
                 raw = extract_result_block(result_text)
                 model_usage = payload.get("modelUsage") or {}
@@ -105,4 +113,6 @@ class ClaudeAdapter(BaseExecutorAdapter):
             )
         if usage is not None:
             result = result.model_copy(update={"usage": usage})
+        if session:
+            result.meta["session_id"] = session
         return result

@@ -36,7 +36,10 @@ async def test_claude_execute_contract_and_usage(git_repo, tmp_path):
     assert result.model == "claude-opus-5"
     assert result.usage.cost_usd == 0.392015
     assert (tmp_path / "capture.stdin").read_text() == "fix it"
-    assert (tmp_path / "capture.argv").read_text().splitlines() == [
+    argv = (tmp_path / "capture.argv").read_text().splitlines()
+    # id сессии задаёт демон: его можно продолжить даже после таймаута.
+    assert argv[3] == "--session-id" and len(argv[4]) == 36
+    assert argv[:3] + argv[5:] == [
         "-p",
         "--output-format",
         "json",
@@ -45,6 +48,8 @@ async def test_claude_execute_contract_and_usage(git_repo, tmp_path):
         "--verbose",
     ]
     assert result.meta["log_path"] == str(tmp_path / "run.log")
+    # В отчёте CLI свой id сессии, он важнее заданного.
+    assert result.meta["session_id"] == "a17ff92a-3b08-4dd1-aa46-4bee0d99b33f"
 
 
 @pytest.mark.asyncio

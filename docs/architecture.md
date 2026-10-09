@@ -8,7 +8,7 @@ agent (claude / codex / opencode)
         │ HTTP 127.0.0.1:7433, Authorization: Bearer <token из serve.json>
         ▼
 `agent-dispatch serve`                       демон, один на машину
-  ├─ api/            FastAPI: /health, /executors, /route, /tasks, /tasks/{id}, /tasks/{id}/feedback, /export
+  ├─ api/            FastAPI: /health, /executors, /route, /tasks, /tasks/{id}, /tasks/{id}/followup, /tasks/{id}/feedback, /export
   ├─ dispatch/       dispatcher (state machine задачи), task_package, escalation
   ├─ routing/        Router-интерфейс, jev.py, claude_local.py, guards.py, decision.py
   ├─ executors/      base, process, workspace, result_parser, env, claude, codex, opencode, registry
@@ -49,6 +49,12 @@ queued → routing → running → completed | partial | failed | needs_context 
 Потолки расходов (по умолчанию выключены). `routing.max_chain_cost_usd`: перед эскалацией суммируется цена звеньев цепочки `escalated_from` и всех их подзадач по `parent_task_id` (`Storage.tree_cost`) плюс цена текущего результата; дошла до потолка — следующее звено не создаётся, цепочка считается исчерпанной, в `meta.budget` цена и лимит. `routing.daily_cost_limit_usd`: в `_prepare` до роутера суммируются цена задач, завершённых с местной полуночи, и решений роутера (`Storage.cost_since`); дошла до лимита — отказ `guard: budget`. Считается только цена, которую сообщает CLI (`usage.cost_usd` у claude и opencode).
 
 Любое исключение вне адаптера тоже переводит задачу в `failed` и ставит событие: задача не может остаться `running` навсегда. После рестарта демона `recover_stale()` переводит осиротевшие `queued/routing/running` в `failed` с `error="daemon restarted"`.
+
+## Follow-up
+
+`Dispatcher.followup(task_id, FollowupRequest)` продолжает готовую задачу: берётся последнее звено её цепочки эскалации (как в `wait`), новая задача копирует его запрос с `task = message`, `executor` = тот же исполнитель (или роутер, если он остывает), `followup_of`, `workspace_mode: in_place` и `verify` прошлой задачи, если не задан новый. Отказ (`FollowupError`, HTTP 409): задача ещё идёт, не дошла до исполнителя или её работа не в рабочей копии (`integrated: false` с патчем или веткой).
+
+Адаптеры кладут id сессии CLI в `result.meta.session_id` (claude: заданный демоном `--session-id` или `session_id` отчёта; codex: `thread.started.thread_id`; opencode: `sessionID`). `_build_context` передаёт его в `RunContext.resume_session`, если прошлый запуск шёл in_place в том же `cwd` тем же исполнителем; адаптеры продолжают сессию (`claude --resume`, `codex exec … resume <id> -`, `opencode run --session`), а промпт короткий (`followup_resumed.md.j2`). Иначе полный Task Package с разделом «Previous attempt»: запрос, изменённые файлы, ошибка, упавшая проверка, хвост отчёта. Продолжение, упавшее до работы (не сбой исполнителя, не таймаут, без изменений), один раз повторяется с нуля: событие `resume_failed`, `meta.resume_failed`.
 
 ## Hop-протокол и сабагенты
 
