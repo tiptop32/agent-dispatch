@@ -8,7 +8,16 @@ from pathlib import Path
 
 from agent_dispatch.config import load_settings
 
-from .harness import default_limit_group, load, render, replay
+from .harness import (
+    acceptance,
+    default_limit_group,
+    delegations,
+    load,
+    load_decisions,
+    render,
+    replay,
+    router_vs_static,
+)
 
 
 def main() -> int:
@@ -21,6 +30,21 @@ def main() -> int:
         type=str,
         default=None,
         help="ISO date/time: consider only tasks created at or after this moment",
+    )
+    parser.add_argument(
+        "--accept-window-hours",
+        type=float,
+        default=48,
+        help="a diff counts as accepted if the caller committed its files within this window",
+    )
+    parser.add_argument(
+        "--no-git", action="store_true", help="skip the acceptance check (it runs git log)"
+    )
+    parser.add_argument(
+        "--baseline-tier",
+        choices=("fast", "balanced", "strong"),
+        default="balanced",
+        help="tier of the static rule Jev is compared with",
     )
     parser.add_argument("--json", action="store_true", help="print the full JSON report")
     args = parser.parse_args()
@@ -38,14 +62,27 @@ def main() -> int:
         item = executors.get(name)
         return item.resolved_limit_group(name) if item else default_limit_group(name)
 
+    tasks = load(args.db)
+    if since is not None:
+        tasks = [task for task in tasks if task.created_at >= since]
     report = replay(
-        load(args.db),
+        tasks,
         args.cooldown,
         quota_cooldown=settings.routing.quota_cooldown_seconds,
         limit_group=limit_group,
         review_only=settings.routing.review_only,
         recheck=lambda name: name in executors and executors[name].limit_reset == "recheck",
-        since=since,
+    )
+    report["delegations"] = delegations(tasks)
+    if not args.no_git:
+        report["acceptance"] = acceptance(tasks, window_hours=args.accept_window_hours)
+    report["router_vs_static"] = router_vs_static(
+        load_decisions(args.db),
+        tasks,
+        executors,
+        baseline_tier=args.baseline_tier,
+        corporate_min_confidence=settings.routing.corporate_min_confidence,
+        corporate_perimeter=settings.routing.corporate_perimeter,
     )
     print(json.dumps(report, indent=2, ensure_ascii=False) if args.json else render(report))
     return 0

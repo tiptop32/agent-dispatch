@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
-from datetime import UTC, datetime
+import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from evals.replay.harness import load, render, replay
+from agent_dispatch.config import ExecutorSettings
+from agent_dispatch.models import ExecutionResult
+from evals.replay.harness import (
+    Acceptance,
+    Decision,
+    Task,
+    acceptance,
+    added_lines,
+    delegations,
+    git_acceptance,
+    load,
+    load_decisions,
+    render,
+    replay,
+    router_vs_static,
+)
 
 SCHEMA = Path(__file__).parent.parent / "agent_dispatch" / "telemetry" / "schema.sql"
 OFFLINE = '{"type":"error","message":"Reconnecting... 5/5 (request timed out)"}'
@@ -389,3 +406,259 @@ def test_replay_since_keeps_only_later_tasks(tmp_path):
         "first": "2026-09-23T13:31:00+00:00",
         "last": "2026-09-23T13:31:00+00:00",
     }
+
+
+def _task(task_id, status, *, executor="codex/sol", parent=None, minutes=1, result=None, cwd="/r"):
+    created = datetime(2026, 9, 23, 10, 0, tzinfo=UTC)
+    return Task(
+        task_id=task_id,
+        executor=executor,
+        status=status,
+        created_at=created,
+        started_at=created,
+        finished_at=created,
+        duration_ms=minutes * 60000,
+        escalated_from=parent,
+        # У отменённой и ещё идущей задачи результата нет.
+        result=None
+        if status in ("cancelled", "running")
+        else ExecutionResult.model_validate(result or _result(status)),
+        cwd=cwd,
+    )
+
+
+def test_delegations_follow_the_escalation_chain_to_its_outcome():
+    tasks = [
+        # Упал, но эскалация довела до completed: делегирование удалось.
+        _task("a" * 32, "failed", minutes=10, result=_result("failed", error="timeout")),
+        _task("b" * 32, "completed", parent="a" * 32, minutes=5),
+        # Таймаут с изменёнными файлами: работа есть, хотя не completed.
+        _task("c" * 32, "partial", result=_result("partial", changed=["x.py"])),
+        # Квота, затем отказ guard'а следующему звену: ничего, 7 минут впустую.
+        _task("d" * 32, "failed", minutes=6, result=_result("failed", error=WEEKLY)),
+        _task(
+            "e" * 32,
+            "failed",
+            executor="",
+            parent="d" * 32,
+            result=_result("failed", error="sibling count 2 >= 2"),
+        ),
+        _task("f" * 32, "cancelled", minutes=0),
+        _task("g" * 32, "running"),
+    ]
+    report = delegations(tasks)
+
+    assert report == {
+        "roots": 4,
+        "in_flight": 1,
+        "completed": 1,
+        "work_only": 1,
+        "wasted": 2,
+        "wasted_share": 0.5,
+        "wasted_minutes": 7.0,
+        "wasted_by_cause": {"guard": 1, "cancelled": 1},
+    }
+
+
+def test_delegations_treat_an_escalation_outside_since_as_a_root():
+    child = _task("b" * 32, "completed", parent="a" * 32)
+    assert delegations([child])["completed"] == 1
+
+
+def test_added_lines_keep_meaningful_lines_per_file():
+    patch = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1,3 @@\n"
+        " x = 1\n+    }\n+value = compute(x)\n"
+        "diff --git a/old.py b/old.py\n--- a/old.py\n+++ /dev/null\n@@ -1 +0,0 @@\n"
+        "-gone = True\n"
+    )
+    assert added_lines(patch) == {"a.py": ["value = compute(x)"]}
+
+
+def _accepted(verdicts):
+    """Поддельная проверка git: вердикт по cwd задачи."""
+
+    def check(cwd, files, patch, since, until):
+        assert until - since == timedelta(hours=48)
+        return verdicts[cwd]
+
+    return check
+
+
+def test_acceptance_counts_commits_and_surviving_lines():
+    def done(task_id, cwd, **meta):
+        return _task(
+            task_id, "completed", result=_result("completed", changed=["a.py"], meta=meta), cwd=cwd
+        )
+
+    tasks = [
+        done("a" * 32, "/kept"),
+        done("b" * 32, "/rewritten"),
+        done("c" * 32, "/dropped"),
+        done("d" * 32, "/gone"),
+        # Не дошло до рабочей копии: судить вызывающего не за что.
+        done("e" * 32, "/held", integrated=False),
+        # Ревью без изменений файлов.
+        _task("f" * 32, "completed", cwd="/review"),
+    ]
+    verdicts = {
+        "/kept": Acceptance(committed=True, added=10, survived=9),
+        "/rewritten": Acceptance(committed=True, added=10, survived=1),
+        "/dropped": Acceptance(committed=False),
+        "/gone": None,
+    }
+    report = acceptance(tasks, _accepted(verdicts))
+
+    assert (report["diffs"], report["committed"], report["not_committed"], report["unknown"]) == (
+        4,
+        2,
+        1,
+        1,
+    )
+    assert report["committed_share"] == 0.667
+    assert (report["kept"], report["reworked"], report["rewritten"]) == (1, 0, 1)
+    assert report["lines_survived_share"] == 0.5
+    text = render({**replay([]), "acceptance": report})
+    assert "diffs committed by the caller within 48 h: 2 of 3 (67%), unknown 1" in text
+    assert "executor lines kept in the caller's commit: 50% over 2 diffs" in text
+
+
+def _git_env(home: Path) -> dict:
+    return {
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+        "HOME": str(home),
+    }
+
+
+def test_git_acceptance_reads_the_callers_commit_and_skips_daemon_commits(git_repo, tmp_path):
+    # Коммиты на час вперёд: init-коммит фикстуры не должен попасть в окно.
+    later = datetime.now(UTC) + timedelta(hours=1)
+    env = {
+        **_git_env(tmp_path),
+        "GIT_AUTHOR_DATE": later.isoformat(),
+        "GIT_COMMITTER_DATE": later.isoformat(),
+    }
+
+    def commit(message, text):
+        (git_repo / "a.py").write_text(text)
+        subprocess.run(["git", "add", "a.py"], cwd=git_repo, env=env, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", message], cwd=git_repo, env=env, check=True)
+
+    since = later - timedelta(minutes=30)
+    until = later + timedelta(minutes=30)
+    patch = "+++ b/a.py\n+value = compute(x)\n+other = compute(y)\n"
+    # Коммит демона на ветке задачи не решение вызывающего.
+    commit("agent-dispatch: task deadbeef", "x = 1\nvalue = compute(x)\nother = compute(y)\n")
+    assert git_acceptance(str(git_repo), ["a.py"], patch, since, until) == Acceptance(
+        committed=False
+    )
+
+    commit("caller keeps half", "x = 1\nvalue = compute(x)\n")
+    assert git_acceptance(str(git_repo), ["a.py"], patch, since, until) == Acceptance(
+        committed=True, added=2, survived=1
+    )
+    sub = git_repo / "sub"
+    sub.mkdir()
+    assert git_acceptance(str(sub), ["a.py"], patch, since, until) == Acceptance(
+        committed=True, added=2, survived=1
+    )
+    assert git_acceptance(str(tmp_path / "missing"), ["a.py"], patch, since, until) is None
+    assert git_acceptance(str(tmp_path), ["a.py"], patch, since, until) is None
+
+
+def _settings(adapter, tier, *, corporate=False):
+    return ExecutorSettings(
+        adapter=adapter,
+        tier=tier,
+        corporate=corporate,
+        model="m" if adapter == "opencode" else None,
+    )
+
+
+EXECUTORS = {
+    "opencode/x5": _settings("opencode", "balanced", corporate=True),
+    "codex/luna": _settings("codex", "fast"),
+    "codex/sol": _settings("codex", "balanced"),
+    "claude/opus": _settings("claude", "strong"),
+}
+
+
+def _decision(task_id, capability, *, judgment=False, corporate=None, guard=None, candidates=None):
+    judgments = {} if capability is None else {"capability": {"value": capability}}
+    judgments["judgment"] = {"value": judgment}
+    if corporate is not None:
+        judgments["corporate_data"] = {"value": corporate[0], "confidence": corporate[1]}
+    return Decision(
+        task_id=task_id,
+        router="jev",
+        candidates=candidates or ["codex/luna", "codex/sol", "claude/opus"],
+        choice="",
+        guard_reason=guard,
+        judgments=judgments,
+    )
+
+
+def test_router_vs_static_compares_jev_with_one_tier_for_everything():
+    decisions = [
+        _decision("a" * 32, "balanced"),
+        _decision("b" * 32, "strong"),
+        _decision("c" * 32, "fast"),
+        # Суждение уводит к claude даже на balanced.
+        _decision("d" * 32, "balanced", judgment=True),
+        # Корпоративные данные: обе стороны внутри периметра, тир не важен.
+        _decision("e" * 32, "strong", corporate=(True, 0.9), candidates=list(EXECUTORS)),
+        # Ниже порога периметра: сужения нет, strong уходит к claude.
+        _decision("f" * 32, "strong", corporate=(True, 0.1), candidates=list(EXECUTORS)),
+        _decision("g" * 32, "strong", guard="low_confidence"),
+        _decision("h" * 32, None),
+        _decision("i" * 32, "fast", candidates=["codex/retired"]),
+    ]
+    statuses = {"a": "completed", "b": "completed", "c": "failed", "d": "failed"}
+    statuses |= {"e": "completed", "f": "completed"}
+    tasks = [_task(key * 32, status) for key, status in statuses.items()]
+    report = router_vs_static(decisions, tasks, EXECUTORS, corporate_min_confidence=0.5)
+
+    assert (report["compared"], report["agree"], report["agreement"]) == (6, 2, 0.333)
+    assert report["capabilities"] == {"strong": 3, "balanced": 2, "fast": 1}
+    assert report["disagreements"] == {
+        "strong: jev claude/opus / static codex/sol": 1,
+        "fast: jev codex/luna / static codex/sol": 1,
+        "balanced: jev claude/opus / static codex/sol": 1,
+        "strong: jev claude/opus / static opencode/x5": 1,
+    }
+    assert report["completed_when_agree"] == 1.0
+    assert report["completed_when_disagree"] == 0.5
+    assert report["skipped"] == {"no_capability": 1, "unknown_candidate": 1}
+    assert "jev vs static tier 'balanced': 2 of 6 agree (33%)" in render(
+        {**replay([]), "router_vs_static": report}
+    )
+
+
+def test_load_reads_cwd_and_routing_decisions(tmp_path):
+    db = _db(tmp_path, [("a" * 32, "codex/sol", "10:00", "10:05", 5, None, _result("completed"))])
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "insert into routing_decisions (task_id, router, candidates_json, choice, confidence,"
+        " scores_json, judgments_json, guard_reason, latency_ms, created_at)"
+        " values (?, 'jev', '[\"codex/sol\"]', 'codex/sol', 0.9, '{}',"
+        ' \'{"capability": {"value": "fast"}}\', null, 10, \'2026-09-23T10:00:00+00:00\')',
+        ("a" * 32,),
+    )
+    conn.commit()
+    conn.close()
+
+    assert load(db)[0].cwd == "/r"
+    assert load_decisions(db) == [
+        Decision(
+            task_id="a" * 32,
+            router="jev",
+            candidates=["codex/sol"],
+            choice="codex/sol",
+            guard_reason=None,
+            judgments={"capability": {"value": "fast"}},
+        )
+    ]
