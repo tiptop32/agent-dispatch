@@ -62,6 +62,39 @@ def review_permissions_env() -> str:
     )
 
 
+def _as_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return value
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def _error_from_event(event: dict) -> str | None:
+    """Сообщение об ошибке из события; последняя ошибка побеждает.
+
+    v1 присылает вложенный ``error.data.message`` (или только имя/тип),
+    v2 — ``error.message`` внутри события: ``{"error": {"type":
+    "provider.no-route" | "provider.auth", "message": ...}}``.
+    """
+    error = event.get("error")
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        data = error.get("data")
+        if isinstance(data, dict) and isinstance(data.get("message"), str):
+            return data["message"]
+        for key in ("message", "name", "type"):
+            value = error.get(key)
+            if isinstance(value, str):
+                return value
+    return None
+
+
 class OpenCodeAdapter(BaseExecutorAdapter):
     def __init__(
         self, name: str, settings: ExecutorSettings, base_env: dict[str, str] | None = None
@@ -85,13 +118,14 @@ class OpenCodeAdapter(BaseExecutorAdapter):
             # Headless-запуск: без `--auto` OpenCode спрашивает разрешение на
             # инструменты. Явную настройку пользователя не переопределяем.
             extra = [*extra, "--auto"]
+        # `--dir` поддерживает только CLI v1; v2 выбирает рабочий каталог
+        # через process.env.PWD (upstream cli-run.ts:73), который execute()
+        # выставляет в ctx.cwd. build_argv не должен знать про cwd.
         return [
             self.command,
             "run",
             "--format",
             "json",
-            "--dir",
-            ctx.cwd,
             "--model",
             self.settings.model,
             *(["--session", ctx.resume_session] if ctx.resume_session else []),
@@ -100,10 +134,10 @@ class OpenCodeAdapter(BaseExecutorAdapter):
         ]
 
     async def execute(self, ctx: RunContext) -> ExecutionResult:
+        env = {**ctx.env, "PWD": ctx.cwd}
         if ctx.read_only:
-            ctx = ctx.model_copy(
-                update={"env": {**ctx.env, "OPENCODE_PERMISSION": review_permissions_env()}}
-            )
+            env["OPENCODE_PERMISSION"] = review_permissions_env()
+        ctx = ctx.model_copy(update={"env": env})
         argv = self.build_argv(ctx)
         return await self._execute_common(
             ctx,
@@ -155,12 +189,15 @@ class OpenCodeAdapter(BaseExecutorAdapter):
                         permission_rejections.append(f"{part.get('tool', '')}: {str(detail)[:120]}")
             elif event.get("type") == "step_finish" and isinstance(event.get("part"), dict):
                 part = event["part"]
-                tokens = part.get("tokens") or {}
-                input_tokens += int(tokens.get("input", 0))
-                output_tokens += int(tokens.get("output", 0))
-                cost += float(part.get("cost", 0) or 0)
+                tokens = part.get("tokens")
+                if isinstance(tokens, dict):
+                    input_tokens += _as_int(tokens.get("input"))
+                    output_tokens += _as_int(tokens.get("output"))
+                cost += _as_float(part.get("cost"))
             elif event.get("type") == "error":
-                error_message = ((event.get("error") or {}).get("data") or {}).get("message")
+                message = _error_from_event(event)
+                if message:
+                    error_message = message
         text = "\n".join(text_parts)
         raw = extract_result_block(text)
         result = normalize(raw, outcome, changed, self.name, self.settings.model)

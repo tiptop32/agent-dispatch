@@ -14,6 +14,13 @@ from agent_dispatch.executors.process import ProcessOutcome
 
 REQUIRED_FIELDS = {"id", "kind", "input", "expected"}
 
+FIXTURES_DIR = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "agent_output"
+
+
+def load_events_fixture(name: str) -> list[dict]:
+    lines = (FIXTURES_DIR / name).read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
+
 
 @dataclass
 class Row:
@@ -58,19 +65,27 @@ def run_case(case: dict, tmp: Path) -> Row:
     )
     if case["kind"] == "argv":
         argv = adapter.build_argv(ctx)
+        # Полный argv, а не только хвост: флаг с аргументом мог бы спрятаться
+        # до начала сравниваемого хвоста.
+        for token in case["expected"].get("forbidden", []):
+            if any(arg == token or arg.startswith(f"{token}=") for arg in argv):
+                return Row(case["id"], False, f"argv contains forbidden {token!r}")
         expected_tail = case["expected"]["tail"]
         actual_tail = argv[-len(expected_tail) :]
         if actual_tail != expected_tail:
             return Row(case["id"], False, f"argv tail {actual_tail!r} != {expected_tail!r}")
         return Row(case["id"], True, "")
 
-    stdout = "".join(
-        json.dumps(event, ensure_ascii=False) + "\n" for event in case["input"]["events"]
-    )
+    input = case["input"]
+    if "events_fixture" in input:
+        events = load_events_fixture(input["events_fixture"])
+    else:
+        events = input["events"]
+    stdout = "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events)
     outcome = ProcessOutcome(
-        case["input"].get("exit_code", 0), stdout, "", False, case["input"].get("duration_ms", 1)
+        input.get("exit_code", 0), stdout, "", False, input.get("duration_ms", 1)
     )
-    result = adapter._parse_result(outcome, case["input"].get("changed", []))
+    result = adapter._parse_result(outcome, input.get("changed", []))
     expected = case["expected"]
     if result.status != expected.get("status"):
         return Row(case["id"], False, f"status {result.status!r} != {expected.get('status')!r}")

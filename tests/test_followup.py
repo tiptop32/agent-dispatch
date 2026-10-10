@@ -110,7 +110,7 @@ async def test_opencode_reports_its_session_and_continues_it(git_repo, tmp_path)
 
     await adapter.execute(_ctx(git_repo, tmp_path, resume_session="ses_1"))
     argv = _argv(tmp_path)
-    assert argv[7:9] == ["--session", "ses_1"]
+    assert argv[5:7] == ["--session", "ses_1"]
     assert argv[-3:] == ["--quiet", "--auto", "do task"]
 
 
