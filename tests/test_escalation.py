@@ -383,7 +383,9 @@ async def test_wait_timeout_returns_running_escalated_child(tmp_path, git_repo):
     gate = asyncio.Event()
     adapters["codex"].gate = gate
     parent = await dispatcher.submit(_request(git_repo))
-    done = await dispatcher.wait(parent.task_id, 0.05)
+    # Звено держит `gate`, поэтому окно не ослабляет проверку: оно нужно лишь
+    # на провал родителя и создание звена (с записью события `git`).
+    done = await dispatcher.wait(parent.task_id, 0.5)
     assert done.escalated_from == parent.task_id
     assert done.status in {"queued", "running"}
     gate.set()

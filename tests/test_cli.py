@@ -1,7 +1,10 @@
+import asyncio
 import json
 import os
 import socket
+import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 import pytest
@@ -9,8 +12,11 @@ import respx
 from typer.testing import CliRunner
 
 from agent_dispatch.cli import app
+from agent_dispatch.config import load_settings
 from agent_dispatch.mcp import autostart
+from agent_dispatch.models import DispatchRequest, SourceAgent, TaskRecord, TaskStatus
 from agent_dispatch.serve_state import ServeState, write_state
+from agent_dispatch.telemetry.storage import Storage
 
 runner = CliRunner()
 
@@ -331,6 +337,193 @@ def test_worktrees_reports_an_empty_repository(tmp_config_dir, git_repo):
 
     assert result.exit_code == 0
     assert "no agent-dispatch worktrees or branches" in result.stdout
+
+
+def _clone_repo(source: Path, target: Path) -> Path:
+    subprocess.run(
+        ["git", "clone", "-q", str(source), str(target)],
+        check=True,
+        capture_output=True,
+    )
+    return target
+
+
+def _record_task(task_id: str, status: TaskStatus, cwd: Path) -> None:
+    async def save() -> None:
+        settings = load_settings()
+        storage = Storage(settings.server.data_dir / "dispatch.db")
+        await storage.open()
+        try:
+            now = datetime.now(UTC)
+            await storage.insert_task(
+                TaskRecord(
+                    task_id=task_id,
+                    parent_task_id=None,
+                    escalated_from=None,
+                    root_agent=SourceAgent.cli,
+                    source_agent=SourceAgent.cli,
+                    hop=0,
+                    request=DispatchRequest(task="test", cwd=str(cwd), source_agent="cli"),
+                    status=status,
+                    decision=None,
+                    result=None,
+                    log_path="",
+                    created_at=now,
+                    started_at=None,
+                    finished_at=(
+                        now if status in {TaskStatus.completed, TaskStatus.failed} else None
+                    ),
+                )
+            )
+        finally:
+            await storage.close()
+
+    asyncio.run(save())
+
+
+def test_worktrees_all_lists_multiple_repositories_with_age_and_task_status(
+    tmp_config_dir, git_repo, tmp_path
+):
+    from agent_dispatch.executors import worktree
+
+    settings = load_settings()
+    base = settings.server.data_dir / "worktrees"
+    second_repo = _clone_repo(git_repo, tmp_path / "second-repo")
+    first = worktree.create(git_repo, base / "task-finished", "agent-dispatch/finished")
+    second = worktree.create(second_repo, base / "task-running", "agent-dispatch/running")
+    old = datetime.now().timestamp() - 8 * 86400
+    os.utime(first.path / ".git", (old, old))
+    _record_task("task-finished", TaskStatus.completed, first.path)
+    _record_task("task-running", TaskStatus.running, second.path)
+
+    result = runner.invoke(app, ["worktrees", "--all"])
+
+    assert result.exit_code == 0
+    assert f"repository\t{git_repo}" in result.stdout
+    assert f"repository\t{second_repo}" in result.stdout
+    assert f"{first.path}\tagent-dispatch/finished\tage=8d\tstatus=completed" in result.stdout
+    assert f"{second.path}\tagent-dispatch/running" in result.stdout
+    assert "status=running" in result.stdout
+
+
+def test_worktrees_all_clean_removes_only_safe_trees_and_missing_repositories(
+    tmp_config_dir, git_repo, tmp_path
+):
+    from agent_dispatch.executors import worktree
+
+    settings = load_settings()
+    base = settings.server.data_dir / "worktrees"
+    missing_repo = _clone_repo(git_repo, tmp_path / "missing-repo")
+    finished = worktree.create(git_repo, base / "finished", "agent-dispatch/finished")
+    running = worktree.create(git_repo, base / "running", "agent-dispatch/running")
+    guarded = worktree.create(git_repo, base / "guarded", "agent-dispatch/guarded")
+    missing = worktree.create(missing_repo, base / "missing", "agent-dispatch/missing")
+    missing_running = worktree.create(
+        missing_repo, base / "missing-running", "agent-dispatch/missing-running"
+    )
+    active_child_cwd = guarded.path / "child"
+    active_child_cwd.mkdir()
+    _record_task("finished", TaskStatus.completed, finished.path)
+    _record_task("running", TaskStatus.running, running.path)
+    _record_task("guarded", TaskStatus.completed, guarded.path)
+    _record_task("active-child", TaskStatus.running, active_child_cwd)
+    _record_task("missing", TaskStatus.completed, missing.path)
+    _record_task("missing-running", TaskStatus.running, missing_running.path)
+    missing_repo.rename(tmp_path / "moved-repo")
+
+    result = runner.invoke(app, ["worktrees", "--all", "--clean"])
+
+    assert result.exit_code == 0
+    assert not finished.path.exists()
+    assert running.path.exists()
+    assert guarded.path.exists()
+    assert not missing.path.exists()
+    # Исчезнувший репозиторий не даёт права удалить дерево работающей задачи.
+    assert missing_running.path.exists()
+    assert f"{running.path}\tkept\tunfinished task (running)" in result.stdout
+    assert f"{guarded.path}\tkept\tactive task cwd" in result.stdout
+    assert f"{missing.path}\tremoved\trepository missing" in result.stdout
+    assert f"{missing_running.path}\tkept\tunfinished task (running)" in result.stdout
+
+
+def test_worktrees_all_clean_never_follows_a_symlink_out_of_the_base_dir(
+    tmp_config_dir, git_repo, tmp_path
+):
+    from agent_dispatch.executors import worktree
+
+    settings = load_settings()
+    base = settings.server.data_dir / "worktrees"
+    base.mkdir(parents=True, exist_ok=True)
+    outside = worktree.create(git_repo, tmp_path / "elsewhere" / "tree", "feature/outside")
+    (base / "evil").symlink_to(outside.path, target_is_directory=True)
+    _record_task("evil", TaskStatus.completed, base / "evil")
+
+    result = runner.invoke(app, ["worktrees", "--all", "--clean"])
+
+    assert result.exit_code == 0
+    assert outside.path.exists()
+    assert "evil" not in result.stdout
+
+
+def test_worktrees_all_clean_rereads_tasks_right_before_removal(
+    tmp_config_dir, git_repo, monkeypatch
+):
+    # Между первым снимком базы и удалением демон принял задачу с cwd в дереве.
+    from agent_dispatch import cli
+    from agent_dispatch.executors import worktree
+
+    settings = load_settings()
+    base = settings.server.data_dir / "worktrees"
+    tree = worktree.create(git_repo, base / "done", "agent-dispatch/done")
+    snapshots = iter(
+        [
+            ({"done": "completed"}, []),
+            ({"done": "completed", "late": "running"}, [str(tree.path / "sub")]),
+        ]
+    )
+
+    async def index(_settings):
+        return next(snapshots)
+
+    monkeypatch.setattr(cli, "_worktree_task_index", index)
+
+    result = runner.invoke(app, ["worktrees", "--all", "--clean"])
+
+    assert result.exit_code == 0
+    assert tree.path.exists()
+    assert f"{tree.path}\tkept\tactive task cwd" in result.stdout
+
+
+def test_worktrees_all_clean_revalidates_the_path_at_removal(
+    tmp_config_dir, git_repo, tmp_path, monkeypatch
+):
+    # После инвентаризации каталог подменили симлинком на чужой worktree.
+    import shutil
+
+    from agent_dispatch import cli
+    from agent_dispatch.executors import worktree
+
+    settings = load_settings()
+    base = settings.server.data_dir / "worktrees"
+    tree = worktree.create(git_repo, base / "done", "agent-dispatch/done")
+    outside = worktree.create(git_repo, tmp_path / "elsewhere" / "tree", "feature/outside")
+    calls = 0
+
+    async def index(_settings):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            shutil.rmtree(tree.path)
+            tree.path.symlink_to(outside.path, target_is_directory=True)
+        return {"done": "completed"}, []
+
+    monkeypatch.setattr(cli, "_worktree_task_index", index)
+
+    result = runner.invoke(app, ["worktrees", "--all", "--clean"])
+
+    assert result.exit_code == 0
+    assert outside.path.exists()
+    assert f"{tree.path}\tkept\tnot a plain directory" in result.stdout
 
 
 def test_help_lists_all_commands():

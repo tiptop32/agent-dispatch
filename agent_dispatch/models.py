@@ -56,6 +56,7 @@ FINAL_STATUSES: frozenset[TaskStatus] = frozenset(
 
 class RouterKind(StrEnum):
     jev = "jev"
+    explore = "explore"
     claude_local = "claude_local"
     fallback = "fallback"
     override = "override"

@@ -82,6 +82,21 @@ def test_max_children_boundary(git_repo):
     )
 
 
+def test_max_children_refusal_names_running_siblings(git_repo):
+    r = DispatchRequest(task="x", cwd=str(git_repo), parent_task_id="p")
+    quiet = pre_guards(r, settings(), set(), True, 2)
+    assert quiet.reason == GuardReason.max_children
+    assert "status(task_id, wait_seconds)" not in quiet.detail
+    event = pre_guards(r, settings(), set(), True, 2, running_siblings=["abc123", "def456"])
+    assert event.reason == GuardReason.max_children
+    assert "running siblings: abc123, def456" in event.detail
+    assert "status(task_id, wait_seconds)" in event.detail
+    assert "instead of dispatching again" in event.detail
+    long = pre_guards(r, settings(), set(), True, 2, running_siblings=[f"t{i}" for i in range(7)])
+    assert "t0, t1, t2, t3, t4, t5 (+1 more)" in long.detail
+    assert "t6" not in long.detail
+
+
 def test_override_disabled(git_repo):
     s = settings()
     s.executors["claude"].enabled = False

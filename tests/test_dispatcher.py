@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from pathlib import Path
 
 import pytest
@@ -25,13 +26,18 @@ def _settings(
     tmp_path: Path,
     *,
     max_tasks: int = 2,
+    max_per_group: int = 2,
     max_children: int = 2,
     max_hops: int = 2,
     escalation: dict[str, list[str]] | None = None,
 ) -> Settings:
     names = {"codex": "codex", "claude": "claude", "opencode/kimi": "opencode"}
     return Settings(
-        server=ServerSettings(data_dir=tmp_path, max_concurrent_tasks=max_tasks),
+        server=ServerSettings(
+            data_dir=tmp_path,
+            max_concurrent_tasks=max_tasks,
+            max_concurrent_per_group=max_per_group,
+        ),
         routing=RoutingSettings(
             fallback_executor="codex", max_children=max_children, max_hops=max_hops
         ),
@@ -91,6 +97,65 @@ async def test_semaphore_serializes_roots(tmp_path, git_repo):
     a["codex"].gate.set()
     await d.wait(r1.task_id, WAIT)
     await d.wait(r2.task_id, WAIT)
+
+
+@pytest.mark.asyncio
+async def test_root_task_capacity_is_per_group_under_global_ceiling(tmp_path, git_repo):
+    _, storage, adapters, dispatcher = await _make(tmp_path, max_tasks=3, max_per_group=2)
+    repos = [git_repo]
+    for index in range(1, 6):
+        repo = tmp_path / f"repo-{index}"
+        shutil.copytree(git_repo, repo)
+        repos.append(repo)
+
+    codex = adapters["codex"]
+    opencode = adapters["opencode/kimi"]
+    codex.gate = asyncio.Event()
+    opencode.gate = asyncio.Event()
+
+    first = await dispatcher.submit(_req(repos[0], executor="codex"))
+    second = await dispatcher.submit(_req(repos[1], executor="codex"))
+    async with asyncio.timeout(WAIT):
+        while len(codex.calls) < 2:  # noqa: ASYNC110
+            await asyncio.sleep(0)
+
+    waiting_group = await dispatcher.submit(_req(repos[2], executor="codex"))
+    async with asyncio.timeout(WAIT):
+        while (await storage.get_task(waiting_group.task_id)).decision is None:  # noqa: ASYNC110
+            await asyncio.sleep(0)
+
+    other_group = await dispatcher.submit(_req(repos[3], executor="opencode/kimi"))
+    await asyncio.wait_for(opencode.started.wait(), WAIT)
+    assert len(codex.calls) == 2
+    assert len(opencode.calls) == 1
+
+    # В группе opencode есть место, но общий предел уже занят двумя codex и
+    # первым opencode. Ожидающий group-slot codex общего слота не держит.
+    opencode.started = asyncio.Event()
+    waiting_global = await dispatcher.submit(_req(repos[4], executor="opencode/kimi"))
+    async with asyncio.timeout(WAIT):
+        while (await storage.get_task(waiting_global.task_id)).decision is None:  # noqa: ASYNC110
+            await asyncio.sleep(0)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(opencode.started.wait(), 0.1)
+
+    # Отмена задачи, которая не получила group-slot, не должна освободить
+    # чужой global-slot. Второй opencode по-прежнему ждёт.
+    await dispatcher.cancel(waiting_group.task_id)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(opencode.started.wait(), 0.1)
+
+    await dispatcher.cancel(first.task_id)
+    await asyncio.wait_for(opencode.started.wait(), WAIT)
+    assert len(opencode.calls) == 2
+
+    events = await storage.list_events(other_group.task_id)
+    slot = next(event["payload"] for event in events if event["kind"] == "slot")
+    assert slot["limit_group"] == "opencode/kimi"
+    assert slot["wait_seconds"] >= 0
+
+    for task_id in (second.task_id, other_group.task_id, waiting_global.task_id):
+        await dispatcher.cancel(task_id)
 
 
 @pytest.mark.asyncio
@@ -177,6 +242,36 @@ async def test_max_children_guard(tmp_path, git_repo):
     )
     assert refused.result.meta["guard"] == "max_children"
     assert refused.result.error == "sibling count 2 >= 2"
+    assert retried.result.error == "sibling count 2 >= 2"
+
+
+@pytest.mark.asyncio
+async def test_max_children_refusal_lists_running_siblings(tmp_path, git_repo):
+    _, _, a, d = await _make(tmp_path, max_children=2)
+    parent = await d.submit(_req(git_repo))
+    await d.wait(parent.task_id, WAIT)
+    done = await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))
+    await d.wait(done.task_id, WAIT)
+    a["codex"].gate = asyncio.Event()
+    a["codex"].started.clear()
+    running = await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))
+    await asyncio.wait_for(a["codex"].started.wait(), WAIT)
+    refused = await d.wait(
+        (await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))).task_id, WAIT
+    )
+    assert refused.result.meta["guard"] == "max_children"
+    assert refused.result.error == (
+        f"sibling count 2 >= 2; running siblings: {running.task_id};"
+        " wait for one via status(task_id, wait_seconds) instead of dispatching again"
+    )
+    # Слот освободился: работающих sibling'ов больше нет, и отказ снова
+    # короткий — ждать нечего, но квота fan-out не растёт.
+    a["codex"].gate.set()
+    await d.wait(running.task_id, WAIT)
+    retried = await d.wait(
+        (await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))).task_id, WAIT
+    )
+    assert retried.result.meta["guard"] == "max_children"
     assert retried.result.error == "sibling count 2 >= 2"
 
 
@@ -404,3 +499,83 @@ async def test_worker_cancelled_before_start_is_recorded_cancelled(tmp_path, git
     stored = await st.get_task(record.task_id)
     assert stored.status == TaskStatus.cancelled
     assert stored.result is not None and stored.result.error == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_timeout_precedence_request_then_executor_then_routing(tmp_path, git_repo):
+    settings, _, a, d = await _make(tmp_path)
+    settings.executors["codex"].timeout_seconds = 3600
+    settings.routing.default_timeout_seconds = 1800
+
+    for req, expected in (
+        (_req(git_repo, timeout_seconds=600), 600),
+        (_req(git_repo), 3600),
+        (_req(git_repo, executor="claude"), 1800),
+    ):
+        await d.wait((await d.submit(req)).task_id, WAIT)
+        adapter = a[req.executor]
+        assert adapter.calls[-1].timeout_seconds == expected
+        # Бюджет времени в промпте исполнителя тот же, что у таймаута.
+        assert f"Your time budget is {expected} seconds" in adapter.calls[-1].prompt
+
+
+@pytest.mark.asyncio
+async def test_submit_records_the_git_common_dir_and_branch_of_cwd(tmp_path, git_repo):
+    from agent_dispatch.executors import worktree
+
+    _, st, _, d = await _make(tmp_path)
+    tree = worktree.create(git_repo, tmp_path / "wt" / "feature", "feature")
+    linked = await d.submit(_req(tree.path))
+    # Событие уже записано, когда `submit` вернул ответ: вызывающий может
+    # удалить свой worktree сразу, и запись после этого не нашла бы репу.
+    events = [e for e in await st.list_events(linked.task_id) if e["kind"] == "git"]
+    assert [e["payload"] for e in events] == [
+        {"common_dir": str((git_repo / ".git").resolve()), "branch": "feature"}
+    ]
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    not_git = await d.submit(_req(plain))
+    for record in (linked, not_git):
+        await d.wait(record.task_id, WAIT)
+    await d.shutdown()
+
+    assert not [e for e in await st.list_events(not_git.task_id) if e["kind"] == "git"]
+
+
+@pytest.mark.asyncio
+async def test_failed_git_location_does_not_break_submit(tmp_path, git_repo, monkeypatch):
+    # Событие `git` это телеметрия: её сбой не роняет `submit` и не оставляет
+    # задачу `queued` без воркера.
+    from agent_dispatch.executors import worktree
+
+    def broken(_cwd):
+        raise RuntimeError("cwd vanished between git calls")
+
+    monkeypatch.setattr(worktree, "git_location", broken)
+    _, st, _, d = await _make(tmp_path)
+
+    record = await d.submit(_req(git_repo))
+    done = await d.wait(record.task_id, WAIT)
+
+    assert done.status == "completed"
+    assert not [e for e in await st.list_events(record.task_id) if e["kind"] == "git"]
+
+
+@pytest.mark.asyncio
+async def test_failed_git_event_write_does_not_fail_a_running_submit(tmp_path, git_repo):
+    # Воркер уже создан: ошибка записи события заставила бы вызывающего
+    # повторить `submit` и запустить ту же работу дважды.
+    _, st, _, d = await _make(tmp_path)
+    original = st.add_event
+
+    async def add_event(task_id, kind, payload):
+        if kind == "git":
+            raise OSError("disk full")
+        return await original(task_id, kind, payload)
+
+    st.add_event = add_event
+
+    record = await d.submit(_req(git_repo))
+    done = await d.wait(record.task_id, WAIT)
+
+    assert done.status == "completed"

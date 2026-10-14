@@ -19,6 +19,17 @@ def _event(reason: GuardReason, detail: str, executor: str | None = None) -> Gua
     return GuardEvent(reason=reason, detail=detail, executor=executor)
 
 
+#: Сколько task_id работающих sibling'ов помещается в отказ: компактный
+#: ответ MCP показывает `error` целиком только до 500 символов.
+MAX_SIBLING_IDS_IN_REFUSAL = 6
+
+
+def _running_siblings(ids: list[str]) -> str:
+    shown = ids[:MAX_SIBLING_IDS_IN_REFUSAL]
+    tail = f" (+{len(ids) - len(shown)} more)" if len(ids) > len(shown) else ""
+    return ", ".join(shown) + tail
+
+
 def pre_guards(
     req: DispatchRequest,
     settings: Settings,
@@ -26,6 +37,7 @@ def pre_guards(
     parent_exists: bool,
     sibling_count: int,
     review_only: set[str] | frozenset[str] = frozenset(),
+    running_siblings: list[str] | None = None,
 ) -> GuardEvent | RouteDecision | None:
     if not is_git_repo(req.cwd):
         return _event(GuardReason.bad_cwd, f"cwd is not a git repository: {req.cwd}")
@@ -34,10 +46,15 @@ def pre_guards(
     if req.parent_task_id and not parent_exists:
         return _event(GuardReason.unknown_parent, f"parent task not found: {req.parent_task_id}")
     if req.parent_task_id and sibling_count >= settings.routing.max_children:
-        return _event(
-            GuardReason.max_children,
-            f"sibling count {sibling_count} >= {settings.routing.max_children}",
-        )
+        detail = f"sibling count {sibling_count} >= {settings.routing.max_children}"
+        if running_siblings:
+            # Слот освободит один из работающих sibling'ов: повторный dispatch
+            # откажет снова, ждать надо через status, а не через dispatch.
+            detail += (
+                f"; running siblings: {_running_siblings(running_siblings)};"
+                " wait for one via status(task_id, wait_seconds) instead of dispatching again"
+            )
+        return _event(GuardReason.max_children, detail)
     if req.executor is not None:
         if req.executor not in settings.executors or not settings.executors[req.executor].enabled:
             return _event(

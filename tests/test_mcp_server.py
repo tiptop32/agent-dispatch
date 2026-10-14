@@ -163,6 +163,26 @@ async def test_compact_output_shows_a_failed_integration(tmp_path):
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_compact_output_keeps_max_children_advice(tmp_path):
+    # Отказ max_children называет работающих sibling'ов и совет status:
+    # компактный ответ обязан донести этот текст целиком, иначе вызывающий
+    # снова dispatch'ует вместо того, чтобы дождаться sibling.
+    refusal = view(status="failed", summary="")
+    refusal.result.error = (
+        "sibling count 2 >= 2; running siblings: aaaa, bbbb;"
+        " wait for one via status(task_id, wait_seconds) instead of dispatching again"
+    )
+    respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(200, json=refusal.model_dump(mode="json"))
+    )
+    r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
+    text = r.content[0].text
+    assert "error: sibling count 2 >= 2; running siblings: aaaa, bbbb" in text
+    assert "status(task_id, wait_seconds) instead of dispatching again" in text
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_dispatch_truncates_long_summary(tmp_path):
     summary = "x" * 801
     respx.post("http://127.0.0.1:7433/tasks").mock(

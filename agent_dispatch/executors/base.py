@@ -127,7 +127,12 @@ class BaseExecutorAdapter:
             return cwd_error_result(self.name, self.settings.model, ctx.cwd, ctx.log_path)
         changed = workspace.diff(before, after)
         result = parse_result(outcome, changed)
-        return result.model_copy(update={"meta": {**result.meta, "log_path": str(ctx.log_path)}})
+        meta = {**result.meta, "log_path": str(ctx.log_path)}
+        if outcome.timed_out:
+            # Работал агент до конца или висел. CLI, который печатает всё в
+            # конце, молчит весь запуск: его молчание ничего не говорит.
+            meta["last_output_age_s"] = outcome.last_output_age_s if self.streams_output else None
+        return result.model_copy(update={"meta": meta})
 
 
 def default_base_env() -> dict[str, str]:

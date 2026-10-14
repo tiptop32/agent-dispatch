@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import subprocess
 import time
 import uuid
@@ -38,6 +39,7 @@ from agent_dispatch.models import (
 )
 from agent_dispatch.routing.base import Router
 from agent_dispatch.routing.decision import decide_with_fallback
+from agent_dispatch.routing.exploration import apply_exploration
 from agent_dispatch.routing.guards import candidates, pre_guards, review_only_executors
 from agent_dispatch.telemetry.storage import Storage
 
@@ -116,6 +118,13 @@ class Dispatcher:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._events: dict[str, asyncio.Event] = {}
         self._semaphore = asyncio.Semaphore(settings.server.max_concurrent_tasks)
+        self._group_semaphores = {
+            item.resolved_limit_group(name): asyncio.Semaphore(
+                settings.server.max_concurrent_per_group
+            )
+            for name, item in settings.executors.items()
+            if item.enabled
+        }
         # Ёмкость ревью отдельная: долгая корневая задача не должна оставлять
         # ревью без слота, и лишние ревью не должны вытеснять задачи. Максимум
         # корневых CLI-процессов демона из-за этого равен сумме двух пределов.
@@ -140,6 +149,10 @@ class Dispatcher:
     async def submit(self, req: DispatchRequest, escalated_from: str | None = None) -> TaskRecord:
         if req.parent_task_id is None:
             req = await self._inherit_worktree_parent(req)
+        # Где живут коммиты вызывающего, узнаётся до записи задачи: он вправе
+        # удалить свой worktree сразу после ответа `submit`, а отмена `submit`
+        # во время вызова git не оставит в базе задачу `queued` без воркера.
+        location = await self._git_location(req.cwd)
         task_id = uuid.uuid4().hex
         root = req.root_agent or req.source_agent
         log_path = self.settings.server.data_dir / "logs" / f"{task_id}.log"
@@ -166,7 +179,33 @@ class Dispatcher:
         self._tasks[task_id].add_done_callback(
             lambda worker, tid=task_id: self._track_cleanup(self._on_worker_done(tid, worker))
         )
+        # После создания воркера: ожидание write-lock здесь отменяемо, и отмена
+        # не должна оставить задачу без исполнения.
+        if location is not None:
+            try:
+                await self.storage.add_event(task_id, "git", location)
+            except Exception:
+                # Задача уже идёт: ошибка здесь заставила бы вызывающего
+                # повторить `submit` и запустить ту же работу дважды.
+                logging.getLogger("agent_dispatch.dispatch").warning(
+                    "git event of task %s not recorded", task_id, exc_info=True
+                )
         return record
+
+    async def _git_location(self, cwd: str) -> dict[str, str | None] | None:
+        """Общий git dir и ветка cwd для события `git`; два вызова git, ~15 мс.
+
+        Вызывающий удаляет свой worktree после слияния, а `evals.replay` судит,
+        принят ли диф, по записанному здесь. Это только телеметрия: её сбой не
+        должен ронять `submit`.
+        """
+        try:
+            return await asyncio.to_thread(worktree.git_location, cwd)
+        except Exception:
+            logging.getLogger("agent_dispatch.dispatch").warning(
+                "git location of %s not recorded", cwd, exc_info=True
+            )
+            return None
 
     async def _inherit_worktree_parent(self, req: DispatchRequest) -> DispatchRequest:
         """Восстановить родителя вложенного вызова по cwd его worktree."""
@@ -331,6 +370,7 @@ class Dispatcher:
             await self.storage.task_exists(req.parent_task_id) if req.parent_task_id else False
         )
         siblings = 0
+        running_siblings: list[str] = []
         if req.parent_task_id and not is_escalation:
             # Ретраи эскалации не съедают квоту fan-out родителя, cancelled тоже.
             siblings = await self.storage.count_children(
@@ -338,7 +378,18 @@ class Dispatcher:
                 exclude_escalated=True,
                 exclude_task_id=current_task_id,
             )
-        verdict = pre_guards(req, self.settings, unavailable, parent_exists, siblings, review_only)
+            running_siblings = await self.storage.running_children(
+                req.parent_task_id, exclude_task_id=current_task_id
+            )
+        verdict = pre_guards(
+            req,
+            self.settings,
+            unavailable,
+            parent_exists,
+            siblings,
+            review_only,
+            running_siblings=running_siblings,
+        )
         names = candidates(self.settings, unavailable | review_only, req.source_agent, req.hop)
         if isinstance(verdict, GuardEvent):
             cooldown = self.availability.cooldown(verdict.executor) if verdict.executor else None
@@ -362,6 +413,15 @@ class Dispatcher:
             return Routing(self._fallback_decision(guard.reason), guard, [], names)
         decision, events = await decide_with_fallback(
             req, {n: self.settings.executors[n] for n in names}, self.settings, self.routers
+        )
+        decision = apply_exploration(
+            current_task_id,
+            req,
+            decision,
+            {n: self.settings.executors[n] for n in names},
+            self.settings,
+            is_escalation=is_escalation,
+            unavailable=self.availability.unavailable(),
         )
         return Routing(decision, None, events, names)
 
@@ -510,15 +570,7 @@ class Dispatcher:
         mode = req.workspace_mode or self.settings.execution.workspace_mode
         if review:
             mode = "in_place"
-        # Корневая задача и корневое ревью ходят в разные пулы; вложенная
-        # работа (hop > 0) мимо обоих, иначе исполнитель в подзадаче ждал бы
-        # слот своего же родителя — взаимная блокировка.
-        if req.hop > 0:
-            semaphore = contextlib.nullcontext()
-        elif review:
-            semaphore = self._review_semaphore
-        else:
-            semaphore = self._semaphore
+        capacity = self._capacity(record, decision)
         # В режиме worktree исполнители не делят дерево, поэтому lock нужен
         # только на время переноса результата обратно в рабочую копию.
         lock = (
@@ -526,7 +578,7 @@ class Dispatcher:
             if req.hop == 0 and mode == "in_place" and not review
             else contextlib.nullcontext()
         )
-        async with semaphore, lock:
+        async with capacity, lock:
             # Путь и ветка известны до создания: отмена посреди `worktree.create`
             # бросает ожидание, но поток доводит каталог до конца, и корутина
             # никогда не узнает о дереве, которое уже есть на диске.
@@ -581,6 +633,40 @@ class Dispatcher:
                 if target is not None:
                     await self._note_kept_worktree(record, *target, exc)
                 raise
+
+    @contextlib.asynccontextmanager
+    async def _capacity(self, record: TaskRecord, decision: RouteDecision) -> AsyncIterator[None]:
+        """Занять ёмкость корневой задачи, не блокируя чужую группу.
+
+        Вложенная работа обходит корневые пулы, а ревью сохраняет свой прежний
+        отдельный пул. Задача на правку сначала ждёт группу и лишь затем общий
+        потолок, поэтому занятая группа не создаёт head-of-line blocking.
+        """
+        req = record.request
+        if req.hop > 0:
+            yield
+            return
+        if req.kind == "review":
+            async with self._review_semaphore:
+                yield
+            return
+
+        group = self._resolved_limit_group(decision.executor)
+        semaphore = self._group_semaphores.setdefault(
+            group, asyncio.Semaphore(self.settings.server.max_concurrent_per_group)
+        )
+        started = time.monotonic()
+        async with semaphore:
+            async with self._semaphore:
+                await self.storage.add_event(
+                    record.task_id,
+                    "slot",
+                    {
+                        "limit_group": group,
+                        "wait_seconds": round(time.monotonic() - started, 6),
+                    },
+                )
+                yield
 
     async def _run_executor(
         self,
@@ -770,9 +856,11 @@ class Dispatcher:
     ) -> RunContext:
         """Task Package и prompt под адаптер выбранного исполнителя."""
         req = record.request
+        timeout = self.settings.timeout_for(decision.executor, req.timeout_seconds)
         package = await asyncio.to_thread(
             build_task_package,
-            req,
+            # Бюджет времени в Task Package равен таймауту выбранного исполнителя.
+            req.model_copy(update={"timeout_seconds": timeout}),
             self.settings,
             str(tree.path) if tree else None,
             tree.branch if tree else None,
@@ -789,7 +877,7 @@ class Dispatcher:
         )
         return RunContext(
             cwd=str(tree.path) if tree else req.cwd,
-            timeout_seconds=req.timeout_seconds or self.settings.routing.default_timeout_seconds,
+            timeout_seconds=timeout,
             idle_timeout_seconds=self.settings.execution.idle_timeout_seconds or None,
             env=child_env(
                 self.settings,
@@ -906,12 +994,17 @@ class Dispatcher:
         configured = self.settings.executors.get(executor)
         if scope != "group" or configured is None:
             return [executor]
-        group = configured.resolved_limit_group(executor)
+        group = self._resolved_limit_group(executor)
         return [executor] + [
             name
             for name, item in self.settings.executors.items()
             if name != executor and item.enabled and item.resolved_limit_group(name) == group
         ]
+
+    def _resolved_limit_group(self, executor: str) -> str:
+        """Имя общей квоты исполнителя из конфига или сам исполнитель."""
+        configured = self.settings.executors.get(executor)
+        return configured.resolved_limit_group(executor) if configured else executor
 
     async def restore_cooldowns(self) -> int:
         """Вернуть остывания из базы после перезапуска демона."""

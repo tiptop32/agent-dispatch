@@ -14,6 +14,8 @@
   следующего исполнителя;
 - отчёт исполнителя (`result_parser._coerce`): сколько `partial` дал только
   формат отчёта (уверенность словами, `null` в необязательных полях).
+- очередь корневых задач: сколько каждая группа лимита ждала слоты. Метрика
+  берётся только из новых событий `slot`, старые задачи в неё не подмешиваются.
 
 И три вещи о пользе самой утилиты:
 
@@ -22,8 +24,14 @@
   Вызывающий потратил контекст на отправку и ожидание и сделал работу сам;
 - `acceptance`: по скольким дифам вызывающий потом закоммитил хотя бы один
   из `changed_files` и какая доля значимых строк патча дожила до этого коммита.
-  Сам факт коммита это верхняя оценка: коммит мог переписать работу;
+  Сам факт коммита это верхняя оценка: коммит мог переписать работу. Удалённый
+  после слияния worktree вызывающего судится по общему git dir (событие `git`
+  задачи или поиск по соседям), остальные `unknown` разбиты по причинам;
+- `timeouts`: жёсткие таймауты по исполнителям и был ли вывод за последние
+  120 с до убийства (`meta.last_output_age_s`): работавшему до конца агенту
+  мал таймаут или велика задача, молчавший висел;
 - `router_vs_static`: как часто выбор Jev совпал бы со статическим правилом
+- `exploration`: исход и acceptance рандомизированных arm `explore` и `jev`
   (один тир для всех, без вопроса о суждении, тот же периметр) на текущем
   конфиге и чем кончились задачи там, где они расходятся.
 """
@@ -36,13 +44,13 @@ import sqlite3
 import subprocess
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
 from agent_dispatch.config import ExecutorSettings
 from agent_dispatch.executors.health import classify_failure, cooldown_seconds, failure_scope
-from agent_dispatch.models import ExecutionResult
+from agent_dispatch.models import FINAL_STATUSES, ExecutionResult
 from agent_dispatch.routing.capability import has_corporate, select
 
 #: Ошибки валидации, которые `_coerce` теперь исправляет сам.
@@ -76,6 +84,11 @@ class Task:
     started_at: datetime | None = None
     cwd: str = ""
     parent_task_id: str | None = None
+    events: list[dict] = field(default_factory=list)
+    #: Событие `git` задачи: общий git dir и ветка cwd на момент `submit`.
+    #: У задач до него None.
+    git_common_dir: str | None = None
+    git_branch: str | None = None
 
 
 @dataclass
@@ -108,8 +121,22 @@ def load(db_path: Path) -> list[Task]:
             " coalesce(json_extract(request_json, '$.kind'), 'task'), cwd, parent_task_id"
             " from tasks order by created_at"
         ).fetchall()
+        event_rows = conn.execute(
+            "select task_id, ts, kind, payload_json from events order by id"
+        ).fetchall()
+        git = {
+            task_id: json.loads(payload)
+            for task_id, payload in conn.execute(
+                "select task_id, payload_json from events where kind = 'git' order by id"
+            )
+        }
     finally:
         conn.close()
+    events: dict[str, list[dict]] = {}
+    for task_id, ts, kind, payload in event_rows:
+        events.setdefault(task_id, []).append(
+            {"ts": ts, "kind": kind, "payload": json.loads(payload)}
+        )
     return [
         Task(
             task_id=row[0],
@@ -125,6 +152,9 @@ def load(db_path: Path) -> list[Task]:
             kind=row[10],
             cwd=row[11],
             parent_task_id=row[12],
+            events=events.get(row[0], []),
+            git_common_dir=git.get(row[0], {}).get("common_dir"),
+            git_branch=git.get(row[0], {}).get("branch"),
         )
         for row in rows
     ]
@@ -165,6 +195,36 @@ def _window(times: list[datetime]) -> dict | None:
     return {
         "first": min(times).isoformat(timespec="seconds"),
         "last": max(times).isoformat(timespec="seconds"),
+    }
+
+
+def _queue_wait_by_limit_group(tasks: list[Task]) -> dict[str, dict]:
+    """Сводка ожидания по новым slot-событиям; старые задачи исключены."""
+    waits: dict[str, list[float]] = {}
+    for task in tasks:
+        for event in task.events:
+            if event.get("kind") != "slot":
+                continue
+            payload = event.get("payload", {})
+            group = payload.get("limit_group")
+            seconds = payload.get("wait_seconds")
+            if (
+                not isinstance(group, str)
+                or not group
+                or isinstance(seconds, bool)
+                or not isinstance(seconds, (int, float))
+                or seconds < 0
+            ):
+                continue
+            waits.setdefault(group, []).append(float(seconds))
+    return {
+        group: {
+            "samples": len(values),
+            "waited_over_60_seconds": sum(value > 60 for value in values),
+            "avg_seconds": round(sum(values) / len(values), 1),
+            "max_seconds": round(max(values), 1),
+        }
+        for group, values in sorted(waits.items())
     }
 
 
@@ -294,6 +354,7 @@ def replay(
         "review_only_runs": len(restricted),
         "review_only_failed": sum(1 for task in restricted if task.status == "failed"),
         "review_only_minutes": round(sum(task.duration_ms for task in restricted) / 60000, 1),
+        "queue_wait_by_limit_group": _queue_wait_by_limit_group(tasks),
         "section_windows": {
             "executor_failures": _window(failure_times),
             "avoidable_runs": _window(avoidable_times),
@@ -440,11 +501,52 @@ class Acceptance:
 
     `added` это значимые добавленные строки патча, `survived` из них те, что
     есть в файлах на первом коммите вызывающего. Без патча оба равны нулю.
+    `via` говорит, где искали коммит (`GitRepo.via`).
     """
 
     committed: bool
     added: int = 0
     survived: int = 0
+    via: str = "cwd"
+
+
+@dataclass(frozen=True)
+class Unknown:
+    """Судить нечем. Причина идёт в разбивку отчёта:
+
+    - `cwd_gone`: каталога нет, общий git dir не записан и не нашёлся;
+    - `ambiguous`: каталога нет, а git-checkouts рядом с ним из разных реп;
+    - `not_git`: каталог есть, но это не git, и репа не нашлась так же, как
+      для удалённого;
+    - `git_error`: git отказал (битая репа, нет коммита);
+    - `unverified_repo`: догадка по предку или соседям нашла репу, в истории
+      которой нет ни одного файла задачи, то есть, скорее всего, чужую.
+    """
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class GitRepo:
+    """Где искать коммит вызывающего.
+
+    `via: cwd` это рабочая копия задачи (`git -C`, её HEAD). Остальное это общий
+    git dir удалённой рабочей копии (`git --git-dir`, все ветки без stash):
+    ветка вызывающего могла слиться в основную, а могла остаться отдельной.
+    `recorded` взят из события `git` задачи, `ancestor` из ближайшего живого
+    предка cwd, `siblings` из соседних checkouts с одним общим git dir.
+    """
+
+    path: str
+    via: str = "cwd"
+
+    @property
+    def args(self) -> list[str]:
+        return ["-C", self.path] if self.via == "cwd" else ["--git-dir", self.path]
+
+    @property
+    def refs(self) -> list[str]:
+        return [] if self.via == "cwd" else ["--exclude=refs/stash", "--all"]
 
 
 #: Строка короче этого не доказывает авторство: `}`, `)`, `else:`, `pass`.
@@ -468,51 +570,137 @@ def added_lines(patch: str) -> dict[str, list[str]]:
     return files
 
 
-def _git(cwd: str, *args: str) -> subprocess.CompletedProcess[str]:
+def _git(*args: str) -> subprocess.CompletedProcess[str]:
     # Без GIT_*: внутри git-хука GIT_DIR и GIT_INDEX_FILE перебили бы `-C cwd`.
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    return subprocess.run(
-        ["git", "-C", cwd, *args], capture_output=True, text=True, check=False, env=env
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=False, env=env)
+
+
+def common_dir(path: str | Path) -> str | None:
+    """Абсолютный общий git dir каталога или None, если он не в git."""
+    proc = _git("-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return str(Path(proc.stdout.strip()).resolve())
+
+
+class GitLocator:
+    """Репозиторий задачи; кэш на один прогон: у сотен задач общие предки."""
+
+    def __init__(self) -> None:
+        self._common: dict[str, str | None] = {}
+
+    def _common_dir(self, path: Path) -> str | None:
+        key = str(path)
+        if key not in self._common:
+            self._common[key] = common_dir(path)
+        return self._common[key]
+
+    def locate(self, task: Task) -> GitRepo | Unknown:
+        cwd = Path(task.cwd)
+        if cwd.is_dir() and self._common_dir(cwd):
+            return GitRepo(task.cwd)
+        # Каталог есть, но не git: worktree убран, а неотслеживаемое (`.idea`)
+        # осталось. Судится как удалённый, причина без репы своя.
+        missing = Unknown("not_git" if cwd.is_dir() else "cwd_gone")
+        # Записанный при `submit` git dir сильнее догадки по соседям.
+        if task.git_common_dir:
+            if Path(task.git_common_dir).is_dir():
+                return GitRepo(task.git_common_dir, via="recorded")
+            return missing
+        ancestor = next((parent for parent in cwd.parents if parent.is_dir()), None)
+        if ancestor is None:
+            return missing
+        # Worktree внутри репы (`.claude/worktrees/…`): предок сам в git.
+        own = self._common_dir(ancestor)
+        if own:
+            return GitRepo(own, via="ancestor")
+        # Каталог worktrees одной репы (`wt/qa-tools/<ветка>`): соседи скажут,
+        # чья она. Соседи из разных реп не скажут ничего.
+        try:
+            children = sorted(
+                child for child in ancestor.iterdir() if child != cwd and (child / ".git").exists()
+            )
+        except OSError:
+            children = []
+        found = {self._common_dir(child) for child in children} - {None}
+        if len(found) == 1:
+            return GitRepo(found.pop(), via="siblings")
+        return Unknown("ambiguous") if found else missing
+
+    def __call__(
+        self, task: Task, files: list[str], patch: str | None, since: datetime, until: datetime
+    ) -> Acceptance | Unknown:
+        repo = self.locate(task)
+        if isinstance(repo, Unknown):
+            return repo
+        # Догадка (предок или соседи) могла найти чужую репу: удалённый
+        # checkout репы B под dotfiles-репой A. Репа задачи знает хотя бы один
+        # её файл в истории; иначе коммит по тому же пути в A засчитался бы.
+        if repo.via in {"ancestor", "siblings"}:
+            known = _knows_any(repo, files)
+            if known is None:
+                return Unknown("git_error")
+            if not known:
+                return Unknown("unverified_repo")
+        return git_acceptance(repo, files, patch, since, until)
+
+
+def _knows_any(repo: GitRepo, files: list[str]) -> bool | None:
+    """Есть ли в истории репы (все ветки) хотя бы один из путей.
+
+    None, если git отказал: битая репа это `git_error`, а не «чужая репа».
+    """
+    proc = _git(
+        *repo.args,
+        "log",
+        *repo.refs,
+        "-1",
+        "--format=%H",
+        "--",
+        *(f":(top){f}" for f in files),
     )
+    if proc.returncode != 0:
+        return None
+    return bool(proc.stdout.strip())
 
 
 def git_acceptance(
-    cwd: str, files: list[str], patch: str | None, since: datetime, until: datetime
-) -> Acceptance | None:
+    repo: GitRepo, files: list[str], patch: str | None, since: datetime, until: datetime
+) -> Acceptance | Unknown:
     """Коммит вызывающего, тронувший `files` в окне, и доля строк патча в нём.
 
-    None, если судить нечем: каталога уже нет (worktree удалён) или это не git.
     Служебные коммиты демона (`agent-dispatch: task …`) не в счёт.
     """
-    if not Path(cwd).is_dir():
-        return None
     window = [
+        *repo.refs,
         f"--since={since.isoformat()}",
         f"--until={until.isoformat()}",
         f"--grep={_DAEMON_COMMIT}",
         "--invert-grep",
     ]
     # Пути патча и changed_files идут от корня репы, а cwd бывает подкаталогом.
-    proc = _git(cwd, "log", "--format=%H", *window, "--", *(f":(top){f}" for f in files))
+    # С `--git-dir` рабочей копии нет, и `:(top)` тоже значит корень.
+    proc = _git(*repo.args, "log", "--format=%H", *window, "--", *(f":(top){f}" for f in files))
     if proc.returncode != 0:
-        return None
+        return Unknown("git_error")
     if not proc.stdout.strip():
-        return Acceptance(committed=False)
+        return Acceptance(committed=False, via=repo.via)
     if not patch:
-        return Acceptance(committed=True)
+        return Acceptance(committed=True, via=repo.via)
     added = survived = 0
     for path, lines in added_lines(patch).items():
         if not lines:
             continue
         added += len(lines)
-        first = _git(cwd, "log", "--reverse", "--format=%H", *window, "--", f":(top){path}")
+        first = _git(*repo.args, "log", "--reverse", "--format=%H", *window, "--", f":(top){path}")
         commit = (first.stdout.split() or [None])[0]
         if commit is None:
             continue
-        shown = _git(cwd, "show", f"{commit}:{path}")
+        shown = _git(*repo.args, "show", f"{commit}:{path}")
         kept = {line.strip() for line in shown.stdout.splitlines()}
         survived += sum(1 for line in lines if line in kept)
-    return Acceptance(committed=True, added=added, survived=survived)
+    return Acceptance(committed=True, added=added, survived=survived, via=repo.via)
 
 
 def _patch_text(result: ExecutionResult) -> str | None:
@@ -524,9 +712,8 @@ def _patch_text(result: ExecutionResult) -> str | None:
 
 def acceptance(
     tasks: list[Task],
-    check: Callable[
-        [str, list[str], str | None, datetime, datetime], Acceptance | None
-    ] = git_acceptance,
+    check: Callable[[Task, list[str], str | None, datetime, datetime], Acceptance | Unknown]
+    | None = None,
     *,
     window_hours: float = 48,
 ) -> dict:
@@ -537,7 +724,10 @@ def acceptance(
     `committed` это верхняя оценка (коммит мог всё переписать), поэтому рядом
     стоит доля строк патча, доживших до коммита.
     """
+    check = check or GitLocator()
     verdicts: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
+    via: Counter[str] = Counter()
     by_executor: dict[str, Counter[str]] = {}
     lines: dict[str, list[int]] = {}
     for task in tasks:
@@ -547,18 +737,21 @@ def acceptance(
         if result.meta.get("integrated") is False:
             continue
         found = check(
-            task.cwd,
+            task,
             list(result.changed_files),
             _patch_text(result),
             task.finished_at,
             task.finished_at + timedelta(hours=window_hours),
         )
-        verdict = (
-            "unknown" if found is None else "committed" if found.committed else "not_committed"
-        )
+        if isinstance(found, Unknown):
+            verdict = "unknown"
+            reasons[found.reason] += 1
+        else:
+            verdict = "committed" if found.committed else "not_committed"
+            via[found.via] += 1
         verdicts[verdict] += 1
         by_executor.setdefault(task.executor, Counter())[verdict] += 1
-        if found is not None and found.added:
+        if isinstance(found, Acceptance) and found.added:
             share = found.survived / found.added
             verdicts["kept" if share >= 0.8 else "reworked" if share >= 0.2 else "rewritten"] += 1
             counts = lines.setdefault(task.executor, [0, 0])
@@ -573,6 +766,8 @@ def acceptance(
         "committed": verdicts["committed"],
         "not_committed": verdicts["not_committed"],
         "unknown": verdicts["unknown"],
+        "unknown_by_reason": dict(reasons.most_common()),
+        "judged_via": dict(via.most_common()),
         "committed_share": round(verdicts["committed"] / judged, 3) if judged else None,
         "with_patch": verdicts["kept"] + verdicts["reworked"] + verdicts["rewritten"],
         "kept": verdicts["kept"],
@@ -586,10 +781,128 @@ def acceptance(
     }
 
 
+#: Вывод не старше этого к моменту убийства: агент работал до конца.
+ACTIVE_BEFORE_KILL_S = 120
+
+
+def timeouts(tasks: list[Task]) -> dict:
+    """Жёсткие таймауты по исполнителям: работал агент до конца или молчал.
+
+    `active`: вывод был за `ACTIVE_BEFORE_KILL_S` до убийства, исполнителю мал
+    таймаут (`executors.<имя>.timeout_seconds`) или задачу надо дробить.
+    `quiet`: молчал дольше, агент висел или ждал чего-то. `no_stream`: CLI
+    печатает всё в конце (claude), по молчанию не судят. `unknown`: задачи до
+    `meta.last_output_age_s`.
+    """
+    by_executor: dict[str, Counter[str]] = {}
+    minutes: dict[str, int] = {}
+    for task in tasks:
+        result = task.result
+        if result is None or result.error != "timeout":
+            continue
+        if "last_output_age_s" not in result.meta:
+            verdict = "unknown"
+        elif result.meta["last_output_age_s"] is None:
+            verdict = "no_stream"
+        elif result.meta["last_output_age_s"] <= ACTIVE_BEFORE_KILL_S:
+            verdict = "active"
+        else:
+            verdict = "quiet"
+        counts = by_executor.setdefault(task.executor, Counter())
+        counts["count"] += 1
+        counts[verdict] += 1
+        minutes[task.executor] = minutes.get(task.executor, 0) + task.duration_ms
+    total: Counter[str] = Counter()
+    for counts in by_executor.values():
+        total.update(counts)
+    return {
+        "active_window_s": ACTIVE_BEFORE_KILL_S,
+        "count": total["count"],
+        "active": total["active"],
+        "quiet": total["quiet"],
+        "no_stream": total["no_stream"],
+        "unknown": total["unknown"],
+        "by_executor": {
+            name: {
+                "count": counts["count"],
+                "active": counts["active"],
+                "quiet": counts["quiet"],
+                "no_stream": counts["no_stream"],
+                "unknown": counts["unknown"],
+                "avg_minutes": round(minutes[name] / counts["count"] / 60000, 1),
+            }
+            for name, counts in sorted(
+                by_executor.items(), key=lambda item: (-item[1]["count"], item[0])
+            )
+        },
+    }
+
+
 def _completion(statuses: list[str]) -> float | None:
     if not statuses:
         return None
     return round(sum(1 for status in statuses if status == "completed") / len(statuses), 3)
+
+
+def exploration_comparison(
+    decisions: list[Decision],
+    tasks: list[Task],
+    check: Callable[[Task, list[str], str | None, datetime, datetime], Acceptance | Unknown]
+    | None = None,
+    *,
+    window_hours: float = 48,
+    with_acceptance: bool = True,
+) -> dict:
+    """Сравнить исходы рандомизированных arm `explore` и `jev`.
+
+    Берутся только новые решения с явной меткой `exploration_arm`: старые
+    записи Jev не попадают в контрольную группу задним числом. Acceptance
+    считается той же функцией, что и самостоятельная секция replay.
+    Незавершённые задачи исхода ещё не имеют и в доли не входят: иначе arm с
+    большим числом задач в работе выглядел бы хуже. Crossover (arm `explore`,
+    но статический исполнитель был недоступен и запустился выбор Jev) остаётся
+    в своём arm по назначению, а не по факту, и считается отдельно.
+    """
+    arm_by_task: dict[str, str] = {}
+    crossover: set[str] = set()
+    for decision in decisions:
+        marker = decision.judgments.get("exploration_arm") or {}
+        arm = marker.get("value")
+        if arm in {"explore", "jev"} and decision.task_id:
+            arm_by_task[decision.task_id] = arm
+            if decision.judgments.get("exploration_crossover"):
+                crossover.add(decision.task_id)
+
+    final = {status.value for status in FINAL_STATUSES}
+    grouped: dict[str, list[Task]] = {"explore": [], "jev": []}
+    in_flight: Counter[str] = Counter()
+    for task in tasks:
+        arm = arm_by_task.get(task.task_id)
+        if arm is None:
+            continue
+        if task.status not in final:
+            in_flight[arm] += 1
+            continue
+        grouped[arm].append(task)
+
+    arms: dict[str, dict] = {}
+    for arm in ("explore", "jev"):
+        members = grouped[arm]
+        accepted = (
+            acceptance(members, check, window_hours=window_hours) if with_acceptance else None
+        )
+        arms[arm] = {
+            "n": len(members),
+            "in_flight": in_flight[arm],
+            "crossover": sum(1 for task in members if task.task_id in crossover),
+            "completed_share": _completion([task.status for task in members]),
+            "committed_share": accepted["committed_share"] if accepted else None,
+            "lines_kept_share": accepted["lines_survived_share"] if accepted else None,
+        }
+
+    small = [f"{arm} ({arms[arm]['n']})" for arm in ("explore", "jev") if arms[arm]["n"] < 30]
+    warning = f"warning: fewer than 30 tasks in arm(s): {', '.join(small)}" if small else None
+    return {"arms": arms, "warning": warning}
 
 
 def router_vs_static(
@@ -616,7 +929,7 @@ def router_vs_static(
     skipped: Counter[str] = Counter()
     drift = 0
     for decision in decisions:
-        if decision.router != "jev" or decision.guard_reason:
+        if decision.router not in {"jev", "explore"} or decision.guard_reason:
             continue
         capability = (decision.judgments.get("capability") or {}).get("value")
         if capability is None:
@@ -637,7 +950,10 @@ def router_vs_static(
         jev = select(capability, candidates, judgment=judgment, corporate=narrow).executor
         static = select(baseline_tier, candidates, corporate=narrow).executor
         capabilities[capability] += 1
-        drift += jev != decision.choice
+        logged_jev = (decision.judgments.get("exploration_jev_choice") or {}).get(
+            "value", decision.choice
+        )
+        drift += jev != logged_jev
         outcome = status.get(decision.task_id, "unknown")
         if jev == static:
             agree.append(outcome)
@@ -701,6 +1017,17 @@ def render(report: dict) -> str:
         f"{report['review_only_failed']} failed, {report['review_only_minutes']} min"
         + window("review_only_runs")
     )
+    waits = report["queue_wait_by_limit_group"]
+    # Пустая секция без пояснения читается как «ожиданий не было», а это
+    # значит лишь, что демон ещё не писал события `slot`.
+    lines.append(
+        "queue wait by limit group (slot events only):" + ("" if waits else " no slot events yet")
+    )
+    lines += [
+        f"  {group}: {info['waited_over_60_seconds']} over 60 s of {info['samples']}, "
+        f"avg {info['avg_seconds']:.1f} s, max {info['max_seconds']:.1f} s"
+        for group, info in waits.items()
+    ]
     if "children_refusals" in report:
         info = report["children_refusals"]
         lines.append(
@@ -725,11 +1052,18 @@ def render(report: dict) -> str:
     if "acceptance" in report:
         info = report["acceptance"]
         share = "n/a" if info["committed_share"] is None else f"{info['committed_share']:.0%}"
+        reasons = ", ".join(f"{reason} {n}" for reason, n in info["unknown_by_reason"].items())
         lines.append(
             f"diffs committed by the caller within {info['window_hours']:g} h: "
             f"{info['committed']} of {info['committed'] + info['not_committed']} ({share}), "
-            f"unknown {info['unknown']}"
+            f"unknown {info['unknown']}" + (f" ({reasons})" if reasons else "")
         )
+        removed = {via: n for via, n in info["judged_via"].items() if via != "cwd"}
+        if removed:
+            lines.append(
+                "  judged by the git dir of a removed working copy: "
+                + ", ".join(f"{via} {n}" for via, n in removed.items())
+            )
         if info["with_patch"]:
             lines.append(
                 f"  executor lines kept in the caller's commit: "
@@ -743,6 +1077,19 @@ def render(report: dict) -> str:
             + ", ".join(f"{verdict} {n}" for verdict, n in counts.items())
             + (f", lines kept {survival[name]:.0%}" if name in survival else "")
             for name, counts in info["by_executor"].items()
+        ]
+    if "timeouts" in report:
+        info = report["timeouts"]
+        lines.append(
+            f"timeouts: {info['count']}, output within {info['active_window_s']} s before "
+            f"the kill {info['active']} (raise that executor's timeout or split the task), "
+            f"quiet {info['quiet']}, no stream {info['no_stream']}, unknown {info['unknown']}"
+        )
+        lines += [
+            f"  {name}: {row['count']}, active {row['active']}, quiet {row['quiet']}, "
+            f"no stream {row['no_stream']}, unknown {row['unknown']}, "
+            f"avg {row['avg_minutes']} min"
+            for name, row in info["by_executor"].items()
         ]
     if "router_vs_static" in report:
         info = report["router_vs_static"]
@@ -759,4 +1106,21 @@ def render(report: dict) -> str:
             f"config in {info['choice_drift']}"
         )
         lines += [f"  {pair}: {n}" for pair, n in info["disagreements"].items()]
+    if "exploration" in report:
+        info = report["exploration"]
+
+        def experiment_rate(value: float | None) -> str:
+            return "n/a" if value is None else f"{value:.0%}"
+
+        for arm in ("explore", "jev"):
+            metrics = info["arms"][arm]
+            lines.append(
+                f"routing experiment {arm}: n {metrics['n']}, "
+                f"completed {experiment_rate(metrics['completed_share'])}, "
+                f"committed {experiment_rate(metrics['committed_share'])}, "
+                f"lines kept {experiment_rate(metrics['lines_kept_share'])}, "
+                f"in flight {metrics['in_flight']}, crossover {metrics['crossover']}"
+            )
+        if info["warning"]:
+            lines.append(info["warning"])
     return "\n".join(lines)

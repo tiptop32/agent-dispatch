@@ -334,3 +334,34 @@ async def test_run_cli_handles_process_that_exits_immediately(tmp_path: Path) ->
     )
     assert outcome.exit_code == 0
     assert outcome.timed_out is False
+
+
+async def test_run_cli_timeout_records_seconds_since_the_last_output(tmp_path: Path) -> None:
+    # Печатает и замолкает: к убийству молчит около секунды, а не весь запуск.
+    outcome = await run_cli(
+        [sys.executable, "-c", "import time; print('hi', flush=True); time.sleep(30)"],
+        cwd=tmp_path,
+        env={},
+        stdin=None,
+        timeout_seconds=1.0,
+        grace_seconds=0.2,
+        log_path=tmp_path / "process.log",
+    )
+
+    assert outcome.timed_out is True
+    assert outcome.last_output_age_s is not None
+    assert 0.3 <= outcome.last_output_age_s <= 1.5
+
+
+async def test_run_cli_without_timeout_has_no_output_age(tmp_path: Path) -> None:
+    outcome = await run_cli(
+        [sys.executable, "-c", "print('done')"],
+        cwd=tmp_path,
+        env={},
+        stdin=None,
+        timeout_seconds=10,
+        log_path=tmp_path / "process.log",
+    )
+
+    assert outcome.timed_out is False
+    assert outcome.last_output_age_s is None

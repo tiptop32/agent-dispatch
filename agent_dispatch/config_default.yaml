@@ -1,7 +1,8 @@
 server:
   host: 127.0.0.1
   port: 7433
-  max_concurrent_tasks: 2     # корневые задачи на правку; максимум корневых процессов демона = это число + max_concurrent_reviews
+  max_concurrent_tasks: 4     # общий потолок правок; с max_concurrent_reviews: 5 корневых процессов при дефолтах
+  max_concurrent_per_group: 2 # отдельный пул на limit_group; группа берётся раньше общего слота
   max_concurrent_reviews: 1   # корневые ревью в собственной ёмкости: долгие задачи их не блокируют, лишние ревью ждут
   data_dir: ~/.local/share/agent-dispatch
 
@@ -24,6 +25,7 @@ routing:
   min_confidence: 0.60        # ниже: решение не несёт информации, идёт fallback_executor
   autonomous_confidence: 0.85  # выше: решению можно доверять без присмотра
   min_margin: 0.10
+  explore_share: 0.0          # доля пригодных решений Jev для статического balanced-исполнителя
   fallback_executor: codex     # или список [a, b]: первый доступный, остальные в резерве
   max_hops: 2
   max_children: 2
@@ -72,6 +74,7 @@ executors:
     extra_args: ["--sandbox", "workspace-write"]
     enabled: true
     tier: balanced
+    # timeout_seconds: 3600  # жёсткий таймаут задач исполнителя; запрос сильнее, без обоих routing.default_timeout_seconds
     description: "OpenAI Codex CLI: autonomous bug fixing and test-driven fixes in a single repo; medium cost"
   opencode/kimi:
     adapter: opencode

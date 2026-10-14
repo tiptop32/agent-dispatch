@@ -97,15 +97,21 @@ tool_timeout_sec = 120
 теряет worktree. `agent-dispatch doctor` проверяет эту строку (проверка
 `codex-env-vars`) и печатает её, если чего-то не хватает.
 
-For daemon or GUI launches, install `scripts/codex-agent-lb` as
-`~/.local/bin/codex`. It loads only `AGENT_LB_API_KEY` from
-`~/.config/agent-lb/env` when the variable is missing, then runs the current
-native Codex binary. Keep one `KEY=value` (or `export KEY=value`) entry per
-line and protect the file. The launcher uses the first nonempty matching key,
-returns exit `78` when none is available, and follows the unpinned
-`standalone/current` native binary. Reinstalling Codex may replace a global
-launcher, so configure the explicit launcher path in the executor command for
-durable daemon behavior. Make the script executable with `chmod +x`.
+Для запуска из демона или GUI установите `scripts/codex-agent-lb` как
+`~/.local/bin/codex`. Если в окружении нет `AGENT_LB_API_KEY`, wrapper читает
+только этот ключ из `~/.config/agent-lb/env`, затем запускает текущий нативный
+бинарник Codex. Храните по одной записи `KEY=value` или `export KEY=value` на
+строке и ограничьте права на файл. Wrapper берёт первое непустое значение и
+завершается с кодом `78`, если ключа нет. `agent-dispatch doctor` проверяет,
+что ключ доступен из окружения дочернего процесса или fallback-файла, но не
+печатает значение. Ключ из env-файла AgentDispatch входит в `Settings.secrets`,
+поэтому `child_env` его вырежет: храните ключ в окружении процесса демона или
+в `~/.config/agent-lb/env`.
+
+Wrapper следует за незакреплённым бинарником `standalone/current`.
+Переустановка Codex может заменить глобальный launcher, поэтому для стабильного
+запуска демона задайте явный путь к wrapper в `executors.<name>.command`.
+Сделайте файл исполняемым через `chmod +x`.
 
 Run the deterministic launcher eval with `uv run python -m evals.launcher`.
 
@@ -146,9 +152,10 @@ AgentDispatch не обязателен для каждого запроса: э
 3. Один запрос к Jev. Несущий вопрос это `capability`: какого уровня работы требует задача (`fast`, `balanced`, `strong`). Имена моделей Jev не показываются. Рядом идут `judgment` (нужно ли разрешать компромиссы, а не просто исполнять), `corporate_data` (данные не должны покидать периметр; спрашивается, только если есть исполнитель с `corporate: true`), `difficulty`, `task_type`, `risk`, `ambiguity`, `decomposable`.
 4. Исполнителя подбирает код: `corporate` сужает пул до внутреннего периметра, `judgment` отдаёт задачу рассуждающему агенту, дальше выбирается кандидат нужного `tier` (при отсутствии такого берётся ближайший вверх, затем вниз), при равенстве побеждает тот, кто идёт в конфиге выше.
 5. Post-guards: `confidence >= autonomous_confidence` это `autonomous`, между ним и `min_confidence` это `advisory` (решение выполняется, но помечено как слабое), ниже `min_confidence` или отрыв меньше `min_margin` → `fallback_executor`. Это имя или упорядоченный список: берётся первый доступный кандидат из списка, остальные стоят в резерве; если недоступны все, остаётся лучший кандидат роутера с предупреждением.
-6. Запуск адаптера в рабочем каталоге. `changed_files` считаются по `git status` до и после, а не со слов агента.
+6. Если `routing.explore_share > 0`, пригодные решения Jev детерминированно делятся по хешу `task_id`. В arm `explore` запускается статический кандидат тира `balanced`; мнение Jev и оба выбора остаются в телеметрии. Guards уже отфильтровали кандидатов и имеют приоритет.
+7. Запуск адаптера в рабочем каталоге. `changed_files` считаются по `git status` до и после, а не со слов агента.
    Если вызывающий передал `verify` (команды проверки, обычно тесты затронутой области), демон запускает их сам после исполнителя. Упавшая команда значит «не сделано», какой бы `tests` ни написал исполнитель: результат `partial`, задача эскалируется (`verification_failed`). Подробнее в разделе «Проверка результата».
-7. Результат нормализуется в `ExecutionResult`: `status` (`completed | partial | failed | needs_context | needs_escalation`), `summary`, `changed_files`, `tests`, `confidence`, `usage`.
+8. Результат нормализуется в `ExecutionResult`: `status` (`completed | partial | failed | needs_context | needs_escalation`), `summary`, `changed_files`, `tests`, `confidence`, `usage`.
 
 Если Jev недоступен, работает `claude_local` (выбор исполнителя по описаниям через `claude -p`), а если и он недоступен, `fallback_executor`.
 
@@ -186,13 +193,25 @@ execution:
 agent-dispatch worktrees                      # деревья и ветки без дерева (от integrate: branch)
 agent-dispatch worktrees --clean              # убрать деревья, ветки сохранить
 agent-dispatch worktrees --clean --delete-branches
+agent-dispatch worktrees --all                # деревья всех репозиториев, возраст и статус задачи
+agent-dispatch worktrees --all --clean        # убрать только безопасные завершённые деревья
 ```
+
+`--all` обходит `execution.worktree_dir` или `<data_dir>/worktrees` и группирует
+деревья по общей git-директории. Очистка не трогает задачи без финального
+статуса и деревья, внутри которых находится `cwd` другой незавершённой задачи.
+Если исходный репозиторий удалён, `--all --clean` удаляет оставшийся каталог
+дерева напрямую и сообщает об этом. `agent-dispatch doctor` показывает число
+деревьев, общий размер и число деревьев старше семи дней; старые помечаются
+как `WARN` и не меняют код выхода.
 
 Настоящий гейт качества — ваш коммит после того, как вы прочитали диф: `changed_files` в результате берётся из `git status`, а не со слов исполнителя.
 
 ### Параллельные задачи
 
-Корневые задачи (`hop == 0`) ограничены двумя независимыми лимитами. Coding-задачи (`kind: task`) занимают пул `server.max_concurrent_tasks` (по умолчанию 2), ревью (`kind: review`) — отдельный пул `server.max_concurrent_reviews` (по умолчанию 1). Максимум одновременно работающих корневых процессов — сумма этих лимитов, а не один общий пул: ревью не съедает coding-слот и наоборот. Вложенные задачи (`hop > 0`) от корневых семафоров не зависят, как и раньше, — правило hop-протокола не меняется.
+Корневая coding-задача (`hop == 0`, `kind: task`) сначала занимает слот своей `limit_group` (`server.max_concurrent_per_group`, по умолчанию 2), затем общий слот (`server.max_concurrent_tasks`, по умолчанию 4). Поэтому два долгих codex не мешают opencode использовать собственную квоту, но одновременно работают не больше четырёх корневых задач на правку. Порядок group → global не даёт ожидающей группе держать общий слот.
+
+Ревью (`kind: review`) сохраняет отдельный пул `server.max_concurrent_reviews` (по умолчанию 1). При дефолтах максимум одновременно работающих корневых CLI-процессов равен 5: четыре задачи плюс одно ревью. Вложенные задачи (`hop > 0`) от корневых семафоров не зависят, как и раньше, — правило hop-протокола не меняется. Получение task-слотов пишет событие `slot` с `limit_group` и `wait_seconds`; replay показывает по этим событиям число ожиданий дольше 60 секунд, среднее и максимум каждой группы. Старые задачи без события в расчёт не входят.
 
 Ревью остаётся режимом только для чтения и не берёт lock правки по `realpath(cwd)`: пока ревью идёт по репозиторию, coding-задача в него стартует как обычно, и наоборот.
 
@@ -224,7 +243,7 @@ Follow-up всегда идёт in_place. Если работа прошлой �
 
 ### Сабагенты и hop-протокол
 
-Исполнитель получает в окружении `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP`. Его собственный MCP-прокси читает их и передаёт в демон, поэтому глубина делегирования известна демону, а не модели. При `max_hops: 2` исполнитель может разбить задачу и отдать до `max_children` подзадач через тот же `dispatch` (каждую роутит Jev), а его сабагенты уже делегировать не могут. В Codex эти переменные должен пересылать сам MCP-сервер (`env_vars` в `[mcp_servers.agent-dispatch]`, см. выше) — это проверяет `agent-dispatch doctor`.
+Исполнитель получает в окружении `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP`. Его собственный MCP-прокси читает их и передаёт в демон, поэтому глубина делегирования известна демону, а не модели. При `max_hops: 2` исполнитель может разбить задачу и отдать до `max_children` подзадач через тот же `dispatch` (каждую роутит Jev), а его сабагенты уже делегировать не могут. Если лимит уже занят, отказ перечисляет `task_id` работающих соседних задач и предлагает вызвать `status(task_id, wait_seconds)`, а не повторять `dispatch`. Компактный MCP-ответ сохраняет эту подсказку. В Codex переменные глубины должен пересылать сам MCP-сервер (`env_vars` в `[mcp_servers.agent-dispatch]`, см. выше) — это проверяет `agent-dispatch doctor`.
 
 ### Лимиты исполнителей
 
@@ -301,6 +320,15 @@ escalation:
 
 `tier` (`fast`, `balanced`, `strong`) это то, по чему исполнитель находится: Jev называет нужный уровень, код выбирает кандидата этого уровня. Внутри одного `tier` побеждает тот, кто идёт в конфиге выше, поэтому дешёвые варианты ставьте первыми.
 
+Для несмещённого сравнения Jev со статическим правилом включите эксперимент:
+
+```yaml
+routing:
+  explore_share: 0.1
+```
+
+Рекомендуемое значение `0.1` отправляет 10% только пригодных задач статическому исполнителю тира `balanced`. Jev всё равно вызывается, а его выбор записывается рядом. Override (`dispatch_to`), эскалации, follow-up, review, `low_confidence`, `low_margin`, `router_unavailable` и решения, остановленные guards, в эксперимент не входят. При `0.0` поведение не меняется.
+
 `escalation` поднимает задачу по цепочке, когда исполнитель не справился: результат `failed`, явный `needs_escalation`, упавшая проверка `verify`, красные тесты в отчёте — или `partial`, в котором исполнитель не отдал блок отчёта **и** не изменил ни одного файла (`no_result`). Последний случай иначе был бы тупиком: `partial` цепочку не поднимал, и задача застревала, сколько её ни переспрашивай. Если файлы изменены, а отчёт не разобрался, эскалации нет: работа есть, и судить о ней по дифу должен вызывающий, а повторный запуск лёг бы поверх неё.
 
 Потолки расходов по умолчанию выключены:
@@ -343,7 +371,7 @@ agent-dispatch export --since 7d > dataset.jsonl
 agent-dispatch feedback <task_id> --outcome user_accepted
 ```
 
-Одна строка JSONL на задачу: запрос, решение Jev со всеми вероятностями, результат, события guards и feedback. По этому датасету считаются routing accuracy, доля fallback и override, стоимость и латентность по исполнителям.
+Одна строка JSONL на задачу: запрос, решение Jev со всеми вероятностями, результат, события guards и feedback. Для routing-эксперимента `router=explore`, а `judgments` содержат `exploration_arm`, `exploration_jev_choice` и `exploration_static_choice`; контрольный arm остаётся `router=jev` с теми же полями. По этому датасету считаются routing accuracy, доля fallback и override, стоимость и латентность по исполнителям.
 
 ## Evals
 

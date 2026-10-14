@@ -16,10 +16,12 @@ from agent_dispatch.doctor import (
     Check,
     _install_check,
     codex_env_check,
+    codex_lb_key_check,
     format_checks,
     install_check,
     run_checks,
     stale_files,
+    worktrees_check,
 )
 from agent_dispatch.serve_state import ServeState, write_state
 
@@ -47,10 +49,16 @@ def _configure(
     key: str | None = None,
     backend: str = "jev",
     claude_command: str = "claude",
+    codex_command: str | None = None,
 ):
     lines = []
     for name in ("claude", "codex", "opencode/kimi"):
-        command = "/nonexistent" if name == broken else str(FAKE)
+        if name == broken:
+            command = "/nonexistent"
+        elif name == "codex" and codex_command is not None:
+            command = codex_command
+        else:
+            command = str(FAKE)
         lines.extend([f"  {name}:", f'    command: "{command}"'])
     (tmp_config_dir / "config.yaml").write_text(
         f"router:\n  backend: {backend}\n  claude_local:\n    command: {claude_command!r}\n"
@@ -158,6 +166,136 @@ async def test_run_checks_includes_codex_env_vars_check(tmp_config_dir, monkeypa
 
     check = next(c for c in checks if c.name == "codex-env-vars")
     assert not check.ok and CODEX_ENV_VARS_LINE in check.detail
+
+
+@pytest.mark.asyncio
+async def test_run_checks_includes_codex_lb_key_check(tmp_config_dir, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(LB_KEY, raising=False)
+    settings = _configure(tmp_config_dir, codex_command=WRAPPER)
+
+    checks = await run_checks(settings)
+
+    check = next(c for c in checks if c.name == "codex-agent-lb-key")
+    assert not check.ok and "exits 78" in check.detail
+
+
+# --- ключ codex-agent-lb доступен исполнителям, значение не печатается --------
+
+LB_KEY = "AGENT_LB_API_KEY"
+LB_VALUE = "lb-secret-value"  # pragma: allowlist secret
+WRAPPER = "/usr/local/bin/codex-agent-lb"
+
+
+def _wrapper_settings(tmp_config_dir: Path):
+    return _configure(tmp_config_dir, codex_command=WRAPPER)
+
+
+def test_codex_lb_key_check_ok_from_daemon_child_env(tmp_config_dir, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(LB_KEY, LB_VALUE)
+
+    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
+
+    assert check.ok and "available in daemon child env" in check.detail
+    assert LB_VALUE not in check.detail
+
+
+def test_codex_lb_key_check_ok_from_wrapper_fallback_file(tmp_config_dir, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(LB_KEY, raising=False)
+    env_file = tmp_path / ".config/agent-lb/env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(f'export {LB_KEY}="{LB_VALUE}"\n')
+
+    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
+
+    assert check.ok and "wrapper fallback" in check.detail
+    assert LB_VALUE not in check.detail
+
+
+def test_codex_lb_key_check_ignores_empty_file_value(tmp_config_dir, monkeypatch, tmp_path):
+    # Wrapper пропускает пустые значения: `AGENT_LB_API_KEY=` не считается ключом.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(LB_KEY, raising=False)
+    env_file = tmp_path / ".config/agent-lb/env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(f"{LB_KEY}=\n")
+
+    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
+
+    assert not check.ok and "exits 78" in check.detail
+
+
+def test_codex_lb_key_check_fails_when_key_absent_everywhere(tmp_config_dir, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(LB_KEY, raising=False)
+
+    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
+
+    assert not check.ok
+    assert LB_KEY in check.detail and "exits 78" in check.detail
+    assert ".config/agent-lb/env" in check.detail
+
+
+def test_codex_lb_key_check_reports_key_trapped_in_dispatch_secrets(
+    tmp_config_dir, monkeypatch, tmp_path
+):
+    # Ключ в env-файле agent-dispatch (Settings.secrets) child_env вырезает:
+    # wrapper его не увидит, doctor обязан поймать это до запуска задачи.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(LB_KEY, LB_VALUE)
+    (tmp_config_dir / "env").write_text(f"{LB_KEY}={LB_VALUE}\n")
+
+    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
+
+    assert not check.ok
+    assert "child_env strips" in check.detail and "exits 78" in check.detail
+    assert LB_VALUE not in check.detail
+
+
+def test_codex_lb_key_check_skips_without_wrapper_executor(tmp_config_dir, monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(LB_KEY, raising=False)
+
+    check = codex_lb_key_check(_configure(tmp_config_dir))
+
+    assert check.ok and "skipped" in check.detail
+
+
+def test_codex_lb_key_check_detects_wrapper_installed_as_codex(
+    tmp_config_dir, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv(LB_KEY, raising=False)
+    wrapper = tmp_path / "codex"
+    wrapper.write_text(
+        '#!/bin/sh\nAGENT_LB_API_KEY="${AGENT_LB_API_KEY:-}"\nfile="$HOME/.config/agent-lb/env"\n'
+    )
+
+    check = codex_lb_key_check(_configure(tmp_config_dir, codex_command=str(wrapper)))
+
+    assert not check.ok and "exits 78" in check.detail
+
+
+def test_worktrees_check_warns_about_old_trees_and_reports_total_size(tmp_config_dir, git_repo):
+    from agent_dispatch.executors import worktree
+
+    settings = _configure(tmp_config_dir)
+    tree = worktree.create(
+        git_repo,
+        settings.server.data_dir / "worktrees" / "old-task",
+        "agent-dispatch/old-task",
+    )
+    old = datetime.now().timestamp() - 8 * 86400
+    os.utime(tree.path / ".git", (old, old))
+
+    check = worktrees_check(settings)
+
+    assert check.ok and check.warning
+    assert "1 trees" in check.detail and "total" in check.detail
+    assert "1 older than 7 days" in check.detail
+    assert format_checks([check]).startswith("WARN  worktrees:")
 
 
 @pytest.fixture(autouse=True)

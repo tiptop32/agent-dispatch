@@ -153,3 +153,27 @@ async def test_claude_is_not_watched_for_silence_because_it_prints_only_at_the_e
     ctx = context(git_repo, tmp_path).model_copy(update={"idle_timeout_seconds": 900})
     await adapter.execute(ctx)
     assert seen["idle_timeout_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_claude_timeout_has_no_output_age_because_it_prints_only_at_the_end(
+    git_repo, tmp_path, monkeypatch
+):
+    from agent_dispatch.executors import claude as module
+    from agent_dispatch.executors.process import ProcessOutcome
+
+    async def fake(*args, **kwargs):
+        return ProcessOutcome(
+            exit_code=None,
+            stdout="",
+            stderr="",
+            timed_out=True,
+            duration_ms=1800_000,
+            last_output_age_s=1799.0,
+        )
+
+    monkeypatch.setattr(module, "run_cli", fake)
+    adapter = ClaudeAdapter("claude/test", ExecutorSettings(adapter="claude", command="claude"))
+    result = await adapter.execute(context(git_repo, tmp_path))
+    assert result.error == "timeout"
+    assert "last_output_age_s" in result.meta and result.meta["last_output_age_s"] is None

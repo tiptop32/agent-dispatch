@@ -13,11 +13,13 @@ from .harness import (
     children_refusals,
     default_limit_group,
     delegations,
+    exploration_comparison,
     load,
     load_decisions,
     render,
     replay,
     router_vs_static,
+    timeouts,
 )
 
 
@@ -76,15 +78,23 @@ def main() -> int:
     )
     report["children_refusals"] = children_refusals(tasks, settings.routing.max_children)
     report["delegations"] = delegations(tasks)
+    report["timeouts"] = timeouts(tasks)
     if not args.no_git:
         report["acceptance"] = acceptance(tasks, window_hours=args.accept_window_hours)
+    decisions = load_decisions(args.db)
     report["router_vs_static"] = router_vs_static(
-        load_decisions(args.db),
+        decisions,
         tasks,
         executors,
         baseline_tier=args.baseline_tier,
         corporate_min_confidence=settings.routing.corporate_min_confidence,
         corporate_perimeter=settings.routing.corporate_perimeter,
+    )
+    report["exploration"] = exploration_comparison(
+        decisions,
+        tasks,
+        window_hours=args.accept_window_hours,
+        with_acceptance=not args.no_git,
     )
     print(json.dumps(report, indent=2, ensure_ascii=False) if args.json else render(report))
     return 0

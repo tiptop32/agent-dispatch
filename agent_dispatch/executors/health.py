@@ -43,7 +43,12 @@ _ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
         "auth",
         re.compile(
             r"no cookie auth credentials|invalid api key|invalid x-api-key|authentication_error"
-            r"|401 unauthorized|not logged in|please run /login",
+            r"|401 unauthorized|not logged in|please run /login"
+            # codex-lb: ключ аккаунта не дошёл до балансировщика, любая задача
+            # откажет так же. Первую строку печатает codex (env_key провайдера),
+            # вторую сам wrapper `scripts/codex-agent-lb` перед `exit 78`.
+            r"|missing environment variable: [`\"]?(?:agent|codex)_lb_api_key"
+            r"|codex-agent-lb: agent_lb_api_key is not set",
             re.IGNORECASE,
         ),
     ),

@@ -5,9 +5,10 @@
 поведенческие инварианты ёмкости, а не статические флаги конфига:
 
 - ревью стартует, пока все задачные слоты заняты (нет голодания ревью);
+- группы исполнителей используют независимые слоты под общим потолком;
 - лишние ревью ждут в собственной ёмкости и не занимают слоты задач;
 - отмена заблокированной задачи/ревью освобождает свой слот;
-- вложенная работа (hop > 0) идёт мимо обоих пулов;
+- вложенная работа (hop > 0) идёт мимо всех корневых пулов;
 - после дренирования нет утечек: значения семафоров восстановлены, cwd-локи
   и события задач убраны, все записи в конечном статусе.
 
@@ -113,10 +114,13 @@ class Verdict:
 class SchedulingLab:
     """Диспетчер на гейт-адаптерах в изолированном каталоге."""
 
-    def __init__(self, root: Path, max_tasks: int = 2, max_reviews: int = 1):
+    def __init__(
+        self, root: Path, max_tasks: int = 2, max_reviews: int = 1, max_per_group: int = 2
+    ):
         self.root = root
         self.max_tasks = max_tasks
         self.max_reviews = max_reviews
+        self.max_per_group = max_per_group
         self.repos: list[Path] = []
         self.adapters: dict[str, GatedAdapter] = {
             name: GatedAdapter(name) for name in (CODEX, CLAUDE, KIMI)
@@ -126,6 +130,7 @@ class SchedulingLab:
                 data_dir=root / "data",
                 max_concurrent_tasks=max_tasks,
                 max_concurrent_reviews=max_reviews,
+                max_concurrent_per_group=max_per_group,
             ),
             routing=RoutingSettings(fallback_executor=CODEX),
             execution=ExecutionSettings(workspace_mode="in_place"),
@@ -217,6 +222,12 @@ class SchedulingLab:
     async def wait_started(self, name: str) -> None:
         await asyncio.wait_for(self.adapters[name].started.wait(), WAIT)
 
+    async def wait_calls(self, name: str, count: int) -> None:
+        """Дождаться точного наблюдаемого числа запусков адаптера."""
+        async with asyncio.timeout(WAIT):
+            while self.adapters[name].calls < count:  # noqa: ASYNC110
+                await asyncio.sleep(0)
+
     async def never_started(self, name: str) -> bool:
         """True, если адаптер не стартовал: пока гейт чужой задачи держится,
         стартовать ему нечем, поэтому короткий предел здесь не флакает."""
@@ -249,6 +260,12 @@ class SchedulingLab:
             problems.append(
                 f"review semaphore leaked: {self.max_reviews - reviews_value} slots lost"
             )
+        for group, semaphore in self.dispatcher._group_semaphores.items():
+            if semaphore._value != self.max_per_group:
+                problems.append(
+                    f"group semaphore {group} leaked: "
+                    f"{self.max_per_group - semaphore._value} slots lost"
+                )
         if self.dispatcher._cwd_locks:
             problems.append(f"cwd locks left behind: {sorted(self.dispatcher._cwd_locks)}")
         if self.dispatcher._events:
@@ -283,6 +300,40 @@ async def scenario_review_unblocked(root: Path) -> Verdict:
         reasons.extend(await lab.leaks())
         del first, second, review
     return Verdict("review_unblocked_by_saturated_coding", not reasons, reasons)
+
+
+async def scenario_limit_groups_under_global_ceiling(root: Path) -> Verdict:
+    """Свободная группа стартует, занятая ждёт, общий потолок не превышен."""
+    reasons: list[str] = []
+    async with SchedulingLab(root, max_tasks=3, max_per_group=2) as lab:
+        codex_a = await lab.submit(lab.req(lab.repo(), executor=CODEX))
+        codex_b = await lab.submit(lab.req(lab.repo(), executor=CODEX))
+        await lab.wait_calls(CODEX, 2)
+
+        waiting_group = await lab.submit(lab.req(lab.repo(), executor=CODEX))
+        async with asyncio.timeout(WAIT):
+            while (await lab.storage.get_task(waiting_group)).decision is None:  # noqa: ASYNC110
+                await asyncio.sleep(0)
+
+        kimi = await lab.submit(lab.req(lab.repo(), executor=KIMI))
+        await lab.wait_started(KIMI)
+        if lab.adapters[CODEX].calls != 2 or lab.adapters[KIMI].calls != 1:
+            reasons.append("free limit group did not start beside saturated codex group")
+
+        waiting_global = await lab.submit(lab.req(lab.repo(), executor=CLAUDE))
+        if not await lab.never_started(CLAUDE):
+            reasons.append("global task ceiling was exceeded")
+
+        await lab.dispatcher.cancel(waiting_group)
+        if not await lab.never_started(CLAUDE):
+            reasons.append("cancelled group waiter released a slot it did not hold")
+
+        await lab.dispatcher.cancel(codex_a)
+        await lab.wait_started(CLAUDE)
+        await lab.drain()
+        reasons.extend(await lab.leaks())
+        del codex_b, kimi, waiting_global
+    return Verdict("limit_groups_under_global_ceiling", not reasons, reasons)
 
 
 async def scenario_excess_reviews_queue(root: Path) -> Verdict:
@@ -399,6 +450,7 @@ async def scenario_stress(root: Path, seed: int, rounds: int = 12) -> Verdict:
 
 SCENARIOS = (
     scenario_review_unblocked,
+    scenario_limit_groups_under_global_ceiling,
     scenario_excess_reviews_queue,
     scenario_cancellation_releases_capacity,
     scenario_nested_bypass,
