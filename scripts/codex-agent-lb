@@ -18,7 +18,8 @@ if [ -z "${AGENT_LB_API_KEY:-}" ] && [ -f "$HOME/.config/agent-lb/env" ]; then
     done < "$HOME/.config/agent-lb/env"
 fi
 if [ -z "${AGENT_LB_API_KEY:-}" ]; then
-    echo "codex-agent-lb: AGENT_LB_API_KEY is not set and was not found in $HOME/.config/agent-lb/env" >&2
+    # Каноническая строка codex: health.classify_failure узнаёт её как auth.
+    echo "codex-agent-lb: Missing environment variable: \`AGENT_LB_API_KEY\` (not in the environment or $HOME/.config/agent-lb/env)" >&2
     exit 78
 fi
 export AGENT_LB_API_KEY

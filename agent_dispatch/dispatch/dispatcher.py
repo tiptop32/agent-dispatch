@@ -118,13 +118,8 @@ class Dispatcher:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._events: dict[str, asyncio.Event] = {}
         self._semaphore = asyncio.Semaphore(settings.server.max_concurrent_tasks)
-        self._group_semaphores = {
-            item.resolved_limit_group(name): asyncio.Semaphore(
-                settings.server.max_concurrent_per_group
-            )
-            for name, item in settings.executors.items()
-            if item.enabled
-        }
+        # Семафор группы создаётся при первой задаче этой группы.
+        self._group_semaphores: dict[str, asyncio.Semaphore] = {}
         # Ёмкость ревью отдельная: долгая корневая задача не должна оставлять
         # ревью без слота, и лишние ревью не должны вытеснять задачи. Максимум
         # корневых CLI-процессов демона из-за этого равен сумме двух пределов.
@@ -210,8 +205,7 @@ class Dispatcher:
     async def _inherit_worktree_parent(self, req: DispatchRequest) -> DispatchRequest:
         """Восстановить родителя вложенного вызова по cwd его worktree."""
         cwd = Path(req.cwd).expanduser().resolve()  # noqa: ASYNC240
-        base = self.settings.execution.worktree_dir or (self.settings.server.data_dir / "worktrees")
-        base = Path(base).expanduser().resolve()  # noqa: ASYNC240
+        base = self.settings.worktree_base.resolve()  # noqa: ASYNC240
         try:
             relative = cwd.relative_to(base)
         except ValueError:
@@ -378,9 +372,11 @@ class Dispatcher:
                 exclude_escalated=True,
                 exclude_task_id=current_task_id,
             )
-            running_siblings = await self.storage.running_children(
-                req.parent_task_id, exclude_task_id=current_task_id
-            )
+            if siblings >= self.settings.routing.max_children:
+                # Нужны только для текста отказа: лишний запрос на каждом dispatch ни к чему.
+                running_siblings = await self.storage.running_children(
+                    req.parent_task_id, exclude_task_id=current_task_id
+                )
         verdict = pre_guards(
             req,
             self.settings,
@@ -411,14 +407,13 @@ class Dispatcher:
         if not names:
             guard = GuardEvent(reason=GuardReason.unavailable, detail="no available executors")
             return Routing(self._fallback_decision(guard.reason), guard, [], names)
-        decision, events = await decide_with_fallback(
-            req, {n: self.settings.executors[n] for n in names}, self.settings, self.routers
-        )
+        pool = {n: self.settings.executors[n] for n in names}
+        decision, events = await decide_with_fallback(req, pool, self.settings, self.routers)
         decision = apply_exploration(
             current_task_id,
             req,
             decision,
-            {n: self.settings.executors[n] for n in names},
+            pool,
             self.settings,
             is_escalation=is_escalation,
             unavailable=self.availability.unavailable(),
@@ -651,7 +646,7 @@ class Dispatcher:
                 yield
             return
 
-        group = self._resolved_limit_group(decision.executor)
+        group = self.settings.limit_group(decision.executor)
         semaphore = self._group_semaphores.setdefault(
             group, asyncio.Semaphore(self.settings.server.max_concurrent_per_group)
         )
@@ -859,12 +854,12 @@ class Dispatcher:
         timeout = self.settings.timeout_for(decision.executor, req.timeout_seconds)
         package = await asyncio.to_thread(
             build_task_package,
-            # Бюджет времени в Task Package равен таймауту выбранного исполнителя.
-            req.model_copy(update={"timeout_seconds": timeout}),
+            req,
             self.settings,
             str(tree.path) if tree else None,
             tree.branch if tree else None,
         )
+        package = package.model_copy(update={"executor": decision.executor})
         session = None
         if req.followup_of:
             attempt, session = await self._followup(req, decision, tree, resume=resume)
@@ -994,17 +989,12 @@ class Dispatcher:
         configured = self.settings.executors.get(executor)
         if scope != "group" or configured is None:
             return [executor]
-        group = self._resolved_limit_group(executor)
+        group = configured.resolved_limit_group(executor)
         return [executor] + [
             name
             for name, item in self.settings.executors.items()
             if name != executor and item.enabled and item.resolved_limit_group(name) == group
         ]
-
-    def _resolved_limit_group(self, executor: str) -> str:
-        """Имя общей квоты исполнителя из конфига или сам исполнитель."""
-        configured = self.settings.executors.get(executor)
-        return configured.resolved_limit_group(executor) if configured else executor
 
     async def restore_cooldowns(self) -> int:
         """Вернуть остывания из базы после перезапуска демона."""
@@ -1190,9 +1180,8 @@ class Dispatcher:
 
     def _worktree_target(self, task_id: str) -> tuple[Path, str]:
         """Каталог и ветка будущего дерева: они известны ещё до его создания."""
-        base = self.settings.execution.worktree_dir or (self.settings.server.data_dir / "worktrees")
         return (
-            Path(base).expanduser() / task_id,
+            self.settings.worktree_base / task_id,
             f"{self.settings.execution.branch_prefix}/{task_id[:8]}",
         )
 
@@ -1299,12 +1288,8 @@ class Dispatcher:
 
     async def _tree_in_use(self, tree: worktree.Worktree) -> bool:
         """В дереве cwd незавершённой задачи: убирать или откатывать его нельзя."""
-        tree_path = tree.path.expanduser().resolve()
-        for active in await self.storage.list_active_tasks():
-            active_cwd = Path(active.request.cwd).expanduser().resolve()  # noqa: ASYNC240
-            if active_cwd == tree_path or tree_path in active_cwd.parents:
-                return True
-        return False
+        active = await self.storage.list_active_tasks()
+        return worktree.holds_cwd(tree.path, [task.request.cwd for task in active])
 
     async def _escalation_chain(self, record: TaskRecord) -> list[str]:
         return [executor for _, executor in await self._escalation_links(record)]

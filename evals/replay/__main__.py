@@ -9,6 +9,7 @@ from pathlib import Path
 from agent_dispatch.config import load_settings
 
 from .harness import (
+    GitLocator,
     acceptance,
     children_refusals,
     default_limit_group,
@@ -26,7 +27,7 @@ from .harness import (
 def main() -> int:
     settings = load_settings()
     parser = argparse.ArgumentParser(description="Replay dispatcher rules over live telemetry.")
-    parser.add_argument("--db", type=Path, default=settings.server.data_dir / "dispatch.db")
+    parser.add_argument("--db", type=Path, default=settings.db_path)
     parser.add_argument("--cooldown", type=int, default=settings.routing.failure_cooldown_seconds)
     parser.add_argument(
         "--since",
@@ -79,8 +80,10 @@ def main() -> int:
     report["children_refusals"] = children_refusals(tasks, settings.routing.max_children)
     report["delegations"] = delegations(tasks)
     report["timeouts"] = timeouts(tasks)
+    # Один locator на прогон: дифы эксперимента судятся второй раз из кэша.
+    locator = GitLocator()
     if not args.no_git:
-        report["acceptance"] = acceptance(tasks, window_hours=args.accept_window_hours)
+        report["acceptance"] = acceptance(tasks, locator, window_hours=args.accept_window_hours)
     decisions = load_decisions(args.db)
     report["router_vs_static"] = router_vs_static(
         decisions,
@@ -93,6 +96,7 @@ def main() -> int:
     report["exploration"] = exploration_comparison(
         decisions,
         tasks,
+        locator,
         window_hours=args.accept_window_hours,
         with_acceptance=not args.no_git,
     )

@@ -16,7 +16,6 @@ from agent_dispatch.doctor import (
     Check,
     _install_check,
     codex_env_check,
-    codex_lb_key_check,
     format_checks,
     install_check,
     run_checks,
@@ -169,113 +168,48 @@ async def test_run_checks_includes_codex_env_vars_check(tmp_config_dir, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_run_checks_includes_codex_lb_key_check(tmp_config_dir, monkeypatch, tmp_path):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LB_KEY, raising=False)
-    settings = _configure(tmp_config_dir, codex_command=WRAPPER)
+async def test_executor_check_names_a_key_trapped_in_the_dispatch_env_file(
+    tmp_config_dir, tmp_path
+):
+    # Wrapper codex-agent-lb падает до `exec`, если ключа нет в его env. Ключ
+    # в env-файле agent-dispatch туда не попадёт: child_env вырезает секреты.
+    wrapper = tmp_path / "codex-agent-lb"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "echo 'codex-agent-lb: Missing environment variable: AGENT_LB_API_KEY' >&2\n"
+        "exit 78\n"
+    )
+    wrapper.chmod(0o755)
+    value = "lb-secret-value"  # pragma: allowlist secret
+    settings = _configure(tmp_config_dir, codex_command=str(wrapper))
+    (tmp_config_dir / "env").write_text(f"AGENT_LB_API_KEY={value}\n")
+    settings = load_settings()
 
     checks = await run_checks(settings)
 
-    check = next(c for c in checks if c.name == "codex-agent-lb-key")
-    assert not check.ok and "exits 78" in check.detail
-
-
-# --- ключ codex-agent-lb доступен исполнителям, значение не печатается --------
-
-LB_KEY = "AGENT_LB_API_KEY"
-LB_VALUE = "lb-secret-value"  # pragma: allowlist secret
-WRAPPER = "/usr/local/bin/codex-agent-lb"
-
-
-def _wrapper_settings(tmp_config_dir: Path):
-    return _configure(tmp_config_dir, codex_command=WRAPPER)
-
-
-def test_codex_lb_key_check_ok_from_daemon_child_env(tmp_config_dir, monkeypatch, tmp_path):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv(LB_KEY, LB_VALUE)
-
-    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
-
-    assert check.ok and "available in daemon child env" in check.detail
-    assert LB_VALUE not in check.detail
-
-
-def test_codex_lb_key_check_ok_from_wrapper_fallback_file(tmp_config_dir, monkeypatch, tmp_path):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LB_KEY, raising=False)
-    env_file = tmp_path / ".config/agent-lb/env"
-    env_file.parent.mkdir(parents=True)
-    env_file.write_text(f'export {LB_KEY}="{LB_VALUE}"\n')
-
-    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
-
-    assert check.ok and "wrapper fallback" in check.detail
-    assert LB_VALUE not in check.detail
-
-
-def test_codex_lb_key_check_ignores_empty_file_value(tmp_config_dir, monkeypatch, tmp_path):
-    # Wrapper пропускает пустые значения: `AGENT_LB_API_KEY=` не считается ключом.
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LB_KEY, raising=False)
-    env_file = tmp_path / ".config/agent-lb/env"
-    env_file.parent.mkdir(parents=True)
-    env_file.write_text(f"{LB_KEY}=\n")
-
-    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
-
-    assert not check.ok and "exits 78" in check.detail
-
-
-def test_codex_lb_key_check_fails_when_key_absent_everywhere(tmp_config_dir, monkeypatch, tmp_path):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LB_KEY, raising=False)
-
-    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
-
+    check = next(c for c in checks if c.name == "executor:codex")
     assert not check.ok
-    assert LB_KEY in check.detail and "exits 78" in check.detail
-    assert ".config/agent-lb/env" in check.detail
+    assert "AGENT_LB_API_KEY is in the agent-dispatch env file" in check.detail
+    assert value not in check.detail
 
 
-def test_codex_lb_key_check_reports_key_trapped_in_dispatch_secrets(
-    tmp_config_dir, monkeypatch, tmp_path
+@pytest.mark.asyncio
+async def test_executor_check_gives_no_env_file_hint_for_a_process_env_key(
+    tmp_config_dir, tmp_path, monkeypatch
 ):
-    # Ключ в env-файле agent-dispatch (Settings.secrets) child_env вырезает:
-    # wrapper его не увидит, doctor обязан поймать это до запуска задачи.
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv(LB_KEY, LB_VALUE)
-    (tmp_config_dir / "env").write_text(f"{LB_KEY}={LB_VALUE}\n")
-
-    check = codex_lb_key_check(_wrapper_settings(tmp_config_dir))
-
-    assert not check.ok
-    assert "child_env strips" in check.detail and "exits 78" in check.detail
-    assert LB_VALUE not in check.detail
-
-
-def test_codex_lb_key_check_skips_without_wrapper_executor(tmp_config_dir, monkeypatch, tmp_path):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LB_KEY, raising=False)
-
-    check = codex_lb_key_check(_configure(tmp_config_dir))
-
-    assert check.ok and "skipped" in check.detail
-
-
-def test_codex_lb_key_check_detects_wrapper_installed_as_codex(
-    tmp_config_dir, monkeypatch, tmp_path
-):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(LB_KEY, raising=False)
-    wrapper = tmp_path / "codex"
+    # Ключ роутера только в окружении демона: совет «переложить из env-файла» был бы ложью.
+    wrapper = tmp_path / "codex-agent-lb"
     wrapper.write_text(
-        '#!/bin/sh\nAGENT_LB_API_KEY="${AGENT_LB_API_KEY:-}"\nfile="$HOME/.config/agent-lb/env"\n'
+        "#!/bin/sh\necho 'Missing environment variable: OPENROUTER_API_KEY' >&2\nexit 78\n"
     )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "from-process-env")
+    settings = _configure(tmp_config_dir, codex_command=str(wrapper))
 
-    check = codex_lb_key_check(_configure(tmp_config_dir, codex_command=str(wrapper)))
+    checks = await run_checks(settings)
 
-    assert not check.ok and "exits 78" in check.detail
+    check = next(c for c in checks if c.name == "executor:codex")
+    assert not check.ok and "agent-dispatch env file" not in check.detail
 
 
 def test_worktrees_check_warns_about_old_trees_and_reports_total_size(tmp_config_dir, git_repo):

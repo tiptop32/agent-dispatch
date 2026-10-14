@@ -11,14 +11,16 @@ from agent_dispatch.config import ExecutorSettings, Settings
 from agent_dispatch.models import DispatchRequest, Judgment, RouteDecision, RouterKind
 
 from .base import RouterError
-from .capability import has_corporate, select, tiers_present
+from .capability import has_corporate, narrows_to_perimeter, select, tiers_present
 from .questions import build_questions, build_state, parse_answers
 
 
 class JevRouter:
     name = "jev"
 
-    def _corporate_verdict(self, corporate: Judgment | None) -> tuple[bool, str | None]:
+    def _corporate_verdict(
+        self, corporate: Judgment | None, candidates: dict[str, ExecutorSettings]
+    ) -> tuple[bool, str | None]:
         """Сужать ли пул до периметра, и что об этом сказать.
 
         `noul`-ответ вида «скорее да» с уверенностью 0.06 это монетка, а не
@@ -26,11 +28,19 @@ class JevRouter:
         `routing.corporate_min_confidence` и по умолчанию равен нулю: ослабление
         периметра данных должен включить человек, а не дефолт.
         """
-        if corporate is None or not corporate.value:
-            return False, None
-        threshold = self.settings.routing.corporate_min_confidence
-        if corporate.confidence >= threshold:
-            return True, None
+        routing = self.settings.routing
+        answered_yes = bool(corporate and corporate.value)
+        confidence = corporate.confidence if corporate else 0.0
+        narrow = narrows_to_perimeter(
+            candidates,
+            answered_yes=answered_yes,
+            confidence=confidence,
+            perimeter=routing.corporate_perimeter,
+            min_confidence=routing.corporate_min_confidence,
+        )
+        if narrow or not answered_yes or confidence >= routing.corporate_min_confidence:
+            return narrow, None
+        threshold = routing.corporate_min_confidence
         return False, (
             f"corporate_data answered yes but only at confidence {corporate.confidence:.2f}, "
             f"below routing.corporate_min_confidence={threshold:.2f}: "
@@ -82,9 +92,10 @@ class JevRouter:
                 )
                 judgment = judgments.get("judgment")
                 corporate = judgments.get("corporate_data")
-                narrow, extra_note = self._corporate_verdict(corporate)
+                narrow, extra_note = self._corporate_verdict(corporate, candidates)
                 if not ask_corporate:
-                    narrow, extra_note = False, None
+                    # Вопрос не задавался: ответа нет, и заметке о нём не место.
+                    extra_note = None
                 selection = select(
                     capability,
                     candidates,

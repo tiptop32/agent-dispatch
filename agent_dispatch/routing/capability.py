@@ -51,6 +51,25 @@ def has_corporate(candidates: dict[str, ExecutorSettings]) -> bool:
     return any(settings.corporate for settings in candidates.values())
 
 
+def narrows_to_perimeter(
+    candidates: dict[str, ExecutorSettings],
+    *,
+    answered_yes: bool,
+    confidence: float,
+    perimeter: bool,
+    min_confidence: float,
+) -> bool:
+    """Сужать ли пул до корпоративного периметра по ответу о корп. данных.
+
+    Одно правило для Jev, статического плеча эксперимента и replay: периметр
+    включён, в пуле есть корпоративный исполнитель, ответ «да» и его
+    уверенность не ниже `routing.corporate_min_confidence`.
+    """
+    return bool(
+        perimeter and has_corporate(candidates) and answered_yes and confidence >= min_confidence
+    )
+
+
 def _nearest_tiers(tier: str) -> list[str]:
     """Тиры по удалённости от запрошенного: точное совпадение, затем вверх, затем вниз."""
     if tier not in TIERS:

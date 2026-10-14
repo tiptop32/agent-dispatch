@@ -52,10 +52,13 @@ def _failed(error: str, summary: str = "", changed_files: list[str] | None = Non
             "Missing environment variable: `CODEX_LB_API_KEY`.", "auth", id="codex-lb-codex-key"
         ),
         pytest.param(
-            "codex-agent-lb: AGENT_LB_API_KEY is not set and was not found in "
-            "/Users/u/.config/agent-lb/env",
+            "codex-agent-lb: Missing environment variable: `AGENT_LB_API_KEY` "
+            "(not in the environment or /Users/u/.config/agent-lb/env)",
             "auth",
             id="codex-lb-wrapper-exit-78",
+        ),
+        pytest.param(
+            "Missing environment variable: `OPENAI_API_KEY`.", "auth", id="any-provider-key"
         ),
     ],
 )
@@ -103,6 +106,13 @@ def test_stall_after_codex_lost_the_api_is_a_network_failure():
                 "OAuth tokens for server mcphub: OAuth refresh token was rejected"
             ),
             id="mcp-server-oauth",
+        ),
+        pytest.param(
+            # Ключ MCP-сервера не задан: сервер не поднялся, сам codex работает.
+            _failed(
+                "exit 1\nMCP server github failed: Missing environment variable: GITHUB_API_KEY"
+            ),
+            id="mcp-server-missing-key",
         ),
         pytest.param(
             # Работа агента в stdout: задача про rate limiting, а не лимит исполнителя.

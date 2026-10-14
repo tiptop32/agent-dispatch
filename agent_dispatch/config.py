@@ -237,6 +237,22 @@ class Settings(_ConfigModel):
             or self.routing.default_timeout_seconds
         )
 
+    def limit_group(self, executor: str) -> str:
+        """Общая квота исполнителя; неизвестное имя — сама себе группа."""
+        item = self.executors.get(executor)
+        return item.resolved_limit_group(executor) if item else executor
+
+    @property
+    def worktree_base(self) -> Path:
+        """Каталог деревьев исполнителей: одно место для демона, CLI и doctor."""
+        return Path(
+            self.execution.worktree_dir or (self.server.data_dir / "worktrees")
+        ).expanduser()
+
+    @property
+    def db_path(self) -> Path:
+        return self.server.data_dir / "dispatch.db"
+
     def enabled_executors(self) -> dict[str, ExecutorSettings]:
         return {name: executor for name, executor in self.executors.items() if executor.enabled}
 

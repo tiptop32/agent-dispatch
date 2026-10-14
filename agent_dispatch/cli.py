@@ -332,18 +332,6 @@ def cooldown_clear(names: list[str] | None = typer.Argument(None)) -> None:  # n
     typer.echo(f"cleared: {', '.join(cleared) if cleared else '(none)'}")
 
 
-async def _worktree_task_index(settings: Settings) -> tuple[dict[str, str], list[str]]:
-    storage = Storage(settings.server.data_dir / "dispatch.db")
-    await storage.open()
-    try:
-        tasks = await storage.list_tasks(limit=2**31 - 1)
-    finally:
-        await storage.close()
-    statuses = {task.task_id: task.status.value for task in tasks}
-    active_cwds = [task.request.cwd for task in tasks if task.status not in FINAL_STATUSES]
-    return statuses, active_cwds
-
-
 def _format_age(seconds: float) -> str:
     if seconds >= 86400:
         return f"{int(seconds // 86400)}d"
@@ -352,74 +340,79 @@ def _format_age(seconds: float) -> str:
     return f"{int(seconds // 60)}m"
 
 
-def _keep_reason(
-    stored: worktree.StoredWorktree, statuses: dict[str, str], active_cwd_values: list[str]
-) -> str | None:
-    """Почему дерево удалять нельзя; None, если можно."""
-    status = statuses.get(stored.path.name, "unknown")
-    if status not in {item.value for item in FINAL_STATUSES}:
+async def _task_status(storage: Storage, task_id: str) -> str:
+    record = await storage.get_task(task_id)
+    return record.status.value if record else "unknown"
+
+
+async def _keep_reason(storage: Storage, stored: worktree.StoredWorktree) -> str | None:
+    """Почему дерево удалять нельзя; None, если можно.
+
+    База читается заново для каждого дерева прямо перед удалением: демон мог
+    принять задачу с cwd в этом дереве, пока CLI обходил остальные.
+    """
+    status = await _task_status(storage, stored.path.name)
+    if status not in FINAL_STATUSES:
         return f"unfinished task ({status})"
-    tree_path = stored.path.expanduser().resolve()
-    active_cwds = [Path(value).expanduser().resolve() for value in active_cwd_values]
-    if any(path == tree_path or tree_path in path.parents for path in active_cwds):
+    active = await storage.list_active_tasks()
+    if worktree.holds_cwd(stored.path, [task.request.cwd for task in active]):
         return "active task cwd"
     return None
 
 
-def _worktrees_all(settings: Settings, clean: bool, keep_branches: bool) -> None:
-    base = settings.execution.worktree_dir or (settings.server.data_dir / "worktrees")
+def _remove_stored(
+    base: Path, stored: worktree.StoredWorktree, keep_branches: bool
+) -> tuple[str, str]:
+    """Удаляет дерево; (итог, пояснение) для вывода."""
+    try:
+        # Перед самим удалением: каталог могли подменить симлинком после обхода.
+        worktree.ensure_stored_path(base, stored.path)
+    except worktree.WorktreeError as error:
+        return "kept", str(error)
+    try:
+        if not stored.repo_exists:
+            worktree.remove_orphaned_directory(stored)
+            return "removed", "repository missing"
+        worktree.remove(
+            worktree.Worktree(path=stored.path, branch=stored.branch, repo=stored.repo),
+            keep_branch=keep_branches,
+        )
+    except worktree.WorktreeError as error:
+        return "ERROR", str(error)
+    return "removed", stored.branch
+
+
+async def _worktrees_all(settings: Settings, clean: bool, keep_branches: bool) -> None:
+    base = settings.worktree_base
     trees = worktree.list_stored_worktrees(base)
     if not trees:
         typer.echo("no agent-dispatch worktrees")
         return
-    statuses, active_cwd_values = asyncio.run(_worktree_task_index(settings))
-    current_repo: Path | None = None
-    for stored in sorted(trees, key=lambda item: (str(item.repo), str(item.path))):
-        if stored.repo != current_repo:
-            suffix = " (repository missing)" if not stored.repo_exists else ""
-            typer.echo(f"repository\t{stored.repo}{suffix}")
-            current_repo = stored.repo
-        status = statuses.get(stored.path.name, "unknown")
-        if not clean:
-            typer.echo(
-                f"{stored.path}\t{stored.branch}\tage={_format_age(stored.age_seconds)}"
-                f"\tstatus={status}"
+    storage = Storage(settings.db_path)
+    await storage.open()
+    try:
+        current_repo: Path | None = None
+        for stored in sorted(trees, key=lambda item: (str(item.repo), str(item.path))):
+            if stored.repo != current_repo:
+                suffix = " (repository missing)" if not stored.repo_exists else ""
+                typer.echo(f"repository\t{stored.repo}{suffix}")
+                current_repo = stored.repo
+            if not clean:
+                status = await _task_status(storage, stored.path.name)
+                typer.echo(
+                    f"{stored.path}\t{stored.branch}\tage={_format_age(stored.age_seconds)}"
+                    f"\tstatus={status}"
+                )
+                continue
+            # Проверки «оставить» идут раньше любого удаления, в том числе
+            # каталога с исчезнувшим репозиторием: работающая задача важнее.
+            reason = await _keep_reason(storage, stored)
+            outcome, detail = (
+                ("kept", reason) if reason else _remove_stored(base, stored, keep_branches)
             )
-            continue
-        # Проверки «оставить» идут раньше любого удаления, в том числе
-        # каталога с исчезнувшим репозиторием: работающая задача важнее.
-        reason = _keep_reason(stored, statuses, active_cwd_values)
-        if reason is None:
-            # Демон мог принять задачу с cwd в этом дереве после первого
-            # снимка: перед самим удалением база читается заново. Остаётся
-            # окно в миллисекунды между этим чтением и `git worktree remove`.
-            statuses, active_cwd_values = asyncio.run(_worktree_task_index(settings))
-            reason = _keep_reason(stored, statuses, active_cwd_values)
-        if reason is not None:
-            typer.echo(f"{stored.path}\tkept\t{reason}")
-            continue
-        try:
-            worktree.ensure_stored_path(base, stored.path)
-        except worktree.WorktreeError as error:
-            typer.echo(f"{stored.path}\tkept\t{error}")
-            continue
-        if not stored.repo_exists:
-            try:
-                worktree.remove_orphaned_directory(stored)
-            except worktree.WorktreeError as error:
-                typer.echo(f"{stored.path}\tERROR\t{error}")
-            else:
-                typer.echo(f"{stored.path}\tremoved\trepository missing")
-            continue
-        try:
-            worktree.remove(
-                worktree.Worktree(path=stored.path, branch=stored.branch, repo=stored.repo),
-                keep_branch=keep_branches,
-            )
-        except worktree.WorktreeError as error:
-            typer.echo(f"{stored.path}\tERROR\t{error}")
-            continue
-        typer.echo(f"{stored.path}\tremoved\t{stored.branch}")
+            typer.echo(f"{stored.path}\t{outcome}\t{detail}")
+    finally:
+        await storage.close()
 
 
 @app.command("worktrees", help="List or clean up AgentDispatch worktrees.")
@@ -435,7 +428,7 @@ def worktrees(
 ) -> None:
     settings = load_settings()
     if all_repositories:
-        _worktrees_all(settings, clean, keep_branches)
+        asyncio.run(_worktrees_all(settings, clean, keep_branches))
         return
     prefix = settings.execution.branch_prefix
     try:

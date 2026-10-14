@@ -24,7 +24,7 @@ from agent_dispatch.telemetry.storage import Storage
 
 
 async def serve(settings) -> None:
-    storage = Storage(settings.server.data_dir / "dispatch.db")
+    storage = Storage(settings.db_path)
     adapters = build_adapters(settings)
     availability = AvailabilityCache(adapters, settings.routing.availability_ttl_seconds)
     async with httpx.AsyncClient() as client:

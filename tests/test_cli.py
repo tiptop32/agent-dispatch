@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -465,27 +466,27 @@ def test_worktrees_all_clean_never_follows_a_symlink_out_of_the_base_dir(
     assert "evil" not in result.stdout
 
 
-def test_worktrees_all_clean_rereads_tasks_right_before_removal(
+def test_worktrees_all_clean_sees_tasks_started_after_the_listing(
     tmp_config_dir, git_repo, monkeypatch
 ):
-    # Между первым снимком базы и удалением демон принял задачу с cwd в дереве.
-    from agent_dispatch import cli
+    # Пока CLI обходил каталог, демон принял задачу с cwd в дереве.
     from agent_dispatch.executors import worktree
 
     settings = load_settings()
     base = settings.server.data_dir / "worktrees"
     tree = worktree.create(git_repo, base / "done", "agent-dispatch/done")
-    snapshots = iter(
-        [
-            ({"done": "completed"}, []),
-            ({"done": "completed", "late": "running"}, [str(tree.path / "sub")]),
-        ]
-    )
+    _record_task("done", TaskStatus.completed, tree.path)
+    listing = worktree.list_stored_worktrees
 
-    async def index(_settings):
-        return next(snapshots)
+    def list_then_start_task(path):
+        found = listing(path)
+        (tree.path / "sub").mkdir()
+        # Свой поток: у CLI уже работает цикл событий, а хелпер зовёт asyncio.run.
+        with ThreadPoolExecutor(1) as pool:
+            pool.submit(_record_task, "late", TaskStatus.running, tree.path / "sub").result()
+        return found
 
-    monkeypatch.setattr(cli, "_worktree_task_index", index)
+    monkeypatch.setattr(worktree, "list_stored_worktrees", list_then_start_task)
 
     result = runner.invoke(app, ["worktrees", "--all", "--clean"])
 
@@ -497,27 +498,24 @@ def test_worktrees_all_clean_rereads_tasks_right_before_removal(
 def test_worktrees_all_clean_revalidates_the_path_at_removal(
     tmp_config_dir, git_repo, tmp_path, monkeypatch
 ):
-    # После инвентаризации каталог подменили симлинком на чужой worktree.
+    # После обхода и проверок статуса каталог подменили симлинком на чужой worktree.
     import shutil
 
-    from agent_dispatch import cli
     from agent_dispatch.executors import worktree
 
     settings = load_settings()
     base = settings.server.data_dir / "worktrees"
     tree = worktree.create(git_repo, base / "done", "agent-dispatch/done")
     outside = worktree.create(git_repo, tmp_path / "elsewhere" / "tree", "feature/outside")
-    calls = 0
+    _record_task("done", TaskStatus.completed, tree.path)
+    holds_cwd = worktree.holds_cwd
 
-    async def index(_settings):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            shutil.rmtree(tree.path)
-            tree.path.symlink_to(outside.path, target_is_directory=True)
-        return {"done": "completed"}, []
+    def swap_then_check(path, cwds):
+        shutil.rmtree(tree.path)
+        tree.path.symlink_to(outside.path, target_is_directory=True)
+        return holds_cwd(path, cwds)
 
-    monkeypatch.setattr(cli, "_worktree_task_index", index)
+    monkeypatch.setattr(worktree, "holds_cwd", swap_then_check)
 
     result = runner.invoke(app, ["worktrees", "--all", "--clean"])
 

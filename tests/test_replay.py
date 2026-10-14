@@ -1055,7 +1055,7 @@ def test_load_reads_cwd_and_routing_decisions(tmp_path):
     conn.close()
 
     (task,) = load(db)
-    assert (task.cwd, task.git_common_dir, task.git_branch) == ("/r", "/repo/.git", "feature")
+    assert (task.cwd, task.git_common_dir) == ("/r", "/repo/.git")
     assert load_decisions(db) == [
         Decision(
             task_id="a" * 32,

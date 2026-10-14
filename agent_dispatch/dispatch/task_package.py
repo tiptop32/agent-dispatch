@@ -52,6 +52,8 @@ class TaskPackage(BaseModel):
     repo_root: str | None = None
     branch: str | None = None
     followup: Followup | None = None
+    #: Выбранный исполнитель: бюджет времени в промпте равен его таймауту.
+    executor: str | None = None
 
 
 def _git(cwd: str, args: list[str]) -> str:
@@ -156,7 +158,8 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         instructions = "Report the outcome using the structured output schema: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation."  # noqa: E501
     else:
         instructions = 'End your final message with a fenced block tagged `agent-dispatch-result` containing a JSON object with fields: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation. Example:\n```agent-dispatch-result\n{"status": "completed", "summary": "...", "changed_files": [], "tests": {"command": "pytest", "result": "passed"}, "confidence": 0.9, "needs_escalation": false}\n```'  # noqa: E501
-    budget_seconds = req.timeout_seconds or settings.routing.default_timeout_seconds
+    # Тот же порядок, что у жёсткого таймаута: запрос, исполнитель, routing.
+    budget_seconds = settings.timeout_for(package.executor or "", req.timeout_seconds)
     followup = package.followup
     template = "followup_resumed.md.j2" if followup and followup.resumed else "task_package.md.j2"
     return env.get_template(template).render(

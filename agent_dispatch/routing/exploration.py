@@ -8,7 +8,7 @@ from collections.abc import Collection
 from agent_dispatch.config import ExecutorSettings, Settings
 from agent_dispatch.models import DispatchRequest, Judgment, RouteDecision, RouterKind
 
-from .capability import has_corporate, select
+from .capability import narrows_to_perimeter, select
 
 STATIC_BASELINE_TIER = "balanced"
 ARM_JUDGMENT = "exploration_arm"
@@ -28,11 +28,10 @@ def exploration_fraction(task_id: str) -> float:
 
 
 def is_explore_task(task_id: str, share: float) -> bool:
-    """Попадает ли задача в экспериментальную долю трафика."""
-    if share <= 0.0:
-        return False
-    if share >= 1.0:
-        return True
+    """Попадает ли задача в экспериментальную долю трафика.
+
+    Доля лежит в [0, 1), поэтому `share` 0 не берёт ни одной задачи, а 1 все.
+    """
     return exploration_fraction(task_id) < share
 
 
@@ -46,12 +45,12 @@ def _static_executor(
     settings: Settings,
 ) -> str:
     corporate = decision.judgments.get("corporate_data")
-    narrow = bool(
-        settings.routing.corporate_perimeter
-        and has_corporate(candidates)
-        and corporate
-        and corporate.value
-        and corporate.confidence >= settings.routing.corporate_min_confidence
+    narrow = narrows_to_perimeter(
+        candidates,
+        answered_yes=bool(corporate and corporate.value),
+        confidence=corporate.confidence if corporate else 0.0,
+        perimeter=settings.routing.corporate_perimeter,
+        min_confidence=settings.routing.corporate_min_confidence,
     )
     return select(STATIC_BASELINE_TIER, candidates, corporate=narrow).executor
 

@@ -39,7 +39,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import subprocess
 from collections import Counter
@@ -49,9 +48,16 @@ from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
 from agent_dispatch.config import ExecutorSettings
+from agent_dispatch.executors import worktree
 from agent_dispatch.executors.health import classify_failure, cooldown_seconds, failure_scope
+from agent_dispatch.executors.workspace import git_env
 from agent_dispatch.models import FINAL_STATUSES, ExecutionResult
-from agent_dispatch.routing.capability import has_corporate, select
+from agent_dispatch.routing.capability import narrows_to_perimeter, select
+from agent_dispatch.routing.exploration import (
+    ARM_JUDGMENT,
+    CROSSOVER_JUDGMENT,
+    JEV_CHOICE_JUDGMENT,
+)
 
 #: Ошибки валидации, которые `_coerce` теперь исправляет сам.
 _FORMAT_ERRORS = ("is not of type 'number'", "None is not of type")
@@ -84,11 +90,10 @@ class Task:
     started_at: datetime | None = None
     cwd: str = ""
     parent_task_id: str | None = None
+    #: События, которые читает replay (`slot`, `git`), в порядке записи.
     events: list[dict] = field(default_factory=list)
-    #: Событие `git` задачи: общий git dir и ветка cwd на момент `submit`.
-    #: У задач до него None.
+    #: Общий git dir cwd из события `git` при `submit`; у задач до него None.
     git_common_dir: str | None = None
-    git_branch: str | None = None
 
 
 @dataclass
@@ -121,22 +126,20 @@ def load(db_path: Path) -> list[Task]:
             " coalesce(json_extract(request_json, '$.kind'), 'task'), cwd, parent_task_id"
             " from tasks order by created_at"
         ).fetchall()
+        # Только нужные события: таблица растёт с каждой задачей.
         event_rows = conn.execute(
-            "select task_id, ts, kind, payload_json from events order by id"
+            "select task_id, ts, kind, payload_json from events"
+            " where kind in ('slot', 'git') order by id"
         ).fetchall()
-        git = {
-            task_id: json.loads(payload)
-            for task_id, payload in conn.execute(
-                "select task_id, payload_json from events where kind = 'git' order by id"
-            )
-        }
     finally:
         conn.close()
     events: dict[str, list[dict]] = {}
+    git: dict[str, str] = {}
     for task_id, ts, kind, payload in event_rows:
-        events.setdefault(task_id, []).append(
-            {"ts": ts, "kind": kind, "payload": json.loads(payload)}
-        )
+        data = json.loads(payload)
+        events.setdefault(task_id, []).append({"ts": ts, "kind": kind, "payload": data})
+        if kind == "git":
+            git[task_id] = data["common_dir"]
     return [
         Task(
             task_id=row[0],
@@ -153,8 +156,7 @@ def load(db_path: Path) -> list[Task]:
             cwd=row[11],
             parent_task_id=row[12],
             events=events.get(row[0], []),
-            git_common_dir=git.get(row[0], {}).get("common_dir"),
-            git_branch=git.get(row[0], {}).get("branch"),
+            git_common_dir=git.get(row[0]),
         )
         for row in rows
     ]
@@ -203,20 +205,9 @@ def _queue_wait_by_limit_group(tasks: list[Task]) -> dict[str, dict]:
     waits: dict[str, list[float]] = {}
     for task in tasks:
         for event in task.events:
-            if event.get("kind") != "slot":
-                continue
-            payload = event.get("payload", {})
-            group = payload.get("limit_group")
-            seconds = payload.get("wait_seconds")
-            if (
-                not isinstance(group, str)
-                or not group
-                or isinstance(seconds, bool)
-                or not isinstance(seconds, (int, float))
-                or seconds < 0
-            ):
-                continue
-            waits.setdefault(group, []).append(float(seconds))
+            if event["kind"] == "slot":
+                payload = event["payload"]
+                waits.setdefault(payload["limit_group"], []).append(payload["wait_seconds"])
     return {
         group: {
             "samples": len(values),
@@ -572,16 +563,15 @@ def added_lines(patch: str) -> dict[str, list[str]]:
 
 def _git(*args: str) -> subprocess.CompletedProcess[str]:
     # Без GIT_*: внутри git-хука GIT_DIR и GIT_INDEX_FILE перебили бы `-C cwd`.
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=False, env=env)
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, check=False, env=git_env()
+    )
 
 
 def common_dir(path: str | Path) -> str | None:
-    """Абсолютный общий git dir каталога или None, если он не в git."""
-    proc = _git("-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir")
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return None
-    return str(Path(proc.stdout.strip()).resolve())
+    """Абсолютный общий git dir каталога (без симлинков) или None."""
+    found = worktree.common_dir(path)
+    return str(Path(found).resolve()) if found else None
 
 
 class GitLocator:
@@ -589,6 +579,8 @@ class GitLocator:
 
     def __init__(self) -> None:
         self._common: dict[str, str | None] = {}
+        # Один и тот же диф судят и `acceptance`, и сравнение arm эксперимента.
+        self._verdicts: dict[tuple, Acceptance | Unknown] = {}
 
     def _common_dir(self, path: Path) -> str | None:
         key = str(path)
@@ -631,19 +623,30 @@ class GitLocator:
     def __call__(
         self, task: Task, files: list[str], patch: str | None, since: datetime, until: datetime
     ) -> Acceptance | Unknown:
+        key = (task.task_id, tuple(files), patch, since, until)
+        if key not in self._verdicts:
+            self._verdicts[key] = self._judge(task, files, patch, since, until)
+        return self._verdicts[key]
+
+    def _judge(
+        self, task: Task, files: list[str], patch: str | None, since: datetime, until: datetime
+    ) -> Acceptance | Unknown:
         repo = self.locate(task)
         if isinstance(repo, Unknown):
             return repo
+        verdict = git_acceptance(repo, files, patch, since, until)
         # Догадка (предок или соседи) могла найти чужую репу: удалённый
-        # checkout репы B под dotfiles-репой A. Репа задачи знает хотя бы один
-        # её файл в истории; иначе коммит по тому же пути в A засчитался бы.
-        if repo.via in {"ancestor", "siblings"}:
-            known = _knows_any(repo, files)
-            if known is None:
-                return Unknown("git_error")
-            if not known:
-                return Unknown("unverified_repo")
-        return git_acceptance(repo, files, patch, since, until)
+        # checkout репы B под dotfiles-репой A. Коммит в окне уже доказывает,
+        # что репа знает файл; без него нужна проверка по всей истории, иначе
+        # чужая репа дала бы ложный `not_committed`.
+        if repo.via in {"ancestor", "siblings"} and isinstance(verdict, Acceptance):
+            if not verdict.committed:
+                known = _knows_any(repo, files)
+                if known is None:
+                    return Unknown("git_error")
+                if not known:
+                    return Unknown("unverified_repo")
+        return verdict
 
 
 def _knows_any(repo: GitRepo, files: list[str]) -> bool | None:
@@ -785,6 +788,10 @@ def acceptance(
 ACTIVE_BEFORE_KILL_S = 120
 
 
+#: Поля секции `timeouts`: всего и по вердиктам.
+_TIMEOUT_KEYS = ("count", "active", "quiet", "no_stream", "unknown")
+
+
 def timeouts(tasks: list[Task]) -> dict:
     """Жёсткие таймауты по исполнителям: работал агент до конца или молчал.
 
@@ -817,18 +824,10 @@ def timeouts(tasks: list[Task]) -> dict:
         total.update(counts)
     return {
         "active_window_s": ACTIVE_BEFORE_KILL_S,
-        "count": total["count"],
-        "active": total["active"],
-        "quiet": total["quiet"],
-        "no_stream": total["no_stream"],
-        "unknown": total["unknown"],
+        **{key: total[key] for key in _TIMEOUT_KEYS},
         "by_executor": {
             name: {
-                "count": counts["count"],
-                "active": counts["active"],
-                "quiet": counts["quiet"],
-                "no_stream": counts["no_stream"],
-                "unknown": counts["unknown"],
+                **{key: counts[key] for key in _TIMEOUT_KEYS},
                 "avg_minutes": round(minutes[name] / counts["count"] / 60000, 1),
             }
             for name, counts in sorted(
@@ -866,21 +865,20 @@ def exploration_comparison(
     arm_by_task: dict[str, str] = {}
     crossover: set[str] = set()
     for decision in decisions:
-        marker = decision.judgments.get("exploration_arm") or {}
+        marker = decision.judgments.get(ARM_JUDGMENT) or {}
         arm = marker.get("value")
         if arm in {"explore", "jev"} and decision.task_id:
             arm_by_task[decision.task_id] = arm
-            if decision.judgments.get("exploration_crossover"):
+            if decision.judgments.get(CROSSOVER_JUDGMENT):
                 crossover.add(decision.task_id)
 
-    final = {status.value for status in FINAL_STATUSES}
     grouped: dict[str, list[Task]] = {"explore": [], "jev": []}
     in_flight: Counter[str] = Counter()
     for task in tasks:
         arm = arm_by_task.get(task.task_id)
         if arm is None:
             continue
-        if task.status not in final:
+        if task.status not in FINAL_STATUSES:
             in_flight[arm] += 1
             continue
         grouped[arm].append(task)
@@ -940,17 +938,18 @@ def router_vs_static(
             continue
         candidates = {name: executors[name] for name in decision.candidates}
         corporate = decision.judgments.get("corporate_data") or {}
-        narrow = (
-            corporate_perimeter
-            and has_corporate(candidates)
-            and bool(corporate.get("value"))
-            and float(corporate.get("confidence", 0.0)) >= corporate_min_confidence
+        narrow = narrows_to_perimeter(
+            candidates,
+            answered_yes=bool(corporate.get("value")),
+            confidence=float(corporate.get("confidence", 0.0)),
+            perimeter=corporate_perimeter,
+            min_confidence=corporate_min_confidence,
         )
         judgment = bool((decision.judgments.get("judgment") or {}).get("value"))
         jev = select(capability, candidates, judgment=judgment, corporate=narrow).executor
         static = select(baseline_tier, candidates, corporate=narrow).executor
         capabilities[capability] += 1
-        logged_jev = (decision.judgments.get("exploration_jev_choice") or {}).get(
+        logged_jev = (decision.judgments.get(JEV_CHOICE_JUDGMENT) or {}).get(
             "value", decision.choice
         )
         drift += jev != logged_jev
@@ -973,6 +972,10 @@ def router_vs_static(
         "choice_drift": drift,
         "skipped": dict(skipped),
     }
+
+
+def _pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.0%}"
 
 
 def render(report: dict) -> str:
@@ -1051,7 +1054,7 @@ def render(report: dict) -> str:
         )
     if "acceptance" in report:
         info = report["acceptance"]
-        share = "n/a" if info["committed_share"] is None else f"{info['committed_share']:.0%}"
+        share = _pct(info["committed_share"])
         reasons = ", ".join(f"{reason} {n}" for reason, n in info["unknown_by_reason"].items())
         lines.append(
             f"diffs committed by the caller within {info['window_hours']:g} h: "
@@ -1093,32 +1096,26 @@ def render(report: dict) -> str:
         ]
     if "router_vs_static" in report:
         info = report["router_vs_static"]
-        share = "n/a" if info["agreement"] is None else f"{info['agreement']:.0%}"
-
-        def rate(value: float | None) -> str:
-            return "n/a" if value is None else f"{value:.0%}"
+        share = _pct(info["agreement"])
 
         lines.append(
             f"jev vs static tier '{info['baseline_tier']}': {info['agree']} of "
             f"{info['compared']} agree ({share}); completed when agree "
-            f"{rate(info['completed_when_agree'])}, when disagree "
-            f"{rate(info['completed_when_disagree'])}; logged choice differs from today's "
+            f"{_pct(info['completed_when_agree'])}, when disagree "
+            f"{_pct(info['completed_when_disagree'])}; logged choice differs from today's "
             f"config in {info['choice_drift']}"
         )
         lines += [f"  {pair}: {n}" for pair, n in info["disagreements"].items()]
     if "exploration" in report:
         info = report["exploration"]
 
-        def experiment_rate(value: float | None) -> str:
-            return "n/a" if value is None else f"{value:.0%}"
-
         for arm in ("explore", "jev"):
             metrics = info["arms"][arm]
             lines.append(
                 f"routing experiment {arm}: n {metrics['n']}, "
-                f"completed {experiment_rate(metrics['completed_share'])}, "
-                f"committed {experiment_rate(metrics['committed_share'])}, "
-                f"lines kept {experiment_rate(metrics['lines_kept_share'])}, "
+                f"completed {_pct(metrics['completed_share'])}, "
+                f"committed {_pct(metrics['committed_share'])}, "
+                f"lines kept {_pct(metrics['lines_kept_share'])}, "
                 f"in flight {metrics['in_flight']}, crossover {metrics['crossover']}"
             )
         if info["warning"]:

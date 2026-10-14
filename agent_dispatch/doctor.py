@@ -4,7 +4,6 @@ import hashlib
 import importlib.metadata
 import json
 import os
-import shutil
 import time
 import tomllib
 from pathlib import Path
@@ -148,96 +147,27 @@ def _codex_env_check() -> Check:
     return codex_env_check(home / "config.toml")
 
 
-#: Секрет, который wrapper scripts/codex-agent-lb берёт из child env демона или
-#: из fallback-файла самого wrapper. Без него wrapper выходит с `exit 78` до
-#: всякой работы codex. Ключ из `Settings.secrets` в child env не попадает
-#: (`child_env` вырезает его), поэтому проверяется фактическая доступность,
-#: а не наличие в конфиге.
-CODEX_LB_KEY = "AGENT_LB_API_KEY"
-CODEX_LB_ENV_FILE = Path("~/.config/agent-lb/env")
+def _trapped_secret_hint(settings: Settings, error: str) -> str:
+    """Подсказка, если CLI не нашёл ключ, который лежит в env-файле agent-dispatch.
 
-
-def _is_codex_lb_command(command: str) -> bool:
-    path = Path(shutil.which(command) or command).expanduser()
-    if path.name == "codex-agent-lb":
-        return True
-    try:
-        with path.open(errors="ignore") as stream:
-            source = stream.read(16384)
-    except OSError:
-        return False
-    return "AGENT_LB_API_KEY" in source and ".config/agent-lb/env" in source
-
-
-def _uses_codex_lb_wrapper(settings: Settings) -> bool:
-    return any(
-        executor.enabled
-        and executor.adapter == "codex"
-        and _is_codex_lb_command(executor.resolved_command)
-        for executor in settings.executors.values()
-    )
-
-
-def _env_file_value(path: Path, name: str) -> str | None:
-    """Первое непустое значение `KEY=value` (или `export KEY=value`) ровно так,
-    как его читает `scripts/codex-agent-lb`: срезаются только ведущие пробелы,
-    после `export` ровно один пробел, хвост значения не обрезается, пустые
-    значения пропускаются. Любая вольность здесь дала бы зелёный doctor при
-    wrapper, падающем с `exit 78`."""
-    try:
-        # Shell читает байты и делит только по `\n`: битый UTF-8 в комментарии
-        # и `\r` не мешают wrapper, значит не должны мешать и здесь.
-        lines = path.read_bytes().decode("utf-8", errors="surrogateescape").split("\n")
-    except OSError:
-        return None
-    for raw in lines:
-        # Как `[[:space:]]` в C-локали: `str.lstrip()` срезал бы и `\x1c`, и `\xa0`.
-        line = raw.lstrip(" \t\n\v\f\r")
-        for prefix in (f"export {name}=", f"{name}="):
-            if line.startswith(prefix):
-                value = line[len(prefix) :]
-                break
-        else:
-            continue
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        if value:
-            return value
-    return None
-
-
-def codex_lb_key_check(settings: Settings) -> Check:
-    """Проверяет доступность ключа codex-agent-lb до запуска задачи.
-
-    Ключ ищется там же, где его ищет wrapper: в child env демона
-    (`child_env(settings)`) и в fallback-файле `~/.config/agent-lb/env`.
-    Значение ключа не печатается ни в одном из вариантов detail.
+    `child_env` не пускает секреты в env исполнителей, и CLI (например,
+    `scripts/codex-agent-lb` с `exit 78`) падает с именем ключа в stderr.
+    Значение ключа не печатается.
     """
-    name = "codex-agent-lb-key"
-    if not _uses_codex_lb_wrapper(settings):
-        return Check(name=name, ok=True, detail="no codex-agent-lb executor, skipped")
-    if child_env(settings).get(CODEX_LB_KEY):
-        return Check(name=name, ok=True, detail=f"{CODEX_LB_KEY}: available in daemon child env")
-    if _env_file_value(CODEX_LB_ENV_FILE.expanduser(), CODEX_LB_KEY):
-        return Check(
-            name=name,
-            ok=True,
-            detail=f"{CODEX_LB_KEY}: available via wrapper fallback {CODEX_LB_ENV_FILE}",
-        )
-    if settings.secret(CODEX_LB_KEY):
-        detail = (
-            f"{CODEX_LB_KEY}: not available to executors: it is in the agent-dispatch "
-            f"env file, which child_env strips from the daemon child env, so "
-            f"codex-agent-lb exits 78; move it to {CODEX_LB_ENV_FILE} (one KEY=value line) "
-            f"or to the daemon process environment"
-        )
-    else:
-        detail = (
-            f"{CODEX_LB_KEY}: not available to executors: absent from the daemon child env "
-            f"and from {CODEX_LB_ENV_FILE}, so codex-agent-lb exits 78; set it in the "
-            f"daemon process environment or in {CODEX_LB_ENV_FILE} (one KEY=value line)"
-        )
-    return Check(name=name, ok=False, detail=detail)
+    # Только env-файл agent-dispatch (`Settings.secrets`): ключ из окружения
+    # процесса демона туда не относится, и совет переложить его был бы ложным.
+    trapped = sorted(
+        name
+        for name, value in settings.secrets.items()
+        if name in error and value.get_secret_value()
+    )
+    if not trapped:
+        return ""
+    return (
+        f"; {', '.join(trapped)} is in the agent-dispatch env file, but child_env keeps "
+        "secrets out of executor env: put it where the CLI reads it "
+        "(its own config file or the daemon process environment)"
+    )
 
 
 def _format_size(size: int) -> str:
@@ -251,13 +181,12 @@ def _format_size(size: int) -> str:
 
 def worktrees_check(settings: Settings) -> Check:
     """Сводит количество, размер и возраст деревьев во всём каталоге данных."""
-    base = settings.execution.worktree_dir or (settings.server.data_dir / "worktrees")
     try:
-        trees = worktree.list_stored_worktrees(base)
+        trees = worktree.list_stored_worktrees(settings.worktree_base)
     except worktree.WorktreeError as exc:
         return Check(name="worktrees", ok=False, detail=str(exc))
     old = sum(tree.age_seconds >= 7 * 86400 for tree in trees)
-    total = sum(tree.size_bytes for tree in trees)
+    total = sum(worktree.directory_size(tree.path) for tree in trees)
     return Check(
         name="worktrees",
         ok=True,
@@ -294,16 +223,16 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
         )
     checks.append(await _daemon_check(settings))
     checks.append(_codex_env_check())
-    checks.append(codex_lb_key_check(settings))
     checks.append(worktrees_check(settings))
     safe_env = child_env(settings)
     for name, executor in settings.executors.items():
         availability = await check_cli_version(name, executor.resolved_command, safe_env)
+        error = availability.error or "unknown error"
         checks.append(
             Check(
                 name=f"executor:{name}",
                 ok=availability.available,
-                detail=availability.version or availability.error or "unknown error",
+                detail=availability.version or error + _trapped_secret_hint(settings, error),
             )
         )
     if not online:

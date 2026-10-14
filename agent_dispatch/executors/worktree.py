@@ -44,7 +44,6 @@ class StoredWorktree:
     branch: str
     repo: Path
     age_seconds: float
-    size_bytes: int
     repo_exists: bool
 
 
@@ -89,15 +88,38 @@ def git_location(cwd: str | Path) -> dict[str, str | None] | None:
     слияния. Коммиты остаются в общем git dir, по нему `evals.replay` и судит,
     принят ли диф исполнителя.
     """
+    common = common_dir(cwd)
+    if common is None:
+        return None
     try:
-        common = _git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)
-        if common.returncode != 0 or not common.stdout.strip():
-            return None
         # cwd могли удалить между двумя вызовами: ветка тогда просто неизвестна.
-        branch = _git(["symbolic-ref", "--short", "-q", "HEAD"], cwd)
+        branch = _git(["symbolic-ref", "--short", "-q", "HEAD"], cwd).stdout.strip()
+    except WorktreeError:
+        branch = ""
+    return {"common_dir": common, "branch": branch or None}
+
+
+def common_dir(cwd: str | Path) -> str | None:
+    """Абсолютный общий git dir каталога; None, если он не в git или его нет."""
+    try:
+        proc = _git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)
     except WorktreeError:
         return None
-    return {"common_dir": common.stdout.strip(), "branch": branch.stdout.strip() or None}
+    return proc.stdout.strip() or None if proc.returncode == 0 else None
+
+
+def holds_cwd(tree_path: Path, cwds: list[str]) -> bool:
+    """Лежит ли один из cwd в дереве (или совпадает с ним).
+
+    Дерево с cwd незавершённой задачи нельзя убирать: ни демону после задачи,
+    ни человеку через `worktrees --clean`.
+    """
+    root = tree_path.expanduser().resolve()
+    for cwd in cwds:
+        path = Path(cwd).expanduser().resolve()
+        if path == root or root in path.parents:
+            return True
+    return False
 
 
 def ensure_stored_path(base: str | Path, path: Path) -> None:
@@ -368,8 +390,12 @@ def list_worktrees(cwd: str | Path, prefix: str) -> list[Worktree]:
     return found
 
 
-def _directory_size(path: Path) -> int:
-    """Считает размер файлов дерева, не переходя по симлинкам."""
+def directory_size(path: Path) -> int:
+    """Считает размер файлов дерева, не переходя по симлинкам.
+
+    Обход всех файлов дорог (гигабайты в node_modules и .venv), поэтому
+    размер считает только тот, кому он нужен (`doctor`), а не инвентаризация.
+    """
     total = 0
     for root, _directories, files in os.walk(path, followlinks=False):
         for name in files:
@@ -412,7 +438,6 @@ def _stored_worktree(path: Path, now: float) -> StoredWorktree | None:
         branch=branch,
         repo=repo,
         age_seconds=age_seconds,
-        size_bytes=_directory_size(path),
         repo_exists=repo_exists,
     )
 
