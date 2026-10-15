@@ -15,6 +15,7 @@ from agent_dispatch.models import (
     RouteDecision,
     RouterKind,
 )
+from agent_dispatch.routing.decision import decide_with_fallback
 from agent_dispatch.routing.exploration import (
     apply_exploration,
     exploration_fraction,
@@ -91,6 +92,24 @@ def test_eligible_tasks_record_both_choices_and_only_selected_hash_uses_static()
         assert decision.judgments["exploration_arm"].value == arm
         assert decision.judgments["exploration_jev_choice"].value == "claude/opus"
         assert decision.judgments["exploration_static_choice"].value == "codex/sol"
+
+
+@pytest.mark.asyncio
+async def test_exploration_logs_the_capped_jev_choice_and_keeps_static_baseline() -> None:
+    settings = _settings(share=1.0)
+    request = DispatchRequest(task="x", cwd=".", max_capability="balanced")
+    capped, _ = await decide_with_fallback(
+        request,
+        settings.executors,
+        settings,
+        [FakeRouter(_jev_decision())],
+    )
+
+    explored = apply_exploration("a" * 32, request, capped, settings.executors, settings)
+
+    assert capped.meta["capability_uncapped"] == "strong"
+    assert explored.judgments["exploration_jev_choice"].value == "codex/sol"
+    assert explored.judgments["exploration_static_choice"].value == "codex/sol"
 
 
 @pytest.mark.parametrize(

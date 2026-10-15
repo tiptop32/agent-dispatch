@@ -12,9 +12,56 @@ from agent_dispatch.models import (
 )
 
 from .base import Router, RouterError
+from .capability import TIERS, narrows_to_perimeter, select
 from .claude_local import ClaudeLocalRouter
 from .guards import fallback_unavailable, pick_fallback, post_guards, single_candidate_decision
 from .jev import JevRouter
+
+
+def _apply_capability_ceiling(
+    req: DispatchRequest,
+    decision: RouteDecision,
+    candidates: dict[str, ExecutorSettings],
+    settings: Settings,
+) -> RouteDecision:
+    """Ограничить выбор роутера уровнем запроса, не ослабляя сужения пула."""
+    ceiling = req.max_capability
+    if ceiling is None or decision.router not in {RouterKind.jev, RouterKind.claude_local}:
+        return decision
+    capability = decision.capability
+    if capability is None and decision.executor in candidates:
+        capability = candidates[decision.executor].tier
+    if capability not in TIERS or TIERS.index(capability) <= TIERS.index(ceiling):
+        return decision
+
+    corporate = decision.judgments.get("corporate_data")
+    narrow = narrows_to_perimeter(
+        candidates,
+        answered_yes=bool(corporate and corporate.value),
+        confidence=corporate.confidence if corporate else 0.0,
+        perimeter=settings.routing.corporate_perimeter,
+        min_confidence=settings.routing.corporate_min_confidence,
+    )
+    judgment = decision.judgments.get("judgment")
+    selection = select(
+        capability,
+        candidates,
+        max_capability=ceiling,
+        judgment=bool(judgment and judgment.value),
+        corporate=narrow,
+        corporate_confidence=corporate.confidence if corporate else None,
+    )
+    result = decision.model_copy(deep=True)
+    result.executor = selection.executor
+    result.capability = selection.capability
+    result.meta["capability_uncapped"] = selection.capability_uncapped
+    notes = list(result.meta.get("selection_notes", []))
+    notes.append(
+        f"capability capped: {selection.capability_uncapped} -> "
+        f"{selection.capability} (max_capability)"
+    )
+    result.meta["selection_notes"] = notes
+    return result
 
 
 async def decide_with_fallback(
@@ -30,6 +77,7 @@ async def decide_with_fallback(
     for router in routers:
         try:
             decision = await router.decide(req, candidates)
+            decision = _apply_capability_ceiling(req, decision, candidates, settings)
             final, post_events = post_guards(decision, settings, names)
             return final, events + post_events
         except RouterError as exc:

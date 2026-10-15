@@ -40,6 +40,15 @@ def test_each_capability_picks_its_tier(capability, expected):
     assert select(capability, FULL).executor == expected
 
 
+def test_max_capability_caps_the_tier_before_selection():
+    selection = select("strong", FULL, max_capability="balanced")
+
+    assert selection.executor == "codex"
+    assert selection.capability == "balanced"
+    assert selection.capability_uncapped == "strong"
+    assert "capability capped: strong -> balanced (max_capability)" in selection.notes
+
+
 def test_missing_tier_falls_upward_then_downward():
     only_strong_and_fast = {"cheap": ex("opencode", "fast"), "opus": ex("claude", "strong")}
     # balanced нет: берём следующий вверх, а не вниз, чтобы задача не провалилась.

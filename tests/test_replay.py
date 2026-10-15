@@ -1033,6 +1033,18 @@ def test_router_vs_static_uses_logged_jev_choice_in_explore_arm():
     assert report["choice_drift"] == 0
 
 
+def test_router_vs_static_uses_capped_capability():
+    decision = _decision("a" * 32, "strong")
+    decision.capability = "balanced"
+    decision.choice = "codex/sol"
+
+    report = router_vs_static([decision], [_task("a" * 32, "completed")], EXECUTORS)
+
+    assert report["capabilities"] == {"balanced": 1}
+    assert report["agree"] == 1
+    assert report["choice_drift"] == 0
+
+
 def test_load_reads_cwd_and_routing_decisions(tmp_path):
     db = _db(tmp_path, [("a" * 32, "codex/sol", "10:00", "10:05", 5, None, _result("completed"))])
     conn = sqlite3.connect(db)
@@ -1042,6 +1054,10 @@ def test_load_reads_cwd_and_routing_decisions(tmp_path):
         " values (?, 'jev', '[\"codex/sol\"]', 'codex/sol', 0.9, '{}',"
         ' \'{"capability": {"value": "fast"}}\', null, 10, \'2026-09-23T10:00:00+00:00\')',
         ("a" * 32,),
+    )
+    conn.execute(
+        "update tasks set decision_json=? where task_id=?",
+        (json.dumps({"capability": "balanced"}), "a" * 32),
     )
     conn.commit()
     conn.close()
@@ -1064,6 +1080,7 @@ def test_load_reads_cwd_and_routing_decisions(tmp_path):
             choice="codex/sol",
             guard_reason=None,
             judgments={"capability": {"value": "fast"}},
+            capability="balanced",
         )
     ]
 

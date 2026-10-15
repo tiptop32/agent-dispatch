@@ -31,7 +31,7 @@ def test_pre_guards_and_candidates(git_repo):
 
 def test_override_and_post_guard(git_repo):
     s = settings()
-    req = DispatchRequest(task="x", cwd=str(git_repo), executor="codex")
+    req = DispatchRequest(task="x", cwd=str(git_repo), executor="codex", max_capability="fast")
     assert pre_guards(req, s, set(), True, 0).executor == "codex"
     d = __import__("agent_dispatch.models", fromlist=["RouteDecision"]).RouteDecision(
         router="jev", executor="claude", confidence=0.5, scores={"claude": 0.5, "codex": 0.5}

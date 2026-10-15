@@ -39,6 +39,8 @@ class Selection:
     executor: str
     scores: dict[str, float]
     notes: list[str] = field(default_factory=list)
+    capability: str | None = None
+    capability_uncapped: str | None = None
 
 
 def tiers_present(candidates: dict[str, ExecutorSettings]) -> list[str]:
@@ -97,6 +99,7 @@ def select(
     capability: str,
     candidates: dict[str, ExecutorSettings],
     *,
+    max_capability: str | None = None,
     judgment: bool = False,
     corporate: bool = False,
     corporate_confidence: float | None = None,
@@ -114,6 +117,15 @@ def select(
         raise ValueError("no candidates")
     notes: list[str] = []
     pool = dict(candidates)
+    capability_uncapped: str | None = None
+    if (
+        capability in TIERS
+        and max_capability in TIERS
+        and TIERS.index(capability) > TIERS.index(max_capability)
+    ):
+        capability_uncapped = capability
+        capability = max_capability
+        notes.append(f"capability capped: {capability_uncapped} -> {capability} (max_capability)")
 
     corporate_pool = {name: s for name, s in pool.items() if s.corporate}
     if corporate and corporate_pool:
@@ -143,7 +155,13 @@ def select(
             notes.append("task needs judgment rather than execution; sent to a reasoning agent")
 
     executor = _pick(pool, capability)
-    return Selection(executor=executor, scores=_scores(pool, probabilities or {}), notes=notes)
+    return Selection(
+        executor=executor,
+        scores=_scores(pool, probabilities or {}),
+        notes=notes,
+        capability=capability,
+        capability_uncapped=capability_uncapped,
+    )
 
 
 def _scores(pool: dict[str, ExecutorSettings], probabilities: dict[str, float]) -> dict[str, float]:

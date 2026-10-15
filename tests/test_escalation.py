@@ -236,6 +236,28 @@ async def test_failed_result_escalates_to_next_executor(tmp_path, git_repo):
 
 
 @pytest.mark.asyncio
+async def test_capability_ceiling_does_not_limit_explicit_escalation(tmp_path, git_repo):
+    storage, adapters, _, dispatcher = await _make_dispatcher(
+        tmp_path,
+        results={
+            "opencode/kimi": _result("opencode/kimi", "failed"),
+            "claude": _result("claude"),
+        },
+        escalation={"opencode/kimi": ["claude"]},
+    )
+    dispatcher.settings.executors["opencode/kimi"].tier = "balanced"
+    dispatcher.settings.executors["claude"].tier = "strong"
+
+    first = await dispatcher.submit(_request(git_repo, max_capability="balanced"))
+    records = await _wait_for_records(dispatcher, storage, 2)
+    child = next(record for record in records if record.escalated_from == first.task_id)
+
+    assert child.decision.executor == "claude"
+    assert child.request.max_capability == "balanced"
+    assert adapters["claude"].calls
+
+
+@pytest.mark.asyncio
 async def test_completed_result_requesting_escalation_escalates(tmp_path, git_repo):
     storage, _, _, dispatcher = await _make_dispatcher(
         tmp_path,

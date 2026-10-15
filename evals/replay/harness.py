@@ -104,6 +104,7 @@ class Decision:
     choice: str
     guard_reason: str | None
     judgments: dict
+    capability: str | None = None
 
 
 def guard_refusal(task: Task) -> bool:
@@ -166,8 +167,9 @@ def load_decisions(db_path: Path) -> list[Decision]:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = conn.execute(
-            "select coalesce(task_id, ''), router, candidates_json, choice, guard_reason,"
-            " judgments_json from routing_decisions order by id"
+            "select coalesce(d.task_id, ''), d.router, d.candidates_json, d.choice,"
+            " d.guard_reason, d.judgments_json, json_extract(t.decision_json, '$.capability')"
+            " from routing_decisions d left join tasks t on t.task_id = d.task_id order by d.id"
         ).fetchall()
     finally:
         conn.close()
@@ -179,6 +181,7 @@ def load_decisions(db_path: Path) -> list[Decision]:
             choice=row[3],
             guard_reason=row[4],
             judgments=json.loads(row[5]),
+            capability=row[6],
         )
         for row in rows
     ]
@@ -929,7 +932,9 @@ def router_vs_static(
     for decision in decisions:
         if decision.router not in {"jev", "explore"} or decision.guard_reason:
             continue
-        capability = (decision.judgments.get("capability") or {}).get("value")
+        capability = decision.capability or (decision.judgments.get("capability") or {}).get(
+            "value"
+        )
         if capability is None:
             skipped["no_capability"] += 1
             continue

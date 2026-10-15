@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import UTC, datetime
 
@@ -109,9 +110,15 @@ async def test_dispatch_body_and_auth(tmp_path, monkeypatch):
     route = respx.post("http://127.0.0.1:7433/tasks").mock(
         return_value=httpx.Response(200, json=view("running").model_dump(mode="json"))
     )
-    r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
+    r = await call(
+        settings(tmp_path),
+        "dispatch",
+        {"task": "fix", "cwd": ".", "max_capability": "balanced"},
+    )
     assert route.calls[0].request.headers["authorization"] == "Bearer secret"
-    assert route.calls[0].request.read() and "fix" in route.calls[0].request.content.decode()
+    body = route.calls[0].request.read()
+    assert body and "fix" in route.calls[0].request.content.decode()
+    assert json.loads(body)["max_capability"] == "balanced"
     assert r.is_error is False
 
 

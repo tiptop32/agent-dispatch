@@ -128,6 +128,7 @@ def _request(
     constraints: list[str] | None,
     *,
     executor: str | None = None,
+    max_capability: str | None = None,
     wait: int = 1800,
     timeout: int | None = None,
     allow_escalation: bool = True,
@@ -143,6 +144,7 @@ def _request(
         constraints=constraints or [],
         source_agent=SourceAgent.cli,
         executor=executor,
+        max_capability=max_capability,
         wait_seconds=wait,
         timeout_seconds=timeout,
         allow_escalation=allow_escalation,
@@ -190,13 +192,16 @@ def route(
     context: str | None = typer.Option(None),
     files: list[str] | None = typer.Option(None, "--file"),  # noqa: B008
     constraints: list[str] | None = typer.Option(None, "--constraint"),  # noqa: B008
+    max_capability: str | None = typer.Option(None, "--max-capability"),
     kind: str = typer.Option(
         "task", help="task changes code; review reads the working copy and reports findings."
     ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     decision = _daemon_call(
-        "route", _request(task, cwd, context, files, constraints, kind=kind), start=True
+        "route",
+        _request(task, cwd, context, files, constraints, kind=kind, max_capability=max_capability),
+        start=True,
     )
     if as_json:
         typer.echo(decision.model_dump_json(indent=2))
@@ -219,6 +224,7 @@ def dispatch(
     files: list[str] | None = typer.Option(None, "--file"),  # noqa: B008
     constraints: list[str] | None = typer.Option(None, "--constraint"),  # noqa: B008
     executor: str | None = typer.Option(None),
+    max_capability: str | None = typer.Option(None, "--max-capability"),
     wait: int = typer.Option(1800, min=0),
     timeout: int | None = typer.Option(None, min=1),
     poll_seconds: float = typer.Option(2.0, "--poll", min=0.0, help="Polling interval in seconds."),
@@ -243,6 +249,7 @@ def dispatch(
                 files,
                 constraints,
                 executor=executor,
+                max_capability=max_capability,
                 wait=wait,
                 timeout=timeout,
                 allow_escalation=not no_escalation,

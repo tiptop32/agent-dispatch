@@ -115,6 +115,20 @@ def test_dispatch_sends_executor(tmp_config_dir, monkeypatch):
 
 
 @respx.mock
+def test_dispatch_sends_max_capability(tmp_config_dir, monkeypatch):
+    state = _state()
+    _patch_autostart(monkeypatch, state)
+    request = respx.post(f"http://127.0.0.1:{state.port}/tasks").mock(
+        return_value=httpx.Response(200, json=_view())
+    )
+
+    result = runner.invoke(app, ["dispatch", "--max-capability", "balanced", "x"])
+
+    assert result.exit_code == 0
+    assert json.loads(request.calls[0].request.content)["max_capability"] == "balanced"
+
+
+@respx.mock
 def test_dispatch_wait_zero_prints_running_hint(tmp_config_dir, monkeypatch):
     state = _state()
     _patch_autostart(monkeypatch, state)
