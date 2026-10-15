@@ -150,6 +150,21 @@ def select(
 
     if judgment:
         judgment_pool = {name: s for name, s in pool.items() if s.adapter == JUDGMENT_ADAPTER}
+        if max_capability in TIERS:
+            # Потолок вызывающего сильнее совета «нужно суждение»: иначе
+            # reasoning-исполнитель уровня strong обошёл бы его молча. Периметр
+            # данных выше по коду остаётся сильнее потолка.
+            within = {
+                name: s
+                for name, s in judgment_pool.items()
+                if s.tier in TIERS and TIERS.index(s.tier) <= TIERS.index(max_capability)
+            }
+            if judgment_pool and not within:
+                notes.append(
+                    "task needs judgment, but no reasoning agent within "
+                    f"max_capability '{max_capability}'; the ceiling was kept"
+                )
+            judgment_pool = within
         if judgment_pool:
             pool = judgment_pool
             notes.append("task needs judgment rather than execution; sent to a reasoning agent")
