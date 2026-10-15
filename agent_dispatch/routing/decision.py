@@ -43,24 +43,22 @@ def _apply_capability_ceiling(
         min_confidence=settings.routing.corporate_min_confidence,
     )
     judgment = decision.judgments.get("judgment")
-    selection = select(
-        capability,
-        candidates,
-        max_capability=ceiling,
-        judgment=bool(judgment and judgment.value),
-        corporate=narrow,
-        corporate_confidence=corporate.confidence if corporate else None,
-    )
+    pool_args = {
+        "judgment": bool(judgment and judgment.value),
+        "corporate": narrow,
+        "corporate_confidence": corporate.confidence if corporate else None,
+    }
+    selection = select(capability, candidates, max_capability=ceiling, **pool_args)
+    # Заметки выбора без потолка («sent to a reasoning agent») описывают уже
+    # отменённый выбор: их заменяют заметки нового. Заметки самого роутера
+    # (например, о низкой уверенности ответа про корп. данные) остаются.
+    stale = set(select(capability, candidates, **pool_args).notes)
+    kept = [note for note in decision.meta.get("selection_notes", []) if note not in stale]
     result = decision.model_copy(deep=True)
     result.executor = selection.executor
     result.capability = selection.capability
     result.meta["capability_uncapped"] = selection.capability_uncapped
-    notes = list(result.meta.get("selection_notes", []))
-    notes.append(
-        f"capability capped: {selection.capability_uncapped} -> "
-        f"{selection.capability} (max_capability)"
-    )
-    result.meta["selection_notes"] = notes
+    result.meta["selection_notes"] = kept + selection.notes
     return result
 
 

@@ -137,6 +137,55 @@ async def test_capability_ceiling_keeps_corporate_and_judgment_narrowing():
 
 
 @pytest.mark.asyncio
+async def test_capped_decision_notes_describe_the_new_choice_not_the_old_one():
+    # Живой случай 2026-10-15: после потолка в notes оставалось «sent to a
+    # reasoning agent», хотя задача ушла к balanced-исполнителю.
+    low_corporate = "corporate_data answered yes but only at confidence 0.10"
+
+    class JudgmentChoice:
+        name = "jev"
+
+        async def decide(self, req, candidates):
+            return RouteDecision(
+                router=RouterKind.jev,
+                executor="opus",
+                capability="strong",
+                confidence=0.95,
+                scores={"opus": 0.95},
+                judgments={
+                    "judgment": Judgment(kind="noul", value=True, confidence=0.9, probabilities={})
+                },
+                meta={
+                    "selection_notes": [
+                        "task needs judgment rather than execution; sent to a reasoning agent",
+                        low_corporate,
+                    ]
+                },
+            )
+
+    candidates = {
+        "x5": ExecutorSettings(adapter="opencode", model="x", tier="balanced"),
+        "opus": ExecutorSettings(adapter="claude", tier="strong"),
+    }
+    settings = Settings.model_validate(
+        {"routing": {"fallback_executor": "x5"}, "executors": candidates}
+    )
+
+    decision, _ = await decide_with_fallback(
+        DispatchRequest(task="x", cwd=".", max_capability="balanced"),
+        candidates,
+        settings,
+        [JudgmentChoice()],
+    )
+
+    notes = decision.meta["selection_notes"]
+    assert decision.executor == "x5"
+    assert not any("sent to a reasoning agent" in note for note in notes)
+    assert any("no reasoning agent within max_capability" in note for note in notes)
+    assert low_corporate in notes
+
+
+@pytest.mark.asyncio
 async def test_jev_error_then_claude_and_event():
     s = Settings.model_validate(
         {"executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}}}
