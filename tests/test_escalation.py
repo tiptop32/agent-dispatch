@@ -14,6 +14,7 @@ from agent_dispatch.models import (
     ExecutionResult,
     GuardReason,
     RouterKind,
+    VerificationInfo,
 )
 from agent_dispatch.models import TestsInfo as ResultTestsInfo
 from agent_dispatch.telemetry.storage import Storage
@@ -80,6 +81,21 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
             ),
             "tests_failed",
             id="failed-tests",
+        ),
+        pytest.param(
+            # Проверка демона прошла: самоотчёт «тесты упали» слабее неё. Живой
+            # случай 2026-10-15: x5 сделал задачу, verify прошёл, а работу
+            # выбросили из-за `tests: failed` в отчёте.
+            ExecutionResult(
+                status="completed",
+                executor="codex",
+                model=None,
+                summary="tests failed",
+                tests=ResultTestsInfo(result="failed"),
+                verification=VerificationInfo(result="passed"),
+            ),
+            None,
+            id="failed-tests-but-verify-passed",
         ),
         pytest.param(
             ExecutionResult(status="completed", executor="codex", model=None, summary="ok"),
