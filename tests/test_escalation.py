@@ -14,6 +14,7 @@ from agent_dispatch.models import (
     ExecutionResult,
     GuardReason,
     RouterKind,
+    VerificationInfo,
 )
 from agent_dispatch.models import TestsInfo as ResultTestsInfo
 from agent_dispatch.telemetry.storage import Storage
@@ -80,6 +81,21 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
             ),
             "tests_failed",
             id="failed-tests",
+        ),
+        pytest.param(
+            # Проверка демона прошла: самоотчёт «тесты упали» слабее неё. Живой
+            # случай 2026-10-15: x5 сделал задачу, verify прошёл, а работу
+            # выбросили из-за `tests: failed` в отчёте.
+            ExecutionResult(
+                status="completed",
+                executor="codex",
+                model=None,
+                summary="tests failed",
+                tests=ResultTestsInfo(result="failed"),
+                verification=VerificationInfo(result="passed"),
+            ),
+            None,
+            id="failed-tests-but-verify-passed",
         ),
         pytest.param(
             ExecutionResult(status="completed", executor="codex", model=None, summary="ok"),
@@ -236,6 +252,28 @@ async def test_failed_result_escalates_to_next_executor(tmp_path, git_repo):
 
 
 @pytest.mark.asyncio
+async def test_capability_ceiling_does_not_limit_explicit_escalation(tmp_path, git_repo):
+    storage, adapters, _, dispatcher = await _make_dispatcher(
+        tmp_path,
+        results={
+            "opencode/kimi": _result("opencode/kimi", "failed"),
+            "claude": _result("claude"),
+        },
+        escalation={"opencode/kimi": ["claude"]},
+    )
+    dispatcher.settings.executors["opencode/kimi"].tier = "balanced"
+    dispatcher.settings.executors["claude"].tier = "strong"
+
+    first = await dispatcher.submit(_request(git_repo, max_capability="balanced"))
+    records = await _wait_for_records(dispatcher, storage, 2)
+    child = next(record for record in records if record.escalated_from == first.task_id)
+
+    assert child.decision.executor == "claude"
+    assert child.request.max_capability == "balanced"
+    assert adapters["claude"].calls
+
+
+@pytest.mark.asyncio
 async def test_completed_result_requesting_escalation_escalates(tmp_path, git_repo):
     storage, _, _, dispatcher = await _make_dispatcher(
         tmp_path,
@@ -383,7 +421,9 @@ async def test_wait_timeout_returns_running_escalated_child(tmp_path, git_repo):
     gate = asyncio.Event()
     adapters["codex"].gate = gate
     parent = await dispatcher.submit(_request(git_repo))
-    done = await dispatcher.wait(parent.task_id, 0.05)
+    # Звено держит `gate`, поэтому окно не ослабляет проверку: оно нужно лишь
+    # на провал родителя и создание звена (с записью события `git`).
+    done = await dispatcher.wait(parent.task_id, 0.5)
     assert done.escalated_from == parent.task_id
     assert done.status in {"queued", "running"}
     gate.set()

@@ -273,8 +273,10 @@ async def test_cancelled_review_releases_review_capacity(tmp_path, git_repo):
     assert not waiting.started.is_set()
     await dispatcher.cancel(first.task_id)
     await _wait_started(waiting)
-    # Задачный слот никуда не делся: ревью и задача идут одновременно.
-    assert coding.started.is_set()
+    # Задачный слот никуда не делся: ревью и задача идут одновременно. Старт
+    # ждётся, а не проверяется мгновенно: задача ещё готовит своё дерево.
+    await _wait_started(coding)
+    assert waiting.started.is_set()
     for task_id in (second.task_id, filler.task_id):
         await dispatcher.cancel(task_id)
 

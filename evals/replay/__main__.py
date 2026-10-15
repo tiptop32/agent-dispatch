@@ -9,22 +9,25 @@ from pathlib import Path
 from agent_dispatch.config import load_settings
 
 from .harness import (
+    GitLocator,
     acceptance,
     children_refusals,
     default_limit_group,
     delegations,
+    exploration_comparison,
     load,
     load_decisions,
     render,
     replay,
     router_vs_static,
+    timeouts,
 )
 
 
 def main() -> int:
     settings = load_settings()
     parser = argparse.ArgumentParser(description="Replay dispatcher rules over live telemetry.")
-    parser.add_argument("--db", type=Path, default=settings.server.data_dir / "dispatch.db")
+    parser.add_argument("--db", type=Path, default=settings.db_path)
     parser.add_argument("--cooldown", type=int, default=settings.routing.failure_cooldown_seconds)
     parser.add_argument(
         "--since",
@@ -76,15 +79,26 @@ def main() -> int:
     )
     report["children_refusals"] = children_refusals(tasks, settings.routing.max_children)
     report["delegations"] = delegations(tasks)
+    report["timeouts"] = timeouts(tasks)
+    # Один locator на прогон: дифы эксперимента судятся второй раз из кэша.
+    locator = GitLocator()
     if not args.no_git:
-        report["acceptance"] = acceptance(tasks, window_hours=args.accept_window_hours)
+        report["acceptance"] = acceptance(tasks, locator, window_hours=args.accept_window_hours)
+    decisions = load_decisions(args.db)
     report["router_vs_static"] = router_vs_static(
-        load_decisions(args.db),
+        decisions,
         tasks,
         executors,
         baseline_tier=args.baseline_tier,
         corporate_min_confidence=settings.routing.corporate_min_confidence,
         corporate_perimeter=settings.routing.corporate_perimeter,
+    )
+    report["exploration"] = exploration_comparison(
+        decisions,
+        tasks,
+        locator,
+        window_hours=args.accept_window_hours,
+        with_acceptance=not args.no_git,
     )
     print(json.dumps(report, indent=2, ensure_ascii=False) if args.json else render(report))
     return 0

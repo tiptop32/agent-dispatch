@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -22,6 +23,7 @@ from agent_dispatch.models import (
     TaskView,
 )
 from agent_dispatch.server import run_server
+from agent_dispatch.telemetry.storage import Storage
 
 app = typer.Typer(
     name="agent-dispatch",
@@ -126,6 +128,7 @@ def _request(
     constraints: list[str] | None,
     *,
     executor: str | None = None,
+    max_capability: str | None = None,
     wait: int = 1800,
     timeout: int | None = None,
     allow_escalation: bool = True,
@@ -141,6 +144,7 @@ def _request(
         constraints=constraints or [],
         source_agent=SourceAgent.cli,
         executor=executor,
+        max_capability=max_capability,
         wait_seconds=wait,
         timeout_seconds=timeout,
         allow_escalation=allow_escalation,
@@ -188,13 +192,16 @@ def route(
     context: str | None = typer.Option(None),
     files: list[str] | None = typer.Option(None, "--file"),  # noqa: B008
     constraints: list[str] | None = typer.Option(None, "--constraint"),  # noqa: B008
+    max_capability: str | None = typer.Option(None, "--max-capability"),
     kind: str = typer.Option(
         "task", help="task changes code; review reads the working copy and reports findings."
     ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     decision = _daemon_call(
-        "route", _request(task, cwd, context, files, constraints, kind=kind), start=True
+        "route",
+        _request(task, cwd, context, files, constraints, kind=kind, max_capability=max_capability),
+        start=True,
     )
     if as_json:
         typer.echo(decision.model_dump_json(indent=2))
@@ -217,6 +224,7 @@ def dispatch(
     files: list[str] | None = typer.Option(None, "--file"),  # noqa: B008
     constraints: list[str] | None = typer.Option(None, "--constraint"),  # noqa: B008
     executor: str | None = typer.Option(None),
+    max_capability: str | None = typer.Option(None, "--max-capability"),
     wait: int = typer.Option(1800, min=0),
     timeout: int | None = typer.Option(None, min=1),
     poll_seconds: float = typer.Option(2.0, "--poll", min=0.0, help="Polling interval in seconds."),
@@ -241,6 +249,7 @@ def dispatch(
                 files,
                 constraints,
                 executor=executor,
+                max_capability=max_capability,
                 wait=wait,
                 timeout=timeout,
                 allow_escalation=not no_escalation,
@@ -330,15 +339,104 @@ def cooldown_clear(names: list[str] | None = typer.Argument(None)) -> None:  # n
     typer.echo(f"cleared: {', '.join(cleared) if cleared else '(none)'}")
 
 
-@app.command("worktrees", help="List or clean up AgentDispatch worktrees of a repository.")
+def _format_age(seconds: float) -> str:
+    if seconds >= 86400:
+        return f"{int(seconds // 86400)}d"
+    if seconds >= 3600:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 60)}m"
+
+
+async def _task_status(storage: Storage, task_id: str) -> str:
+    record = await storage.get_task(task_id)
+    return record.status.value if record else "unknown"
+
+
+async def _keep_reason(storage: Storage, stored: worktree.StoredWorktree) -> str | None:
+    """Почему дерево удалять нельзя; None, если можно.
+
+    База читается заново для каждого дерева прямо перед удалением: демон мог
+    принять задачу с cwd в этом дереве, пока CLI обходил остальные.
+    """
+    status = await _task_status(storage, stored.path.name)
+    if status not in FINAL_STATUSES:
+        return f"unfinished task ({status})"
+    active = await storage.list_active_tasks()
+    if worktree.holds_cwd(stored.path, [task.request.cwd for task in active]):
+        return "active task cwd"
+    return None
+
+
+def _remove_stored(
+    base: Path, stored: worktree.StoredWorktree, keep_branches: bool
+) -> tuple[str, str]:
+    """Удаляет дерево; (итог, пояснение) для вывода."""
+    try:
+        # Перед самим удалением: каталог могли подменить симлинком после обхода.
+        worktree.ensure_stored_path(base, stored.path)
+    except worktree.WorktreeError as error:
+        return "kept", str(error)
+    try:
+        if not stored.repo_exists:
+            worktree.remove_orphaned_directory(stored)
+            return "removed", "repository missing"
+        worktree.remove(
+            worktree.Worktree(path=stored.path, branch=stored.branch, repo=stored.repo),
+            keep_branch=keep_branches,
+        )
+    except worktree.WorktreeError as error:
+        return "ERROR", str(error)
+    return "removed", stored.branch
+
+
+async def _worktrees_all(settings: Settings, clean: bool, keep_branches: bool) -> None:
+    base = settings.worktree_base
+    trees = worktree.list_stored_worktrees(base)
+    if not trees:
+        typer.echo("no agent-dispatch worktrees")
+        return
+    storage = Storage(settings.db_path)
+    await storage.open()
+    try:
+        current_repo: Path | None = None
+        for stored in sorted(trees, key=lambda item: (str(item.repo), str(item.path))):
+            if stored.repo != current_repo:
+                suffix = " (repository missing)" if not stored.repo_exists else ""
+                typer.echo(f"repository\t{stored.repo}{suffix}")
+                current_repo = stored.repo
+            if not clean:
+                status = await _task_status(storage, stored.path.name)
+                typer.echo(
+                    f"{stored.path}\t{stored.branch}\tage={_format_age(stored.age_seconds)}"
+                    f"\tstatus={status}"
+                )
+                continue
+            # Проверки «оставить» идут раньше любого удаления, в том числе
+            # каталога с исчезнувшим репозиторием: работающая задача важнее.
+            reason = await _keep_reason(storage, stored)
+            outcome, detail = (
+                ("kept", reason) if reason else _remove_stored(base, stored, keep_branches)
+            )
+            typer.echo(f"{stored.path}\t{outcome}\t{detail}")
+    finally:
+        await storage.close()
+
+
+@app.command("worktrees", help="List or clean up AgentDispatch worktrees.")
 def worktrees(
     cwd: str = typer.Option(".", help="Any path inside the repository."),
+    all_repositories: bool = typer.Option(
+        False, "--all", help="Inspect worktrees of every repository in the data directory."
+    ),
     clean: bool = typer.Option(False, "--clean", help="Remove the listed worktrees."),
     keep_branches: bool = typer.Option(
         True, "--keep-branches/--delete-branches", help="Keep branches when cleaning."
     ),
 ) -> None:
     settings = load_settings()
+    if all_repositories:
+        asyncio.run(_worktrees_all(settings, clean, keep_branches))
+        return
     prefix = settings.execution.branch_prefix
     try:
         trees = worktree.list_worktrees(cwd, prefix)

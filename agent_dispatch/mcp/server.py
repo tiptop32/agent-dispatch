@@ -6,7 +6,7 @@ import os
 import sys
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -255,6 +255,7 @@ def build_server(
         constraints: list[str] | None = None,
         success_criteria: list[str] | None = None,
         context_mode: str = "prompt+summary",
+        max_capability: Literal["fast", "balanced", "strong"] | None = None,
         kind: str = "task",
         verbose: bool = False,
     ) -> str:
@@ -270,6 +271,7 @@ def build_server(
                     constraints=constraints or [],
                     success_criteria=success_criteria or [],
                     context_mode=ContextMode(context_mode),
+                    max_capability=max_capability,
                     kind=kind,
                 )
             )
@@ -295,6 +297,7 @@ def build_server(
         allow_escalation: bool,
         wait_seconds: int | None,
         timeout_seconds: int | None,
+        max_capability: Literal["fast", "balanced", "strong"] | None,
         verbose: bool,
         kind: str = "task",
         verify: list[str] | None = None,
@@ -315,6 +318,7 @@ def build_server(
                 allow_escalation=allow_escalation,
                 wait_seconds=wait,
                 timeout_seconds=timeout_seconds,
+                max_capability=max_capability,
                 kind=kind,
                 verify=verify or [],
             )
@@ -339,6 +343,7 @@ def build_server(
         allow_escalation: bool = True,
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
+        max_capability: Literal["fast", "balanced", "strong"] | None = None,
         kind: str = "task",
         verify: list[str] | None = None,
         verbose: bool = False,
@@ -355,6 +360,7 @@ def build_server(
             allow_escalation,
             wait_seconds,
             timeout_seconds,
+            max_capability,
             verbose,
             kind,
             verify,
@@ -397,6 +403,7 @@ def build_server(
             allow_escalation,
             wait_seconds,
             timeout_seconds,
+            None,
             verbose,
             kind,
             verify,

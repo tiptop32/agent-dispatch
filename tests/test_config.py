@@ -19,12 +19,21 @@ def test_defaults_without_user_files_are_working(tmp_config_dir: Path) -> None:
     assert settings.server.host == "127.0.0.1"
     assert settings.server.port == 7433
     assert settings.routing.fallback_executor == "codex"
+    assert settings.routing.explore_share == 0.0
     assert settings.execution.idle_timeout_seconds == 900
     assert set(settings.enabled_executors()) == {
         "claude",
         "codex",
         "opencode/kimi",
     }
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01])
+def test_explore_share_must_be_a_probability(tmp_config_dir: Path, value: float) -> None:
+    (tmp_config_dir / "config.yaml").write_text(f"routing:\n  explore_share: {value}\n")
+
+    with pytest.raises(ConfigError, match=r"routing\.explore_share"):
+        load_settings(tmp_config_dir)
 
 
 def test_full_file_parses_into_settings(tmp_config_dir: Path) -> None:
@@ -303,7 +312,8 @@ def test_max_children_defaults_to_two(tmp_config_dir: Path) -> None:
 def test_concurrency_limits_have_working_defaults(tmp_config_dir: Path) -> None:
     settings = load_settings(tmp_config_dir)
 
-    assert settings.server.max_concurrent_tasks == 2
+    assert settings.server.max_concurrent_tasks == 4
+    assert settings.server.max_concurrent_per_group == 2
     assert settings.server.max_concurrent_reviews == 1
 
 
@@ -312,6 +322,7 @@ def test_concurrency_limits_have_working_defaults(tmp_config_dir: Path) -> None:
     ("field", "message"),
     [
         ("max_concurrent_tasks", r"server\.max_concurrent_tasks"),
+        ("max_concurrent_per_group", r"server\.max_concurrent_per_group"),
         ("max_concurrent_reviews", r"server\.max_concurrent_reviews"),
     ],
 )

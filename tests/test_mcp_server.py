@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import UTC, datetime
 
@@ -109,9 +110,15 @@ async def test_dispatch_body_and_auth(tmp_path, monkeypatch):
     route = respx.post("http://127.0.0.1:7433/tasks").mock(
         return_value=httpx.Response(200, json=view("running").model_dump(mode="json"))
     )
-    r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
+    r = await call(
+        settings(tmp_path),
+        "dispatch",
+        {"task": "fix", "cwd": ".", "max_capability": "balanced"},
+    )
     assert route.calls[0].request.headers["authorization"] == "Bearer secret"
-    assert route.calls[0].request.read() and "fix" in route.calls[0].request.content.decode()
+    body = route.calls[0].request.read()
+    assert body and "fix" in route.calls[0].request.content.decode()
+    assert json.loads(body)["max_capability"] == "balanced"
     assert r.is_error is False
 
 
@@ -159,6 +166,26 @@ async def test_compact_output_shows_a_failed_integration(tmp_path):
     )
     r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
     assert "integration_error: patch does not apply: a.py" in r.content[0].text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compact_output_keeps_max_children_advice(tmp_path):
+    # Отказ max_children называет работающих sibling'ов и совет status:
+    # компактный ответ обязан донести этот текст целиком, иначе вызывающий
+    # снова dispatch'ует вместо того, чтобы дождаться sibling.
+    refusal = view(status="failed", summary="")
+    refusal.result.error = (
+        "sibling count 2 >= 2; running siblings: aaaa, bbbb;"
+        " wait for one via status(task_id, wait_seconds) instead of dispatching again"
+    )
+    respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(200, json=refusal.model_dump(mode="json"))
+    )
+    r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
+    text = r.content[0].text
+    assert "error: sibling count 2 >= 2; running siblings: aaaa, bbbb" in text
+    assert "status(task_id, wait_seconds) instead of dispatching again" in text
 
 
 @pytest.mark.asyncio

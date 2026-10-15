@@ -56,6 +56,7 @@ FINAL_STATUSES: frozenset[TaskStatus] = frozenset(
 
 class RouterKind(StrEnum):
     jev = "jev"
+    explore = "explore"
     claude_local = "claude_local"
     fallback = "fallback"
     override = "override"
@@ -93,6 +94,7 @@ class DispatchRequest(_Model):
     context_mode: ContextMode = ContextMode.prompt_summary
     source_agent: SourceAgent = SourceAgent.unknown
     executor: str | None = None
+    max_capability: Literal["fast", "balanced", "strong"] | None = None
     allow_escalation: bool = True
     wait_seconds: int = Field(1800, ge=0)
     timeout_seconds: int | None = None

@@ -14,6 +14,12 @@ def should_escalate(result: ExecutionResult) -> str | None:
         # `tests: passed`, не запуская их.
         return "verification_failed"
     if result.tests is not None and result.tests.result == "failed":
+        # И наоборот: прошедшая проверка демона сильнее самоотчёта «упали».
+        # Исполнитель мог гонять что-то шире гейта вызывающего или ошибиться
+        # в отчёте; выбрасывать работу, прошедшую гейт, дороже. Отчёт остаётся
+        # в результате, судит вызывающий.
+        if result.verification is not None and result.verification.result == "passed":
+            return None
         return "tests_failed"
     if result.status == "partial" and result.meta.get("parse_error") and not result.changed_files:
         # Исполнитель не отдал отчёт и не тронул ни одного файла: работы нет.

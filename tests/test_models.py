@@ -48,6 +48,11 @@ def test_dispatch_request_hop_defaults_to_zero() -> None:
     assert DispatchRequest(**request_data()).hop == 0
 
 
+def test_dispatch_request_rejects_unknown_max_capability() -> None:
+    with pytest.raises(ValidationError):
+        DispatchRequest(**request_data(max_capability="unlimited"))
+
+
 @pytest.mark.parametrize("file_name", ["../secret", "src/../secret", "/etc/passwd"])
 def test_dispatch_request_rejects_unsafe_file_paths(file_name: str) -> None:
     with pytest.raises(ValidationError):

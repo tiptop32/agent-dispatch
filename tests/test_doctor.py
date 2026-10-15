@@ -20,6 +20,7 @@ from agent_dispatch.doctor import (
     install_check,
     run_checks,
     stale_files,
+    worktrees_check,
 )
 from agent_dispatch.serve_state import ServeState, write_state
 
@@ -47,10 +48,16 @@ def _configure(
     key: str | None = None,
     backend: str = "jev",
     claude_command: str = "claude",
+    codex_command: str | None = None,
 ):
     lines = []
     for name in ("claude", "codex", "opencode/kimi"):
-        command = "/nonexistent" if name == broken else str(FAKE)
+        if name == broken:
+            command = "/nonexistent"
+        elif name == "codex" and codex_command is not None:
+            command = codex_command
+        else:
+            command = str(FAKE)
         lines.extend([f"  {name}:", f'    command: "{command}"'])
     (tmp_config_dir / "config.yaml").write_text(
         f"router:\n  backend: {backend}\n  claude_local:\n    command: {claude_command!r}\n"
@@ -158,6 +165,71 @@ async def test_run_checks_includes_codex_env_vars_check(tmp_config_dir, monkeypa
 
     check = next(c for c in checks if c.name == "codex-env-vars")
     assert not check.ok and CODEX_ENV_VARS_LINE in check.detail
+
+
+@pytest.mark.asyncio
+async def test_executor_check_names_a_key_trapped_in_the_dispatch_env_file(
+    tmp_config_dir, tmp_path
+):
+    # Wrapper codex-agent-lb падает до `exec`, если ключа нет в его env. Ключ
+    # в env-файле agent-dispatch туда не попадёт: child_env вырезает секреты.
+    wrapper = tmp_path / "codex-agent-lb"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "echo 'codex-agent-lb: Missing environment variable: AGENT_LB_API_KEY' >&2\n"
+        "exit 78\n"
+    )
+    wrapper.chmod(0o755)
+    value = "lb-secret-value"  # pragma: allowlist secret
+    settings = _configure(tmp_config_dir, codex_command=str(wrapper))
+    (tmp_config_dir / "env").write_text(f"AGENT_LB_API_KEY={value}\n")
+    settings = load_settings()
+
+    checks = await run_checks(settings)
+
+    check = next(c for c in checks if c.name == "executor:codex")
+    assert not check.ok
+    assert "AGENT_LB_API_KEY is in the agent-dispatch env file" in check.detail
+    assert value not in check.detail
+
+
+@pytest.mark.asyncio
+async def test_executor_check_gives_no_env_file_hint_for_a_process_env_key(
+    tmp_config_dir, tmp_path, monkeypatch
+):
+    # Ключ роутера только в окружении демона: совет «переложить из env-файла» был бы ложью.
+    wrapper = tmp_path / "codex-agent-lb"
+    wrapper.write_text(
+        "#!/bin/sh\necho 'Missing environment variable: OPENROUTER_API_KEY' >&2\nexit 78\n"
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "from-process-env")
+    settings = _configure(tmp_config_dir, codex_command=str(wrapper))
+
+    checks = await run_checks(settings)
+
+    check = next(c for c in checks if c.name == "executor:codex")
+    assert not check.ok and "agent-dispatch env file" not in check.detail
+
+
+def test_worktrees_check_warns_about_old_trees_and_reports_total_size(tmp_config_dir, git_repo):
+    from agent_dispatch.executors import worktree
+
+    settings = _configure(tmp_config_dir)
+    tree = worktree.create(
+        git_repo,
+        settings.server.data_dir / "worktrees" / "old-task",
+        "agent-dispatch/old-task",
+    )
+    old = datetime.now().timestamp() - 8 * 86400
+    os.utime(tree.path / ".git", (old, old))
+
+    check = worktrees_check(settings)
+
+    assert check.ok and check.warning
+    assert "1 trees" in check.detail and "total" in check.detail
+    assert "1 older than 7 days" in check.detail
+    assert format_checks([check]).startswith("WARN  worktrees:")
 
 
 @pytest.fixture(autouse=True)

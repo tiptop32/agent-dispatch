@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,6 +34,17 @@ class Worktree:
     #: Пустая строка у деревьев, найденных через `list_worktrees`: там базу взять
     #: неоткуда, и патч возвращается к отсчёту от HEAD.
     base: str = ""
+
+
+@dataclass(frozen=True)
+class StoredWorktree:
+    """Worktree из общего каталога AgentDispatch, найденный без исходного cwd."""
+
+    path: Path
+    branch: str
+    repo: Path
+    age_seconds: float
+    repo_exists: bool
 
 
 def _git(args: list[str], cwd: str | Path) -> subprocess.CompletedProcess[str]:
@@ -67,6 +79,59 @@ def repo_root(cwd: str | Path) -> Path:
     if result.returncode != 0:
         raise WorktreeError(f"not a git repository: {cwd}")
     return Path(result.stdout.strip())
+
+
+def git_location(cwd: str | Path) -> dict[str, str | None] | None:
+    """Общий git dir (абсолютный) и ветка cwd; None, если cwd не git.
+
+    Вызывающий часто работает в своём feature-worktree и удаляет его после
+    слияния. Коммиты остаются в общем git dir, по нему `evals.replay` и судит,
+    принят ли диф исполнителя.
+    """
+    common = common_dir(cwd)
+    if common is None:
+        return None
+    try:
+        # cwd могли удалить между двумя вызовами: ветка тогда просто неизвестна.
+        branch = _git(["symbolic-ref", "--short", "-q", "HEAD"], cwd).stdout.strip()
+    except WorktreeError:
+        branch = ""
+    return {"common_dir": common, "branch": branch or None}
+
+
+def common_dir(cwd: str | Path) -> str | None:
+    """Абсолютный общий git dir каталога; None, если он не в git или его нет."""
+    try:
+        proc = _git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd)
+    except WorktreeError:
+        return None
+    return proc.stdout.strip() or None if proc.returncode == 0 else None
+
+
+def holds_cwd(tree_path: Path, cwds: list[str]) -> bool:
+    """Лежит ли один из cwd в дереве (или совпадает с ним).
+
+    Дерево с cwd незавершённой задачи нельзя убирать: ни демону после задачи,
+    ни человеку через `worktrees --clean`.
+    """
+    root = tree_path.expanduser().resolve()
+    for cwd in cwds:
+        path = Path(cwd).expanduser().resolve()
+        if path == root or root in path.parents:
+            return True
+    return False
+
+
+def ensure_stored_path(base: str | Path, path: Path) -> None:
+    """Проверка на границе удаления: путь это настоящий каталог прямо в base.
+
+    Инвентаризация уже отсеяла симлинки, но между ней и удалением каталог
+    могли подменить симлинком на чужой worktree.
+    """
+    if path.is_symlink() or not path.is_dir():
+        raise WorktreeError(f"not a plain directory: {path}")
+    if path.resolve().parent != Path(base).expanduser().resolve():
+        raise WorktreeError(f"outside the worktree directory: {path}")
 
 
 def _main_repo_root(cwd: str | Path) -> Path:
@@ -323,3 +388,86 @@ def list_worktrees(cwd: str | Path, prefix: str) -> list[Worktree]:
                 found.append(Worktree(path=path, branch=branch, repo=root))
             path = None
     return found
+
+
+def directory_size(path: Path) -> int:
+    """Считает размер файлов дерева, не переходя по симлинкам.
+
+    Обход всех файлов дорог (гигабайты в node_modules и .venv), поэтому
+    размер считает только тот, кому он нужен (`doctor`), а не инвентаризация.
+    """
+    total = 0
+    for root, _directories, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat(follow_symlinks=False).st_size
+            except OSError:
+                # Дерево может меняться параллельно с doctor; пропавший файл не
+                # должен обрывать инвентаризацию остальных каталогов.
+                continue
+    return total
+
+
+def _stored_worktree(path: Path, now: float) -> StoredWorktree | None:
+    marker = path / ".git"
+    try:
+        line = marker.read_text().strip()
+        if not line.startswith("gitdir: "):
+            return None
+        git_dir = Path(line.removeprefix("gitdir: "))
+        if not git_dir.is_absolute():
+            git_dir = (path / git_dir).resolve()
+        common_file = git_dir / "commondir"
+        if common_file.is_file():
+            common_dir = (git_dir / common_file.read_text().strip()).resolve()
+        else:
+            # Обычный linked worktree лежит в <common>/.git/worktrees/<name>.
+            common_dir = git_dir.parent.parent
+        repo = common_dir.parent if common_dir.name == ".git" else common_dir
+        repo_exists = common_dir.is_dir() and repo.is_dir()
+        branch = "-"
+        head = git_dir / "HEAD"
+        if head.is_file():
+            value = head.read_text().strip()
+            branch = value.removeprefix("ref: refs/heads/") if value.startswith("ref: ") else value
+        age_seconds = max(0.0, now - marker.stat().st_mtime)
+    except OSError:
+        return None
+    return StoredWorktree(
+        path=path,
+        branch=branch,
+        repo=repo,
+        age_seconds=age_seconds,
+        repo_exists=repo_exists,
+    )
+
+
+def list_stored_worktrees(base: str | Path, *, now: float | None = None) -> list[StoredWorktree]:
+    """Находит worktree всех репозиториев в каталоге данных AgentDispatch."""
+    root = Path(base).expanduser()
+    try:
+        children = sorted(root.iterdir())
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise WorktreeError(f"cannot read worktree directory {root}: {exc}") from exc
+    moment = time.time() if now is None else now
+    resolved_root = root.resolve()
+    # Только настоящие каталоги прямо в base: симлинк с именем задачи мог бы
+    # увести `--clean` в чужой worktree вне каталога данных.
+    return [
+        tree
+        for path in children
+        if not path.is_symlink() and path.is_dir() and path.resolve().parent == resolved_root
+        if (tree := _stored_worktree(path, moment))
+    ]
+
+
+def remove_orphaned_directory(tree: StoredWorktree) -> None:
+    """Удаляет каталог дерева, git-репозиторий которого уже исчез."""
+    if tree.repo_exists:
+        raise WorktreeError(f"repository still exists: {tree.repo}")
+    try:
+        shutil.rmtree(tree.path)
+    except OSError as exc:
+        raise WorktreeError(f"cannot remove {tree.path}: {exc}") from exc

@@ -15,6 +15,9 @@ class ProcessOutcome:
     duration_ms: int
     stalled: bool = False
     idle_seconds: float | None = None
+    #: Сколько секунд CLI молчал (stdout и stderr) к моменту жёсткого таймаута.
+    #: Отличает агента, работавшего до конца, от зависшего. None без таймаута.
+    last_output_age_s: float | None = None
 
 
 async def run_cli(
@@ -106,6 +109,7 @@ async def run_cli(
 
     timed_out = False
     stalled = False
+    last_output_age_s: float | None = None
     idle_limit = idle_timeout_seconds if idle_timeout_seconds and idle_timeout_seconds > 0 else None
     process_wait = asyncio.create_task(process.wait())
     try:
@@ -114,6 +118,8 @@ async def run_cli(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
+                # До SIGTERM: вывод при завершении не должен сбросить счётчик.
+                last_output_age_s = round(time.monotonic() - last_output_at, 1)
                 await terminate_group()
                 break
             poll = min(remaining, 1.0)
@@ -148,4 +154,5 @@ async def run_cli(
         duration_ms=int((time.monotonic() - started_at) * 1000),
         stalled=stalled,
         idle_seconds=idle_limit,
+        last_output_age_s=last_output_age_s,
     )

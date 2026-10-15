@@ -19,12 +19,16 @@ class _ConfigModel(BaseModel):
 class ServerSettings(_ConfigModel):
     host: str = "127.0.0.1"
     port: int = 7433
-    #: Корневые задачи на правку (hop 0, kind: task) идут через этот пул.
-    #: Корневые ревью имеют собственный `max_concurrent_reviews`, поэтому
-    #: долгая задача не съедает ёмкость ревью и наоборот. Отсюда максимум
-    #: корневых CLI-процессов демона равен сумме обоих пределов
-    #: (max_concurrent_tasks + max_concurrent_reviews), а не только этому числу.
-    max_concurrent_tasks: int = Field(2, ge=1)
+    #: Общий потолок корневых задач на правку (hop 0, kind: task) поверх
+    #: отдельных пулов `max_concurrent_per_group`. При дефолтах одновременно
+    #: работают не больше четырёх задач и одного ревью, то есть пяти корневых
+    #: CLI-процессов. В общем случае максимум равен сумме этого предела и
+    #: `max_concurrent_reviews`.
+    max_concurrent_tasks: int = Field(4, ge=1)
+    #: Ёмкость каждой `ExecutorSettings.resolved_limit_group`. Задача сначала
+    #: занимает этот слот, потом общий: ожидание занятой группы не блокирует
+    #: свободную группу общим слотом.
+    max_concurrent_per_group: int = Field(2, ge=1)
     #: Собственная ёмкость корневых ревью (hop 0, kind: review). Лишние ревью
     #: ждут своей очереди, задачи их не блокируют. Вложенная работа (hop > 0)
     #: идёт мимо обоих пулов, как раньше.
@@ -64,6 +68,9 @@ class RoutingSettings(_ConfigModel):
     min_confidence: float = 0.60
     autonomous_confidence: float = 0.85
     min_margin: float = 0.10
+    #: Доля пригодных решений Jev, в которых запускается статический balanced-
+    #: исполнитель. Разбиение детерминировано по task_id и переживает рестарты.
+    explore_share: float = Field(0.0, ge=0.0, le=1.0)
     #: Куда уходит задача без уверенного решения роутера. Строка или упорядоченный
     #: список: берётся первый доступный кандидат, остальные идут резервом.
     fallback_executor: str | list[str] = "codex"
@@ -171,6 +178,9 @@ class ExecutorSettings(_ConfigModel):
     #: сброс относится к одному аккаунту, следующий запрос уйдёт на другой,
     #: поэтому исполнитель перепроверяется через `routing.quota_cooldown_seconds`.
     limit_reset: Literal["announced", "recheck"] = "announced"
+    #: Жёсткий таймаут задач этого исполнителя, секунды. Запрос с
+    #: `timeout_seconds` сильнее, без обоих действует `routing.default_timeout_seconds`.
+    timeout_seconds: int | None = Field(None, ge=1)
 
     @model_validator(mode="after")
     def validate_adapter(self) -> ExecutorSettings:
@@ -217,6 +227,31 @@ class Settings(_ConfigModel):
                 if target not in names:
                     raise ValueError(f"escalation.{source}[{index}]: unknown executor {target!r}")
         return self
+
+    def timeout_for(self, executor: str, requested: int | None = None) -> int:
+        """Жёсткий таймаут запуска: запрос, затем исполнитель, затем `routing`."""
+        item = self.executors.get(executor)
+        return (
+            requested
+            or (item.timeout_seconds if item else None)
+            or self.routing.default_timeout_seconds
+        )
+
+    def limit_group(self, executor: str) -> str:
+        """Общая квота исполнителя; неизвестное имя — сама себе группа."""
+        item = self.executors.get(executor)
+        return item.resolved_limit_group(executor) if item else executor
+
+    @property
+    def worktree_base(self) -> Path:
+        """Каталог деревьев исполнителей: одно место для демона, CLI и doctor."""
+        return Path(
+            self.execution.worktree_dir or (self.server.data_dir / "worktrees")
+        ).expanduser()
+
+    @property
+    def db_path(self) -> Path:
+        return self.server.data_dir / "dispatch.db"
 
     def enabled_executors(self) -> dict[str, ExecutorSettings]:
         return {name: executor for name, executor in self.executors.items() if executor.enabled}

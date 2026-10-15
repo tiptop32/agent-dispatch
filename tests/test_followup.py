@@ -183,7 +183,10 @@ async def test_followup_resumes_the_executor_session_in_place(tmp_path, git_repo
     _, adapters, dispatcher = await _make(tmp_path)
     adapters["codex"].results = [_ok("codex", "s1"), _ok("codex", "s1")]
     first = await _done(
-        dispatcher, (await dispatcher.submit(_req(git_repo, verify=["true"]))).task_id
+        dispatcher,
+        (
+            await dispatcher.submit(_req(git_repo, verify=["true"], max_capability="balanced"))
+        ).task_id,
     )
 
     record = await dispatcher.followup(first.task_id, FollowupRequest(message="also handle None"))
@@ -193,6 +196,7 @@ async def test_followup_resumes_the_executor_session_in_place(tmp_path, git_repo
     assert done.request.followup_of == first.task_id
     assert done.request.task == "also handle None"
     assert done.request.verify == ["true"]  # проверка наследуется
+    assert done.request.max_capability == "balanced"
     assert done.decision.executor == "codex"
     ctx = adapters["codex"].calls[-1]
     assert ctx.resume_session == "s1"

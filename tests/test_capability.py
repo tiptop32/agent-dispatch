@@ -40,6 +40,36 @@ def test_each_capability_picks_its_tier(capability, expected):
     assert select(capability, FULL).executor == expected
 
 
+def test_max_capability_caps_the_tier_before_selection():
+    selection = select("strong", FULL, max_capability="balanced")
+
+    assert selection.executor == "codex"
+    assert selection.capability == "balanced"
+    assert selection.capability_uncapped == "strong"
+    assert "capability capped: strong -> balanced (max_capability)" in selection.notes
+
+
+def test_judgment_does_not_lift_a_task_over_the_ceiling():
+    # Единственный reasoning-исполнитель уровня strong: «нужно суждение» не
+    # должно молча обойти потолок вызывающего (живой случай 2026-10-15).
+    selection = select("strong", FULL, max_capability="balanced", judgment=True)
+
+    assert selection.executor == "codex"
+    assert any("no reasoning agent within max_capability" in n for n in selection.notes)
+
+
+def test_judgment_inside_the_ceiling_still_picks_a_reasoning_agent():
+    pool = {**FULL, "sonnet": ex("claude", "balanced")}
+
+    assert select("strong", pool, max_capability="balanced", judgment=True).executor == "sonnet"
+
+
+def test_corporate_perimeter_stays_stronger_than_the_ceiling():
+    pool = {"codex": ex("codex", "balanced"), "secure": ex("opencode", "strong", corporate=True)}
+
+    assert select("strong", pool, max_capability="balanced", corporate=True).executor == "secure"
+
+
 def test_missing_tier_falls_upward_then_downward():
     only_strong_and_fast = {"cheap": ex("opencode", "fast"), "opus": ex("claude", "strong")}
     # balanced нет: берём следующий вверх, а не вниз, чтобы задача не провалилась.

@@ -14,17 +14,22 @@ from agent_dispatch.models import ExecutionResult
 from evals.replay.harness import (
     Acceptance,
     Decision,
+    GitLocator,
+    GitRepo,
     Task,
+    Unknown,
     acceptance,
     added_lines,
     children_refusals,
     delegations,
+    exploration_comparison,
     git_acceptance,
     load,
     load_decisions,
     render,
     replay,
     router_vs_static,
+    timeouts,
 )
 
 SCHEMA = Path(__file__).parent.parent / "agent_dispatch" / "telemetry" / "schema.sql"
@@ -72,6 +77,20 @@ def _db(tmp_path: Path, rows: list[tuple]) -> Path:
     conn.commit()
     conn.close()
     return path
+
+
+def _slot_event(path: Path, task_id: str, group: str, wait_seconds: float) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "insert into events (task_id, ts, kind, payload_json) values (?, ?, 'slot', ?)",
+        (
+            task_id,
+            "2026-09-23T12:00:00+00:00",
+            json.dumps({"limit_group": group, "wait_seconds": wait_seconds}),
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 def test_replay_counts_runs_sent_to_an_executor_that_was_down(tmp_path):
@@ -237,6 +256,62 @@ def test_replay_avoidable_uses_spawn_time_and_only_finished_cooldowns(tmp_path):
 
     assert report["avoidable_runs"] == []
     assert report["avoidable_minutes"] == 0.0
+
+
+def test_replay_reports_queue_wait_by_limit_group_from_slot_events_only(tmp_path):
+    db = _db(
+        tmp_path,
+        [
+            ("a" * 32, "codex/sol", "10:00", "10:01", 1, None, _result("completed")),
+            ("b" * 32, "codex/sol", "10:02", "10:03", 1, None, _result("completed")),
+            (
+                "c" * 32,
+                "opencode/x5",
+                "10:04",
+                "10:05",
+                1,
+                None,
+                _result("completed"),
+            ),
+            # Старая задача без slot-события в новую метрику не попадает.
+            ("d" * 32, "codex/sol", "10:06", "10:07", 1, None, _result("completed")),
+        ],
+    )
+    _slot_event(db, "a" * 32, "codex", 30.0)
+    _slot_event(db, "b" * 32, "codex", 90.0)
+    _slot_event(db, "c" * 32, "opencode:x5", 120.0)
+
+    report = replay(load(db))
+
+    assert report["queue_wait_by_limit_group"] == {
+        "codex": {
+            "samples": 2,
+            "waited_over_60_seconds": 1,
+            "avg_seconds": 60.0,
+            "max_seconds": 90.0,
+        },
+        "opencode:x5": {
+            "samples": 1,
+            "waited_over_60_seconds": 1,
+            "avg_seconds": 120.0,
+            "max_seconds": 120.0,
+        },
+    }
+    text = render(report)
+    assert "queue wait by limit group (slot events only):" in text
+    assert "codex: 1 over 60 s of 2, avg 60.0 s, max 90.0 s" in text
+    assert "no slot events yet" not in text
+
+
+def test_replay_says_when_there_are_no_slot_events(tmp_path):
+    db = _db(
+        tmp_path,
+        [("a" * 32, "codex/sol", "10:00", "10:01", 1, None, _result("completed"))],
+    )
+
+    text = render(replay(load(db)))
+
+    assert "queue wait by limit group (slot events only): no slot events yet" in text
 
 
 def test_replay_never_started_tasks_are_not_avoidable(tmp_path):
@@ -419,6 +494,7 @@ def _task(
     result=None,
     cwd="/r",
     parent_task_id=None,
+    git_common_dir=None,
 ):
     created = datetime(2026, 9, 23, 10, 0, tzinfo=UTC)
     return Task(
@@ -436,6 +512,7 @@ def _task(
         else ExecutionResult.model_validate(result or _result(status)),
         cwd=cwd,
         parent_task_id=parent_task_id,
+        git_common_dir=git_common_dir,
     )
 
 
@@ -490,9 +567,9 @@ def test_added_lines_keep_meaningful_lines_per_file():
 def _accepted(verdicts):
     """Поддельная проверка git: вердикт по cwd задачи."""
 
-    def check(cwd, files, patch, since, until):
+    def check(task, files, patch, since, until):
         assert until - since == timedelta(hours=48)
-        return verdicts[cwd]
+        return verdicts[task.cwd]
 
     return check
 
@@ -508,6 +585,8 @@ def test_acceptance_counts_commits_and_surviving_lines():
         done("b" * 32, "/rewritten"),
         done("c" * 32, "/dropped"),
         done("d" * 32, "/gone"),
+        done("g" * 32, "/plain"),
+        done("h" * 32, "/merged"),
         # Не дошло до рабочей копии: судить вызывающего не за что.
         done("e" * 32, "/held", integrated=False),
         # Ревью без изменений файлов.
@@ -517,21 +596,29 @@ def test_acceptance_counts_commits_and_surviving_lines():
         "/kept": Acceptance(committed=True, added=10, survived=9),
         "/rewritten": Acceptance(committed=True, added=10, survived=1),
         "/dropped": Acceptance(committed=False),
-        "/gone": None,
+        "/gone": Unknown("cwd_gone"),
+        "/plain": Unknown("not_git"),
+        "/merged": Acceptance(committed=True, via="siblings"),
     }
     report = acceptance(tasks, _accepted(verdicts))
 
     assert (report["diffs"], report["committed"], report["not_committed"], report["unknown"]) == (
-        4,
+        6,
+        3,
+        1,
         2,
-        1,
-        1,
     )
-    assert report["committed_share"] == 0.667
+    assert report["unknown_by_reason"] == {"cwd_gone": 1, "not_git": 1}
+    assert report["judged_via"] == {"cwd": 3, "siblings": 1}
+    assert report["committed_share"] == 0.75
     assert (report["kept"], report["reworked"], report["rewritten"]) == (1, 0, 1)
     assert report["lines_survived_share"] == 0.5
     text = render({**replay([]), "acceptance": report})
-    assert "diffs committed by the caller within 48 h: 2 of 3 (67%), unknown 1" in text
+    assert (
+        "diffs committed by the caller within 48 h: 3 of 4 (75%), unknown 2 (cwd_gone 1, not_git 1)"
+        in text
+    )
+    assert "judged by the git dir of a removed working copy: siblings 1" in text
     assert "executor lines kept in the caller's commit: 50% over 2 diffs" in text
 
 
@@ -565,21 +652,209 @@ def test_git_acceptance_reads_the_callers_commit_and_skips_daemon_commits(git_re
     patch = "+++ b/a.py\n+value = compute(x)\n+other = compute(y)\n"
     # Коммит демона на ветке задачи не решение вызывающего.
     commit("agent-dispatch: task deadbeef", "x = 1\nvalue = compute(x)\nother = compute(y)\n")
-    assert git_acceptance(str(git_repo), ["a.py"], patch, since, until) == Acceptance(
+    assert git_acceptance(GitRepo(str(git_repo)), ["a.py"], patch, since, until) == Acceptance(
         committed=False
     )
 
     commit("caller keeps half", "x = 1\nvalue = compute(x)\n")
-    assert git_acceptance(str(git_repo), ["a.py"], patch, since, until) == Acceptance(
+    assert git_acceptance(GitRepo(str(git_repo)), ["a.py"], patch, since, until) == Acceptance(
         committed=True, added=2, survived=1
     )
     sub = git_repo / "sub"
     sub.mkdir()
-    assert git_acceptance(str(sub), ["a.py"], patch, since, until) == Acceptance(
+    assert git_acceptance(GitRepo(str(sub)), ["a.py"], patch, since, until) == Acceptance(
         committed=True, added=2, survived=1
     )
-    assert git_acceptance(str(tmp_path / "missing"), ["a.py"], patch, since, until) is None
-    assert git_acceptance(str(tmp_path), ["a.py"], patch, since, until) is None
+    # Вдали от репы фикстуры: соседей-checkouts у каталога нет.
+    lonely = tmp_path / "far" / "lonely"
+    lonely.mkdir(parents=True)
+    locator = GitLocator()
+    assert locator.locate(_task("a" * 32, "completed", cwd=str(lonely / "gone"))) == Unknown(
+        "cwd_gone"
+    )
+    assert locator.locate(_task("a" * 32, "completed", cwd=str(lonely))) == Unknown("not_git")
+    broken = tmp_path / "broken.git"
+    broken.mkdir()
+    assert git_acceptance(GitRepo(str(broken), via="recorded"), ["a.py"], patch, since, until) == (
+        Unknown("git_error")
+    )
+
+
+def _removed_worktree(git_repo: Path, tmp_path: Path) -> tuple[Path, datetime, datetime]:
+    """Worktree вызывающего в `wt/`, его ветка слита в main, а сам он удалён.
+
+    Рядом остаётся живой worktree той же репы. Ещё есть ветка демона с его
+    служебным коммитом в `b.py` и stash с правкой `c.py`: ни то, ни другое не
+    решение вызывающего.
+    """
+    later = datetime.now(UTC) + timedelta(hours=1)
+    env = {
+        **_git_env(tmp_path),
+        "GIT_AUTHOR_DATE": later.isoformat(),
+        "GIT_COMMITTER_DATE": later.isoformat(),
+    }
+
+    def git(cwd: Path, *args: str) -> None:
+        subprocess.run(["git", *args], cwd=cwd, env=env, check=True, capture_output=True)
+
+    wt = tmp_path / "wt"
+    feature = wt / "feature"
+    git(git_repo, "worktree", "add", "-q", "-b", "feature", str(feature))
+    git(git_repo, "worktree", "add", "-q", "-b", "other", str(wt / "other"))
+    (feature / "a.py").write_text("x = 1\nvalue = compute(x)\n")
+    git(feature, "commit", "-qam", "caller keeps half")
+    git(git_repo, "merge", "-q", "--no-ff", "-m", "merge feature", "feature")
+    git(git_repo, "worktree", "remove", str(feature))
+    git(git_repo, "branch", "-q", "-d", "feature")
+
+    git(git_repo, "checkout", "-q", "-b", "agent-dispatch/t")
+    (git_repo / "b.py").write_text("daemon = True\n")
+    git(git_repo, "add", "b.py")
+    git(git_repo, "commit", "-qm", "agent-dispatch: task deadbeef")
+    git(git_repo, "checkout", "-q", "main")
+    (git_repo / "c.py").write_text("stashed = True\n")
+    git(git_repo, "add", "c.py")
+    git(git_repo, "stash", "-q")
+    return feature, later - timedelta(minutes=30), later + timedelta(minutes=30)
+
+
+def test_removed_worktree_whose_branch_was_merged_counts_as_committed(git_repo, tmp_path):
+    feature, since, until = _removed_worktree(git_repo, tmp_path)
+    patch = "+++ b/a.py\n+value = compute(x)\n+other = compute(y)\n"
+    locator = GitLocator()
+    common = str((git_repo / ".git").resolve())
+
+    # Без записанного git dir: живой сосед в `wt/` говорит, чья это репа.
+    task = _task("a" * 32, "completed", cwd=str(feature / "src"))
+    assert locator.locate(task) == GitRepo(common, via="siblings")
+    assert locator(task, ["a.py"], patch, since, until) == Acceptance(
+        committed=True, added=2, survived=1, via="siblings"
+    )
+    # Служебный коммит демона и stash в окне есть, но решением вызывающего не считаются.
+    assert locator(task, ["b.py"], None, since, until) == Acceptance(
+        committed=False, via="siblings"
+    )
+    # `c.py` есть только в stash: история репы его не знает, и догадка по
+    # соседям не подтверждена этим файлом.
+    assert locator(task, ["c.py"], None, since, until) == Unknown("unverified_repo")
+    # Каталог worktree остался с неотслеживаемым `.idea`: судится как удалённый.
+    (feature / ".idea").mkdir(parents=True)
+    leftover = _task("a" * 32, "completed", cwd=str(feature))
+    assert locator.locate(leftover) == GitRepo(common, via="siblings")
+    # Worktree внутри самой репы: предок cwd сам в git.
+    inside = _task("a" * 32, "completed", cwd=str(git_repo / ".claude" / "worktrees" / "gone"))
+    assert locator.locate(inside) == GitRepo(common, via="ancestor")
+
+
+def test_parent_with_checkouts_of_different_repos_stays_unknown(git_repo, tmp_path):
+    feature, since, until = _removed_worktree(git_repo, tmp_path)
+    stranger = feature.parent / "stranger"
+    stranger.mkdir()
+    subprocess.run(
+        ["git", "init", "-q"], cwd=stranger, env=_git_env(tmp_path), check=True, capture_output=True
+    )
+    task = _task("a" * 32, "completed", cwd=str(feature))
+
+    assert GitLocator().locate(task) == Unknown("ambiguous")
+    report = acceptance(
+        [
+            _task(
+                "a" * 32,
+                "completed",
+                cwd=str(feature),
+                result=_result("completed", changed=["a.py"]),
+            )
+        ]
+    )
+    assert (report["unknown"], report["unknown_by_reason"]) == (1, {"ambiguous": 1})
+
+
+def test_ancestor_repo_that_never_had_the_files_is_not_the_task_repo(tmp_path):
+    # Удалённый checkout репы B лежал под dotfiles-репой A: ближайший живой
+    # предок в git, но это не та репа, и вердикт по ней был бы ложным.
+    dotfiles = tmp_path / "home"
+    dotfiles.mkdir()
+    env = _git_env(tmp_path)
+    for args in (("init", "-q"), ("commit", "-q", "--allow-empty", "-m", "dotfiles")):
+        subprocess.run(["git", *args], cwd=dotfiles, env=env, check=True, capture_output=True)
+    task = _task("a" * 32, "completed", cwd=str(dotfiles / "wt" / "repo-b-feature"))
+    now = datetime.now(UTC)
+
+    assert GitLocator().locate(task).via == "ancestor"
+    assert GitLocator()(task, ["src/app.py"], None, now, now) == Unknown("unverified_repo")
+
+
+def test_broken_inferred_repo_is_a_git_error_not_a_stranger(tmp_path):
+    # Ссылка на несуществующий объект: `git log --all` падает. Это поломка
+    # репы (`git_error`), а не вывод «репа чужая».
+    home = tmp_path / "home"
+    home.mkdir()
+    env = _git_env(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=home, env=env, check=True, capture_output=True)
+    (home / ".git" / "refs" / "heads" / "broken").write_text("1" * 40 + "\n")
+    task = _task("a" * 32, "completed", cwd=str(home / "wt" / "gone"))
+    now = datetime.now(UTC)
+
+    assert GitLocator()(task, ["src/app.py"], None, now, now) == Unknown("git_error")
+
+
+def test_recorded_common_dir_wins_over_the_heuristic(git_repo, tmp_path):
+    feature, since, until = _removed_worktree(git_repo, tmp_path)
+    stranger = feature.parent / "stranger"
+    stranger.mkdir()
+    subprocess.run(
+        ["git", "init", "-q"], cwd=stranger, env=_git_env(tmp_path), check=True, capture_output=True
+    )
+    common = str((git_repo / ".git").resolve())
+    task = _task("a" * 32, "completed", cwd=str(feature), git_common_dir=common)
+
+    assert GitLocator().locate(task) == GitRepo(common, via="recorded")
+    assert GitLocator()(task, ["a.py"], None, since, until) == Acceptance(
+        committed=True, via="recorded"
+    )
+    # Записанная репа удалена: догадка по соседям не подменяет запись.
+    gone = _task("a" * 32, "completed", cwd=str(feature), git_common_dir=str(tmp_path / "x.git"))
+    assert GitLocator().locate(gone) == Unknown("cwd_gone")
+
+
+def test_timeouts_split_agents_that_worked_to_the_end_from_quiet_ones():
+    def timeout(task_id, executor, age=..., minutes=28, status="failed"):
+        meta = {} if age is ... else {"last_output_age_s": age}
+        result = _result(status, error="timeout", meta=meta)
+        return _task(task_id, status, executor=executor, minutes=minutes, result=result)
+
+    tasks = [
+        timeout("a" * 32, "codex/sol", 5.0, minutes=30),
+        timeout("b" * 32, "codex/sol", 120.0, minutes=30, status="partial"),
+        timeout("c" * 32, "codex/sol", 600.0, minutes=30),
+        timeout("d" * 32, "codex/sol", minutes=24),
+        timeout("e" * 32, "claude", None),
+        timeout("f" * 32, "opencode/x5", 900.0),
+        # Не таймаут: сторож молчания и обычный сбой.
+        _task("g" * 32, "failed", result=_result("failed", error="stalled: no output for 900s")),
+        _task("h" * 32, "failed", result=_result("failed", error="exit 1")),
+    ]
+    report = timeouts(tasks)
+
+    assert {key: report[key] for key in ("count", "active", "quiet", "no_stream", "unknown")} == {
+        "count": 6,
+        "active": 2,
+        "quiet": 2,
+        "no_stream": 1,
+        "unknown": 1,
+    }
+    assert list(report["by_executor"]) == ["codex/sol", "claude", "opencode/x5"]
+    assert report["by_executor"]["codex/sol"] == {
+        "count": 4,
+        "active": 2,
+        "quiet": 1,
+        "no_stream": 0,
+        "unknown": 1,
+        "avg_minutes": 28.5,
+    }
+    text = render({**replay([]), "timeouts": report})
+    assert "timeouts: 6, output within 120 s before the kill 2" in text
+    assert "  codex/sol: 4, active 2, quiet 1, no stream 0, unknown 1, avg 28.5 min" in text
 
 
 def _settings(adapter, tier, *, corporate=False):
@@ -650,6 +925,126 @@ def test_router_vs_static_compares_jev_with_one_tier_for_everything():
     )
 
 
+def test_exploration_comparison_reports_outcome_and_acceptance_per_arm():
+    def done(task_id, status, cwd):
+        return _task(
+            task_id,
+            status,
+            cwd=cwd,
+            result=_result(status, changed=["a.py"]),
+        )
+
+    tasks = [
+        done("a" * 32, "completed", "/explore-kept"),
+        done("b" * 32, "failed", "/explore-dropped"),
+        done("c" * 32, "completed", "/jev-reworked"),
+        _task("d" * 32, "completed", cwd="/jev-no-diff"),
+        # Старая запись Jev без метки эксперимента не смешивается с новым arm.
+        _task("e" * 32, "failed"),
+        # Задача в работе исхода не имеет: в доли не входит, считается отдельно.
+        _task("f" * 32, "running", cwd="/explore-running"),
+    ]
+    decisions = [
+        Decision(
+            task_id=key * 32,
+            router=arm,
+            candidates=["codex/sol", "claude/opus"],
+            choice="codex/sol" if arm == "explore" else "claude/opus",
+            guard_reason=None,
+            judgments={"exploration_arm": {"value": arm}},
+        )
+        for key, arm in (
+            ("a", "explore"),
+            ("b", "explore"),
+            ("c", "jev"),
+            ("d", "jev"),
+            ("f", "explore"),
+        )
+    ]
+    # Crossover: статический исполнитель был недоступен, arm остаётся explore.
+    decisions[1].judgments["exploration_crossover"] = {"value": "codex/sol"}
+    decisions.append(_decision("e" * 32, "strong"))
+    verdicts = {
+        "/explore-kept": Acceptance(committed=True, added=10, survived=9),
+        "/explore-dropped": Acceptance(committed=False),
+        "/jev-reworked": Acceptance(committed=True, added=10, survived=4),
+    }
+
+    report = exploration_comparison(decisions, tasks, check=_accepted(verdicts))
+
+    assert report["arms"] == {
+        "explore": {
+            "n": 2,
+            "in_flight": 1,
+            "crossover": 1,
+            "completed_share": 0.5,
+            "committed_share": 0.5,
+            "lines_kept_share": 0.9,
+        },
+        "jev": {
+            "n": 2,
+            "in_flight": 0,
+            "crossover": 0,
+            "completed_share": 1.0,
+            "committed_share": 1.0,
+            "lines_kept_share": 0.4,
+        },
+    }
+    assert report["warning"] == "warning: fewer than 30 tasks in arm(s): explore (2), jev (2)"
+    text = render({**replay([]), "exploration": report})
+    assert (
+        "routing experiment explore: n 2, completed 50%, committed 50%, lines kept 90%, "
+        "in flight 1, crossover 1"
+    ) in text
+    assert report["warning"] in text
+
+
+def test_exploration_comparison_default_check_judges_real_tasks():
+    # Регрессия: дефолтная проверка получала Task вместо GitRepo и падала
+    # AttributeError на первой задаче эксперимента с изменёнными файлами.
+    task = _task(
+        "a" * 32, "completed", cwd="/no/such/dir", result=_result("completed", changed=["a.py"])
+    )
+    decision = Decision(
+        task_id="a" * 32,
+        router="explore",
+        candidates=["codex/sol"],
+        choice="codex/sol",
+        guard_reason=None,
+        judgments={"exploration_arm": {"value": "explore"}},
+    )
+
+    report = exploration_comparison([decision], [task])
+
+    assert report["arms"]["explore"]["n"] == 1
+    assert report["arms"]["explore"]["committed_share"] is None
+
+
+def test_router_vs_static_uses_logged_jev_choice_in_explore_arm():
+    decision = _decision("a" * 32, "strong")
+    decision.router = "explore"
+    decision.choice = "codex/sol"
+    decision.judgments["exploration_jev_choice"] = {"value": "claude/opus"}
+
+    report = router_vs_static([decision], [_task("a" * 32, "completed")], EXECUTORS)
+
+    assert report["compared"] == 1
+    assert report["completed_when_disagree"] == 1.0
+    assert report["choice_drift"] == 0
+
+
+def test_router_vs_static_uses_capped_capability():
+    decision = _decision("a" * 32, "strong")
+    decision.capability = "balanced"
+    decision.choice = "codex/sol"
+
+    report = router_vs_static([decision], [_task("a" * 32, "completed")], EXECUTORS)
+
+    assert report["capabilities"] == {"balanced": 1}
+    assert report["agree"] == 1
+    assert report["choice_drift"] == 0
+
+
 def test_load_reads_cwd_and_routing_decisions(tmp_path):
     db = _db(tmp_path, [("a" * 32, "codex/sol", "10:00", "10:05", 5, None, _result("completed"))])
     conn = sqlite3.connect(db)
@@ -660,10 +1055,23 @@ def test_load_reads_cwd_and_routing_decisions(tmp_path):
         ' \'{"capability": {"value": "fast"}}\', null, 10, \'2026-09-23T10:00:00+00:00\')',
         ("a" * 32,),
     )
+    conn.execute(
+        "update tasks set decision_json=? where task_id=?",
+        (json.dumps({"capability": "balanced"}), "a" * 32),
+    )
     conn.commit()
     conn.close()
 
-    assert load(db)[0].cwd == "/r"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "insert into events (task_id, ts, kind, payload_json) values (?, '', 'git', ?)",
+        ("a" * 32, json.dumps({"common_dir": "/repo/.git", "branch": "feature"})),
+    )
+    conn.commit()
+    conn.close()
+
+    (task,) = load(db)
+    assert (task.cwd, task.git_common_dir) == ("/r", "/repo/.git")
     assert load_decisions(db) == [
         Decision(
             task_id="a" * 32,
@@ -672,6 +1080,7 @@ def test_load_reads_cwd_and_routing_decisions(tmp_path):
             choice="codex/sol",
             guard_reason=None,
             judgments={"capability": {"value": "fast"}},
+            capability="balanced",
         )
     ]
 

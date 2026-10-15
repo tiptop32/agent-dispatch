@@ -39,6 +39,8 @@ class Selection:
     executor: str
     scores: dict[str, float]
     notes: list[str] = field(default_factory=list)
+    capability: str | None = None
+    capability_uncapped: str | None = None
 
 
 def tiers_present(candidates: dict[str, ExecutorSettings]) -> list[str]:
@@ -49,6 +51,25 @@ def tiers_present(candidates: dict[str, ExecutorSettings]) -> list[str]:
 
 def has_corporate(candidates: dict[str, ExecutorSettings]) -> bool:
     return any(settings.corporate for settings in candidates.values())
+
+
+def narrows_to_perimeter(
+    candidates: dict[str, ExecutorSettings],
+    *,
+    answered_yes: bool,
+    confidence: float,
+    perimeter: bool,
+    min_confidence: float,
+) -> bool:
+    """Сужать ли пул до корпоративного периметра по ответу о корп. данных.
+
+    Одно правило для Jev, статического плеча эксперимента и replay: периметр
+    включён, в пуле есть корпоративный исполнитель, ответ «да» и его
+    уверенность не ниже `routing.corporate_min_confidence`.
+    """
+    return bool(
+        perimeter and has_corporate(candidates) and answered_yes and confidence >= min_confidence
+    )
 
 
 def _nearest_tiers(tier: str) -> list[str]:
@@ -78,6 +99,7 @@ def select(
     capability: str,
     candidates: dict[str, ExecutorSettings],
     *,
+    max_capability: str | None = None,
     judgment: bool = False,
     corporate: bool = False,
     corporate_confidence: float | None = None,
@@ -95,6 +117,15 @@ def select(
         raise ValueError("no candidates")
     notes: list[str] = []
     pool = dict(candidates)
+    capability_uncapped: str | None = None
+    if (
+        capability in TIERS
+        and max_capability in TIERS
+        and TIERS.index(capability) > TIERS.index(max_capability)
+    ):
+        capability_uncapped = capability
+        capability = max_capability
+        notes.append(f"capability capped: {capability_uncapped} -> {capability} (max_capability)")
 
     corporate_pool = {name: s for name, s in pool.items() if s.corporate}
     if corporate and corporate_pool:
@@ -119,12 +150,33 @@ def select(
 
     if judgment:
         judgment_pool = {name: s for name, s in pool.items() if s.adapter == JUDGMENT_ADAPTER}
+        if max_capability in TIERS:
+            # Потолок вызывающего сильнее совета «нужно суждение»: иначе
+            # reasoning-исполнитель уровня strong обошёл бы его молча. Периметр
+            # данных выше по коду остаётся сильнее потолка.
+            within = {
+                name: s
+                for name, s in judgment_pool.items()
+                if s.tier in TIERS and TIERS.index(s.tier) <= TIERS.index(max_capability)
+            }
+            if judgment_pool and not within:
+                notes.append(
+                    "task needs judgment, but no reasoning agent within "
+                    f"max_capability '{max_capability}'; the ceiling was kept"
+                )
+            judgment_pool = within
         if judgment_pool:
             pool = judgment_pool
             notes.append("task needs judgment rather than execution; sent to a reasoning agent")
 
     executor = _pick(pool, capability)
-    return Selection(executor=executor, scores=_scores(pool, probabilities or {}), notes=notes)
+    return Selection(
+        executor=executor,
+        scores=_scores(pool, probabilities or {}),
+        notes=notes,
+        capability=capability,
+        capability_uncapped=capability_uncapped,
+    )
 
 
 def _scores(pool: dict[str, ExecutorSettings], probabilities: dict[str, float]) -> dict[str, float]:

@@ -170,6 +170,23 @@ class Storage:
         row = self._db.execute(query, params).fetchone()
         return int(row[0])
 
+    async def running_children(
+        self,
+        parent_task_id: str,
+        exclude_task_id: str | None = None,
+    ) -> list[str]:
+        """task_id работающих детей, которые входят в квоту родителя."""
+        query = (
+            "SELECT task_id FROM tasks WHERE parent_task_id=? AND status='running'"
+            " AND executor IS NOT NULL AND escalated_from IS NULL"
+        )
+        params: list[str] = [parent_task_id]
+        if exclude_task_id is not None:
+            query += " AND task_id != ?"
+            params.append(exclude_task_id)
+        query += " ORDER BY created_at"
+        return [str(row[0]) for row in self._db.execute(query, params).fetchall()]
+
     async def ancestors(self, task_id: str) -> list[str]:
         result: list[str] = []
         current = task_id

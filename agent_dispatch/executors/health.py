@@ -43,7 +43,13 @@ _ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
         "auth",
         re.compile(
             r"no cookie auth credentials|invalid api key|invalid x-api-key|authentication_error"
-            r"|401 unauthorized|not logged in|please run /login",
+            r"|401 unauthorized|not logged in|please run /login"
+            # Ключ провайдера не дошёл до CLI: любая задача откажет так же.
+            # Так пишет codex про `env_key` провайдера, и так же пишет наш
+            # wrapper `scripts/codex-agent-lb` перед `exit 78`. Только с начала
+            # строки: `MCP server x failed: Missing environment variable: ...`
+            # это сбой MCP-сервера, и исполнитель с ним работает.
+            r"|(?m:^[ \t]*(?:codex-agent-lb: )?missing environment variable: [`\"]?\w*api_key)",
             re.IGNORECASE,
         ),
     ),

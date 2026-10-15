@@ -171,3 +171,24 @@ async def test_codex_passes_the_idle_limit_because_it_streams_events(
     context = ctx(git_repo, tmp_path).model_copy(update={"idle_timeout_seconds": 900})
     await CodexAdapter("codex", ExecutorSettings(adapter="codex", command="codex")).execute(context)
     assert seen["idle_timeout_seconds"] == 900
+
+
+@pytest.mark.asyncio
+async def test_codex_timeout_records_seconds_since_the_last_output(git_repo, tmp_path, monkeypatch):
+    from agent_dispatch.executors import codex as module
+    from agent_dispatch.executors.process import ProcessOutcome
+
+    async def fake(*args, **kwargs):
+        return ProcessOutcome(
+            exit_code=None,
+            stdout="",
+            stderr="",
+            timed_out=True,
+            duration_ms=1800_000,
+            last_output_age_s=12.5,
+        )
+
+    monkeypatch.setattr(module, "run_cli", fake)
+    adapter = CodexAdapter("codex", ExecutorSettings(adapter="codex", command="codex"))
+    result = await adapter.execute(ctx(git_repo, tmp_path))
+    assert (result.error, result.meta["last_output_age_s"]) == ("timeout", 12.5)

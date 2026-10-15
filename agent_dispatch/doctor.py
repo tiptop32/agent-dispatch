@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 import agent_dispatch
 from agent_dispatch.config import Settings
+from agent_dispatch.executors import worktree
 from agent_dispatch.executors.base import check_cli_version
 from agent_dispatch.executors.env import child_env
 from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
@@ -28,6 +29,7 @@ class Check(BaseModel):
     name: str
     ok: bool
     detail: str
+    warning: bool = False
 
 
 def stale_files(installed: Path, source: Path) -> list[str]:
@@ -145,6 +147,54 @@ def _codex_env_check() -> Check:
     return codex_env_check(home / "config.toml")
 
 
+def _trapped_secret_hint(settings: Settings, error: str) -> str:
+    """Подсказка, если CLI не нашёл ключ, который лежит в env-файле agent-dispatch.
+
+    `child_env` не пускает секреты в env исполнителей, и CLI (например,
+    `scripts/codex-agent-lb` с `exit 78`) падает с именем ключа в stderr.
+    Значение ключа не печатается.
+    """
+    # Только env-файл agent-dispatch (`Settings.secrets`): ключ из окружения
+    # процесса демона туда не относится, и совет переложить его был бы ложным.
+    trapped = sorted(
+        name
+        for name, value in settings.secrets.items()
+        if name in error and value.get_secret_value()
+    )
+    if not trapped:
+        return ""
+    return (
+        f"; {', '.join(trapped)} is in the agent-dispatch env file, but child_env keeps "
+        "secrets out of executor env: put it where the CLI reads it "
+        "(its own config file or the daemon process environment)"
+    )
+
+
+def _format_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
+def worktrees_check(settings: Settings) -> Check:
+    """Сводит количество, размер и возраст деревьев во всём каталоге данных."""
+    try:
+        trees = worktree.list_stored_worktrees(settings.worktree_base)
+    except worktree.WorktreeError as exc:
+        return Check(name="worktrees", ok=False, detail=str(exc))
+    old = sum(tree.age_seconds >= 7 * 86400 for tree in trees)
+    total = sum(worktree.directory_size(tree.path) for tree in trees)
+    return Check(
+        name="worktrees",
+        ok=True,
+        warning=old > 0,
+        detail=f"{len(trees)} trees, {_format_size(total)} total, {old} older than 7 days",
+    )
+
+
 async def _daemon_check(settings: Settings) -> Check:
     state = read_state(settings.server.data_dir)
     if state is None or not is_running(state):
@@ -173,14 +223,16 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
         )
     checks.append(await _daemon_check(settings))
     checks.append(_codex_env_check())
+    checks.append(worktrees_check(settings))
     safe_env = child_env(settings)
     for name, executor in settings.executors.items():
         availability = await check_cli_version(name, executor.resolved_command, safe_env)
+        error = availability.error or "unknown error"
         checks.append(
             Check(
                 name=f"executor:{name}",
                 ok=availability.available,
-                detail=availability.version or availability.error or "unknown error",
+                detail=availability.version or error + _trapped_secret_hint(settings, error),
             )
         )
     if not online:
@@ -212,5 +264,7 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
 
 def format_checks(checks: list[Check]) -> str:
     return "\n".join(
-        f"{'ok' if check.ok else 'FAIL'}  {check.name}: {check.detail}" for check in checks
+        f"{'FAIL' if not check.ok else 'WARN' if check.warning else 'ok'}  "
+        f"{check.name}: {check.detail}"
+        for check in checks
     )

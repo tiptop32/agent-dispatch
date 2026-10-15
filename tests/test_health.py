@@ -45,6 +45,21 @@ def _failed(error: str, summary: str = "", changed_files: list[str] | None = Non
         ),
         pytest.param("No cookie auth credentials found", "auth", id="opencode-auth"),
         pytest.param("Invalid API key · Please run /login", "auth", id="claude-login"),
+        pytest.param(
+            "Missing environment variable: `AGENT_LB_API_KEY`.", "auth", id="codex-lb-agent-key"
+        ),
+        pytest.param(
+            "Missing environment variable: `CODEX_LB_API_KEY`.", "auth", id="codex-lb-codex-key"
+        ),
+        pytest.param(
+            "codex-agent-lb: Missing environment variable: `AGENT_LB_API_KEY` "
+            "(not in the environment or /Users/u/.config/agent-lb/env)",
+            "auth",
+            id="codex-lb-wrapper-exit-78",
+        ),
+        pytest.param(
+            "Missing environment variable: `OPENAI_API_KEY`.", "auth", id="any-provider-key"
+        ),
     ],
 )
 def test_cli_messages_about_the_executor_are_classified(error, expected):
@@ -91,6 +106,13 @@ def test_stall_after_codex_lost_the_api_is_a_network_failure():
                 "OAuth tokens for server mcphub: OAuth refresh token was rejected"
             ),
             id="mcp-server-oauth",
+        ),
+        pytest.param(
+            # Ключ MCP-сервера не задан: сервер не поднялся, сам codex работает.
+            _failed(
+                "exit 1\nMCP server github failed: Missing environment variable: GITHUB_API_KEY"
+            ),
+            id="mcp-server-missing-key",
         ),
         pytest.param(
             # Работа агента в stdout: задача про rate limiting, а не лимит исполнителя.
@@ -148,6 +170,16 @@ def test_every_live_limit_message_is_a_quota_failure(error):
 def test_agent_words_about_limits_in_summary_do_not_count():
     # Задача про лимиты: слова в выводе агента не выключают исполнителя.
     result = _failed("exit code 1", summary="You've hit your weekly limit, says the test")
+    assert classify_failure(result) is None
+
+
+def test_lb_key_missing_in_agent_output_does_not_count():
+    # Задача про переменные окружения: имя ключа в выводе агента (stdout) не
+    # выключает исполнителя, классификация смотрит только на `error`.
+    result = _failed(
+        "exit 1",
+        summary="added a check for Missing environment variable: `AGENT_LB_API_KEY`.",
+    )
     assert classify_failure(result) is None
 
 
