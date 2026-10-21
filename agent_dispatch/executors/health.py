@@ -53,6 +53,10 @@ _ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
             re.IGNORECASE,
         ),
     ),
+    # Строку пишет адаптер opencode, а не CLI: opencode молча выходит с кодом 0,
+    # когда запрос к модели не вернулся (`opencode.NO_RESPONSE`). Следующая
+    # задача ждала бы те же минуты.
+    ("network", re.compile(r"^opencode: no model response")),
 )
 
 #: Событие codex при потере связи с API: `{"type":"error","message":"Reconnecting... 5/5 ..."}`.

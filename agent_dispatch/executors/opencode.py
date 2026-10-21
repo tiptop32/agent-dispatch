@@ -62,6 +62,10 @@ def review_permissions_env() -> str:
     )
 
 
+#: Ошибка пустого запуска; по началу строки её узнаёт `health.classify_failure`.
+NO_RESPONSE = "opencode: no model response (the run ended before the first step finished)"
+
+
 def _as_int(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
@@ -154,6 +158,8 @@ class OpenCodeAdapter(BaseExecutorAdapter):
         cost = 0.0
         error_message = None
         session = None
+        #: Модель хоть раз ответила: текст, рассуждение, вызов инструмента или законченный шаг.
+        responded = False
         for line in outcome.stdout.splitlines():
             try:
                 event = json.loads(line)
@@ -163,6 +169,8 @@ class OpenCodeAdapter(BaseExecutorAdapter):
                 continue
             if session is None and isinstance(event.get("sessionID"), str):
                 session = event["sessionID"]
+            if event.get("type") in ("text", "reasoning", "tool_use", "step_finish"):
+                responded = True
             if event.get("type") == "text" and isinstance(event.get("part"), dict):
                 text_parts.append(str(event["part"].get("text", "")))
             elif event.get("type") == "tool_use" and isinstance(event.get("part"), dict):
@@ -203,6 +211,12 @@ class OpenCodeAdapter(BaseExecutorAdapter):
         result = normalize(raw, outcome, changed, self.name, self.settings.model)
         if error_message:
             result = result.model_copy(update={"status": "failed", "error": error_message})
+        elif not responded and raw is None and not changed and result.status == "partial":
+            # Только `step_start` и выход с кодом 0 через минуты: запрос к модели
+            # не вернулся, а opencode этого не сообщает. Так кончались запуски
+            # x5-code-large 2026-10-19…21 (usage пуст, ни одного шага). Это
+            # сбой исполнителя, а не задачи: `health` выводит его из ротации.
+            result = result.model_copy(update={"status": "failed", "error": NO_RESPONSE})
         if permission_rejections:
             if raw is None:
                 result = result.model_copy(

@@ -59,6 +59,7 @@ execution:
   keep_worktrees: false
   idle_timeout_seconds: 900
   verify_timeout_seconds: 600 # предел на каждую команду verify из запроса
+  report_recovery_timeout_seconds: 300 # дозапрос отчёта в той же сессии, если работа есть, а блока нет; 0 выключает
 
 executors:
   claude:

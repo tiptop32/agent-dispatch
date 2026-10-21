@@ -130,7 +130,7 @@ def _rewrite_file_list(files: list[str] | None, repo_root: str, worktree: str) -
     return [rewrite_repo_prefix(item, repo_root, worktree) or item for item in files]
 
 
-def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Settings) -> str:
+def _templates() -> Environment:
     template_dir = Path(__file__).resolve().parent.parent / "templates"
     env = Environment(
         loader=FileSystemLoader(template_dir),
@@ -141,6 +141,27 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         undefined=StrictUndefined,
     )
     env.filters["bullets"] = _bullets
+    return env
+
+
+def result_instructions(adapter_kind: AdapterKind) -> str:
+    """Как исполнитель отдаёт отчёт: codex схемой, остальные блоком в тексте."""
+    if adapter_kind == "codex":
+        return "Report the outcome using the structured output schema: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation."  # noqa: E501
+    return 'End your final message with a fenced block tagged `agent-dispatch-result` containing a JSON object with fields: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation. Example:\n```agent-dispatch-result\n{"status": "completed", "summary": "...", "changed_files": [], "tests": {"command": "pytest", "result": "passed"}, "confidence": 0.9, "needs_escalation": false}\n```'  # noqa: E501
+
+
+def render_report_prompt(adapter_kind: AdapterKind) -> str:
+    """Промпт дозапроса отчёта в той же сессии, когда запуск кончился без блока."""
+    return (
+        _templates()
+        .get_template("report_only.md.j2")
+        .render(result_instructions=result_instructions(adapter_kind))
+    )
+
+
+def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Settings) -> str:
+    env = _templates()
     req = package.request
     worktree = package.worktree
     task, context, files, checks = req.task, req.context, req.files, req.verify
@@ -154,10 +175,7 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         context = rewrite_repo_prefix(context, root, worktree)
         files = _rewrite_file_list(files, root, worktree)
         checks = _rewrite_file_list(checks, root, worktree)
-    if adapter_kind == "codex":
-        instructions = "Report the outcome using the structured output schema: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation."  # noqa: E501
-    else:
-        instructions = 'End your final message with a fenced block tagged `agent-dispatch-result` containing a JSON object with fields: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation. Example:\n```agent-dispatch-result\n{"status": "completed", "summary": "...", "changed_files": [], "tests": {"command": "pytest", "result": "passed"}, "confidence": 0.9, "needs_escalation": false}\n```'  # noqa: E501
+    instructions = result_instructions(adapter_kind)
     # Тот же порядок, что у жёсткого таймаута: запрос, исполнитель, routing.
     budget_seconds = settings.timeout_for(package.executor or "", req.timeout_seconds)
     followup = package.followup

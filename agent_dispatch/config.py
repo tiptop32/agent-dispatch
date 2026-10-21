@@ -156,6 +156,9 @@ class ExecutionSettings(_ConfigModel):
     #: Предел на каждую команду `verify` из запроса. Зависшая проверка
     #: считается упавшей.
     verify_timeout_seconds: int = Field(600, ge=1)
+    #: Запуск правки кончился без блока отчёта, но с изменёнными файлами: демон
+    #: продолжает ту же сессию коротким «дай отчёт» с этим пределом; 0 отключает.
+    report_recovery_timeout_seconds: int = Field(300, ge=0)
 
 
 class ExecutorSettings(_ConfigModel):

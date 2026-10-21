@@ -332,6 +332,13 @@ def replay(
         if any(error in task.result.meta.get("parse_error", "") for error in _FORMAT_ERRORS)
     ]
     format_only = [task.task_id[:8] for task in format_only_tasks]
+    recovery_tasks = [
+        task for task in tasks if task.result and task.result.meta.get("report_recovery")
+    ]
+    recovery: dict[str, int] = {"attempted": len(recovery_tasks), "recovered": 0, "failed": 0}
+    for task in recovery_tasks:
+        outcome = str(task.result.meta["report_recovery"]).split(":", 1)[0]
+        recovery[outcome if outcome in recovery else "failed"] += 1
     return {
         "tasks": len(tasks),
         "cooldown_seconds": cooldown,
@@ -345,6 +352,7 @@ def replay(
         ),
         "partial": len(partial),
         "partial_from_report_format": format_only,
+        "report_recovery": recovery,
         "review_only_runs": len(restricted),
         "review_only_failed": sum(1 for task in restricted if task.status == "failed"),
         "review_only_minutes": round(sum(task.duration_ms for task in restricted) / 60000, 1),
@@ -354,6 +362,7 @@ def replay(
             "avoidable_runs": _window(avoidable_times),
             "integrations_to_hold": _window(held_times),
             "partial_from_report_format": _window([task.created_at for task in format_only_tasks]),
+            "report_recovery": _window([task.created_at for task in recovery_tasks]),
             "review_only_runs": _window([task.created_at for task in restricted]),
         },
     }
@@ -1019,6 +1028,12 @@ def render(report: dict) -> str:
         f"partial results: {report['partial']}, "
         f"from report format only: {len(report['partial_from_report_format'])}"
         + window("partial_from_report_format")
+    )
+    recovery = report["report_recovery"]
+    lines.append(
+        f"missing reports asked again in the same session: {recovery['attempted']}, "
+        f"recovered {recovery['recovered']}, failed {recovery['failed']}"
+        + window("report_recovery")
     )
     lines.append(
         f"work given to a review-only executor: {report['review_only_runs']} runs, "

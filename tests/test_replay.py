@@ -175,6 +175,46 @@ def test_replay_separates_report_format_partials(tmp_path):
     assert report["partial"] == 2 and report["partial_from_report_format"] == ["f" * 8]
 
 
+def test_replay_counts_report_recoveries(tmp_path):
+    db = _db(
+        tmp_path,
+        [
+            (
+                "a" * 32,
+                "opencode/x5",
+                "10:00",
+                "10:05",
+                5,
+                None,
+                _result("completed", meta={"report_recovery": "recovered"}),
+            ),
+            (
+                "b" * 32,
+                "opencode/x5",
+                "10:10",
+                "10:15",
+                5,
+                None,
+                _result(
+                    "partial",
+                    meta={
+                        "report_recovery": "failed: no result block",
+                        "parse_error": "no result block",
+                    },
+                ),
+            ),
+            ("c" * 32, "opencode/x5", "10:20", "10:25", 5, None, _result("completed")),
+        ],
+    )
+    report = replay(load(db))
+
+    assert report["report_recovery"] == {"attempted": 2, "recovered": 1, "failed": 1}
+    assert report["section_windows"]["report_recovery"]["first"].startswith("2026-09-23T10:00")
+    assert "missing reports asked again in the same session: 2, recovered 1, failed 1" in (
+        render(report)
+    )
+
+
 WEEKLY = "You've hit your weekly limit · resets 5am (Asia/Yekaterinburg)"
 
 

@@ -23,7 +23,7 @@ from agent_dispatch.dispatch.followup import FollowupError, continued_link
 from agent_dispatch.executors.base import RunContext
 from agent_dispatch.executors.claude import ClaudeAdapter
 from agent_dispatch.executors.codex import CodexAdapter
-from agent_dispatch.executors.opencode import OpenCodeAdapter
+from agent_dispatch.executors.opencode import NO_RESPONSE, OpenCodeAdapter
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     DispatchRequest,
@@ -363,6 +363,119 @@ async def test_resume_is_not_retried_after_executor_failures_or_real_work(
     )
     await _done(dispatcher, record.task_id)
     assert len(adapters["codex"].calls) == 2
+
+
+def _no_block(name: str, session: str | None = "s1") -> ExecutionResult:
+    """Работа в дереве есть, блока отчёта нет: так кончалась каждая седьмая правка x5."""
+    meta = {"parse_error": "no result block", **({"session_id": session} if session else {})}
+    return ExecutionResult(
+        status="partial",
+        executor=name,
+        model=None,
+        summary="stdout tail",
+        changed_files=["a.py"],
+        meta=meta,
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_report_is_asked_again_in_the_same_session(tmp_path, git_repo):
+    storage, adapters, dispatcher = await _make(tmp_path)
+    report = _ok("codex", "s1", summary="added the endpoint")
+    report.changed_files = []
+    adapters["codex"].results = [_no_block("codex"), report]
+
+    done = await _done(
+        dispatcher, (await dispatcher.submit(_req(git_repo, verify=["true"]))).task_id
+    )
+
+    assert done.status == TaskStatus.completed
+    assert done.result.summary == "added the endpoint"
+    assert done.result.changed_files == ["a.py"]
+    assert done.result.meta["report_recovery"] == "recovered"
+    assert done.result.verification.result == "passed"  # verify судит итог после отчёта
+    first, again = adapters["codex"].calls
+    assert first.resume_session is None and again.resume_session == "s1"
+    assert again.prompt.startswith("# Report") and "structured output schema" in again.prompt
+    assert again.timeout_seconds == min(300, first.timeout_seconds)
+    assert adapters["claude"].calls == []
+    events = await storage.list_events(done.task_id)
+    assert any(
+        e["kind"] == "report_recovery" and e["payload"] == {"session": "s1", "outcome": "recovered"}
+        for e in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_report_recovery_runs_in_the_worktree_of_the_first_run(tmp_path, git_repo):
+    _, adapters, dispatcher = await _make(tmp_path, workspace_mode="worktree")
+
+    async def touch(ctx):
+        if ctx.resume_session is None:
+            (Path(ctx.cwd) / "a.py").write_text("work\n")
+
+    adapters["codex"].on_execute = touch
+    report = _ok("codex", "s1", summary="added the endpoint")
+    report.changed_files = []
+    adapters["codex"].results = [_no_block("codex"), report]
+
+    done = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
+
+    first, again = adapters["codex"].calls
+    assert again.cwd == first.cwd != str(git_repo)
+    assert done.status == TaskStatus.completed
+    assert done.result.meta["report_recovery"] == "recovered"
+    assert (git_repo / "a.py").read_text() == "work\n"  # работа доехала патчем
+
+
+@pytest.mark.asyncio
+async def test_failed_report_recovery_leaves_the_work_to_the_caller(tmp_path, git_repo):
+    _, adapters, dispatcher = await _make(tmp_path)
+    adapters["codex"].results = [_no_block("codex"), _no_block("codex")]
+
+    done = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
+
+    assert done.status == TaskStatus.partial
+    assert done.result.meta["report_recovery"] == "failed: no result block"
+    assert len(adapters["codex"].calls) == 2  # один дозапрос, без цикла
+    assert adapters["claude"].calls == []  # работа есть: не эскалируется
+
+
+@pytest.mark.asyncio
+async def test_executor_failure_in_the_report_recovery_cools_the_executor(tmp_path, git_repo):
+    storage, adapters, dispatcher = await _make(tmp_path)
+    empty = ExecutionResult(
+        status="failed", executor="codex", model=None, summary="", error=NO_RESPONSE
+    )
+    adapters["codex"].results = [_no_block("codex"), empty]
+
+    done = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
+
+    assert done.status == TaskStatus.partial
+    assert done.result.meta["report_recovery"] == f"failed: {NO_RESPONSE}"
+    assert done.result.meta["executor_failure"] == "network"
+    assert "codex" in dispatcher.availability.unavailable()
+    events = await storage.list_events(done.task_id)
+    assert any(e["kind"] == "cooldown" and e["payload"]["kind"] == "network" for e in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first", "execution"),
+    [
+        pytest.param(_no_block("codex"), {"report_recovery_timeout_seconds": 0}, id="disabled"),
+        pytest.param(_no_block("codex", session=None), {}, id="no-session"),
+    ],
+)
+async def test_report_is_not_asked_again_when_it_cannot_be(tmp_path, git_repo, first, execution):
+    _, adapters, dispatcher = await _make(tmp_path, **execution)
+    adapters["codex"].results = [first]
+
+    done = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
+
+    assert done.status == TaskStatus.partial
+    assert "report_recovery" not in done.result.meta
+    assert len(adapters["codex"].calls) == 1
 
 
 @pytest.mark.asyncio
