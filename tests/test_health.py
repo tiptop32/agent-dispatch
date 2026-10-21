@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from agent_dispatch.executors.health import classify_failure
+from agent_dispatch.executors.opencode import NO_RESPONSE
 from agent_dispatch.models import ExecutionResult
 
 # Хвост stdout codex, у которого пропала связь с API (задачи 09-23, 30 минут до таймаута).
@@ -60,10 +61,17 @@ def _failed(error: str, summary: str = "", changed_files: list[str] | None = Non
         pytest.param(
             "Missing environment variable: `OPENAI_API_KEY`.", "auth", id="any-provider-key"
         ),
+        pytest.param(NO_RESPONSE, "network", id="opencode-no-model-response"),
     ],
 )
 def test_cli_messages_about_the_executor_are_classified(error, expected):
     assert classify_failure(_failed(error)) == expected
+
+
+def test_no_response_phrase_inside_another_error_does_not_count():
+    # Только строка адаптера с начала: тот же текст в ошибке MCP-сервера или в
+    # выводе теста про opencode о самом исполнителе ничего не говорит.
+    assert classify_failure(_failed(f"MCP server x failed: {NO_RESPONSE}")) is None
 
 
 def test_timeout_after_codex_lost_the_api_is_a_network_failure():

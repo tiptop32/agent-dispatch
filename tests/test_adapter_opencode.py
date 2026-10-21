@@ -7,17 +7,17 @@ import pytest
 
 from agent_dispatch.config import ExecutorSettings
 from agent_dispatch.executors.base import RunContext
-from agent_dispatch.executors.opencode import OpenCodeAdapter
+from agent_dispatch.executors.opencode import NO_RESPONSE, OpenCodeAdapter
 from agent_dispatch.executors.process import ProcessOutcome
 
 ROOT = Path(__file__).parent
 
 
-def parse_stdout(stdout: str):
+def parse_stdout(stdout: str, changed: list[str] | None = None):
     adapter = OpenCodeAdapter(
         "opencode", ExecutorSettings(adapter="opencode", command="opencode", model="m")
     )
-    return adapter._parse_result(ProcessOutcome(0, stdout, "", False, 12), [])
+    return adapter._parse_result(ProcessOutcome(0, stdout, "", False, 12), changed or [])
 
 
 def stream(*events: dict) -> str:
@@ -391,3 +391,56 @@ async def test_opencode_missing_binary_reports_unavailable(tmp_path):
         "opencode", ExecutorSettings(adapter="opencode", command="/nonexistent/opencode", model="m")
     ).check()
     assert not result.available and result.error
+
+
+# Весь stdout пустого запуска x5-code-large 2026-10-21 (задача e692cbb1): один
+# `step_start`, затем выход с кодом 0 через шесть минут.
+STEP_START = {
+    "type": "step_start",
+    "timestamp": 1792586574733,
+    "sessionID": "ses_ea1839e9effea8sdeOppJSxvF9",
+    "part": {"type": "step-start"},
+}
+STEP_FINISH = {
+    "type": "step_finish",
+    "sessionID": "ses_ea1839e9effea8sdeOppJSxvF9",
+    "part": {"type": "step-finish", "tokens": {"input": 120, "output": 4}, "cost": 0},
+}
+
+
+def test_run_without_a_single_model_step_is_an_executor_failure():
+    result = parse_stdout(stream(STEP_START))
+
+    assert result.status == "failed"
+    assert result.error == NO_RESPONSE
+    assert result.meta["session_id"] == "ses_ea1839e9effea8sdeOppJSxvF9"
+
+
+@pytest.mark.parametrize(
+    ("events", "changed"),
+    [
+        pytest.param([STEP_START, STEP_FINISH], [], id="model-answered-without-text"),
+        pytest.param(
+            [STEP_START, {"type": "text", "part": {"type": "text", "text": "done"}}],
+            [],
+            id="text-without-block",
+        ),
+        pytest.param(
+            [STEP_START, {"type": "tool_use", "part": {"tool": "read", "state": {}}}],
+            [],
+            id="tool-call-without-block",
+        ),
+        pytest.param(
+            [STEP_START, {"type": "reasoning", "part": {"type": "reasoning", "text": "hm"}}],
+            [],
+            id="reasoning-only",
+        ),
+        pytest.param([STEP_START], ["a.py"], id="files-changed"),
+    ],
+)
+def test_run_where_the_model_did_something_stays_a_missing_report(events, changed):
+    result = parse_stdout(stream(*events), changed)
+
+    assert result.status == "partial"
+    assert result.meta["parse_error"] == "no result block"
+    assert result.error is None

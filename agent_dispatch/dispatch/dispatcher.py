@@ -12,12 +12,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_dispatch.config import Settings
-from agent_dispatch.dispatch import followup, verify
+from agent_dispatch.dispatch import followup, report_recovery, verify
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import (
     Followup,
     build_task_package,
     render_prompt,
+    render_report_prompt,
     rewrite_repo_prefix,
 )
 from agent_dispatch.executors import workspace, worktree
@@ -700,6 +701,8 @@ class Dispatcher:
             ctx = await self._build_context(record, decision, tree, resume=False)
             result = await self._call_adapter(adapter, ctx, decision)
             result.meta["resume_failed"] = True
+        if not review and report_recovery.needs_report(result):
+            result = await self._recover_report(record, decision, adapter, ctx, result)
         if review:
             await self._check_review_wrote_nothing(req, before, result)
         await self._note_executor_failure(record, decision, result)
@@ -788,6 +791,40 @@ class Dispatcher:
                 # Работа уже в коммите: несостоявшийся откат оставляет в патче
                 # только артефакты проверки, а не отменяет результат исполнителя.
                 result.meta["verify_artifacts_kept"] = f"discard failed: {exc}"
+
+    async def _recover_report(
+        self,
+        record: TaskRecord,
+        decision: RouteDecision,
+        adapter: ExecutorAdapter,
+        ctx: RunContext,
+        result: ExecutionResult,
+    ) -> ExecutionResult:
+        """Продолжить сессию исполнителя одним «дай отчёт» о сделанной работе."""
+        timeout = self.settings.execution.report_recovery_timeout_seconds
+        if not timeout:
+            return result
+        session = result.meta["session_id"]
+        adapter_kind = self.settings.executors[decision.executor].adapter
+        report_ctx = ctx.model_copy(
+            update={
+                "prompt": render_report_prompt(adapter_kind),
+                "resume_session": session,
+                "timeout_seconds": min(timeout, ctx.timeout_seconds),
+            }
+        )
+        report = await self._call_adapter(adapter, report_ctx, decision)
+        # Дозапрос мог упасть на сбое самого исполнителя (лимит, пустой ответ
+        # opencode): итог задачи несёт ошибку первого запуска, а не его, и без
+        # этого вызова исполнитель остался бы в ротации.
+        await self._note_executor_failure(record, decision, report)
+        merged = report_recovery.merge_report(result, report)
+        await self.storage.add_event(
+            record.task_id,
+            "report_recovery",
+            {"session": session, "outcome": merged.meta["report_recovery"]},
+        )
+        return merged
 
     @staticmethod
     async def _call_adapter(

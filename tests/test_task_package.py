@@ -4,7 +4,12 @@ from pathlib import Path
 import pytest
 
 from agent_dispatch.config import ExecutorSettings, RoutingSettings, Settings
-from agent_dispatch.dispatch.task_package import TaskPackage, build_task_package, render_prompt
+from agent_dispatch.dispatch.task_package import (
+    TaskPackage,
+    build_task_package,
+    render_prompt,
+    render_report_prompt,
+)
 from agent_dispatch.models import ContextMode, DispatchRequest, SourceAgent
 
 
@@ -238,3 +243,15 @@ def test_render_prompt_in_place_mode_keeps_paths_verbatim():
     rendered = render_prompt(TaskPackage(request=req), "claude", settings())
     assert "/repo/project/src/client.py" in rendered
     assert "/wt/" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("adapter", "format_hint"),
+    [("codex", "structured output schema"), ("opencode", "```agent-dispatch-result")],
+)
+def test_report_prompt_asks_only_for_the_report_in_the_adapter_format(adapter, format_hint):
+    prompt = render_report_prompt(adapter)
+
+    assert prompt.startswith("# Report")
+    assert "Do not change any files" in prompt
+    assert format_hint in prompt
