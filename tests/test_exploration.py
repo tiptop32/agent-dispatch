@@ -176,7 +176,9 @@ def test_corporate_and_availability_guards_still_win() -> None:
     unavailable = apply_exploration(
         "a" * 32,
         request,
-        _jev_decision(),
+        # Ответ «нет» снял периметр: иначе fail closed сузил бы статический
+        # выбор до корпоративного codex/luna, и crossover остался бы непроверен.
+        _jev_decision(corporate=False),
         settings.executors,
         settings,
         unavailable={"codex/sol"},
@@ -188,6 +190,17 @@ def test_corporate_and_availability_guards_still_win() -> None:
     assert unavailable.judgments["exploration_arm"].value == "explore"
     assert unavailable.judgments["exploration_crossover"].value == "codex/sol"
     assert "недоступен" in unavailable.meta["exploration_note"]
+
+
+def test_exploration_without_corporate_answer_stays_inside_the_perimeter() -> None:
+    # Ответа о корп. данных нет, периметр включён, корпоративный исполнитель
+    # в пуле есть: статический baseline тоже не выходит за периметр.
+    settings = _settings()
+    settings.executors["codex/luna"].corporate = True
+    result = apply_exploration(
+        "a" * 32, DispatchRequest(task="x", cwd="."), _jev_decision(), settings.executors, settings
+    )
+    assert result.judgments["exploration_static_choice"].value == "codex/luna"
 
 
 @pytest.mark.asyncio

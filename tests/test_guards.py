@@ -267,3 +267,165 @@ def test_post_fallback_chain_exhausted_keeps_top1_with_warning():
     assert out.executor == "claude"
     assert out.meta["warning"] == "fallback executor unavailable: opencode/kimi, codex"
     assert events[-1].reason == GuardReason.unavailable
+
+
+def perimeter_settings(chain):
+    return Settings.model_validate(
+        {
+            "routing": {"fallback_executor": chain},
+            "executors": {
+                "internal": {"adapter": "opencode", "model": "m", "corporate": True},
+                "codex": {"adapter": "codex"},
+                "claude": {"adapter": "claude"},
+            },
+        }
+    )
+
+
+def _corporate_judgment():
+    from agent_dispatch.models import Judgment
+
+    return Judgment(kind="noul", value=True, confidence=0.9, probabilities={})
+
+
+def test_post_low_confidence_keeps_fallback_inside_perimeter():
+    """Слабое решение, суженное до периметра: fallback не выводит задачу наружу."""
+    from agent_dispatch.models import RouteDecision, RouterKind
+
+    s = perimeter_settings(["codex"])
+    d = RouteDecision(
+        router=RouterKind.jev,
+        executor="internal",
+        confidence=0.3,
+        scores={"internal": 0.9},
+        judgments={"corporate_data": _corporate_judgment()},
+    )
+    out, events = post_guards(d, s, ["internal", "codex"])
+    assert out.executor == "internal"
+    assert out.meta["perimeter"] == "answered"
+    # Цепочка без исполнителя периметра: задача остаётся у внутреннего
+    # исполнителя, событие unavailable объясняет, почему fallback не взят.
+    assert [e.reason for e in events] == [GuardReason.low_confidence, GuardReason.unavailable]
+    assert "corporate perimeter" in out.meta["warning"]
+
+
+def test_post_guards_narrows_unanswered_perimeter_to_corporate():
+    """claude_local вопрос не задаёт: уверенный внешний выбор сужается (fail closed)."""
+    from agent_dispatch.models import RouteDecision, RouterKind
+
+    d = RouteDecision(
+        router=RouterKind.claude_local, executor="claude", confidence=0.99, scores={"claude": 0.99}
+    )
+    out, _ = post_guards(d, perimeter_settings(["codex"]), ["internal", "codex", "claude"])
+    assert out.executor == "internal"
+    assert out.meta["perimeter"] == "unknown"
+    assert any("fail closed" in note for note in out.meta["selection_notes"])
+
+
+def test_post_weak_without_corporate_in_chain_stays_inside_perimeter():
+    """В цепочке нет исполнителя периметра: выбор остаётся в пуле, с предупреждением."""
+    from agent_dispatch.models import RouteDecision, RouterKind
+
+    s = perimeter_settings(["codex"])
+    d = RouteDecision(
+        router=RouterKind.jev,
+        executor="claude",
+        confidence=0.3,
+        scores={"claude": 0.9, "internal": 0.1},
+        judgments={"corporate_data": _corporate_judgment()},
+    )
+    out, events = post_guards(d, s, ["internal", "claude", "codex"])
+    assert out.executor == "internal"
+    assert "corporate perimeter" in out.meta["warning"]
+    assert events[-1].reason == GuardReason.unavailable
+
+
+def test_post_fallback_respects_max_capability():
+    """Слабое решение не уходит к fallback выше потолка запроса."""
+    from agent_dispatch.models import RouteDecision, RouterKind
+
+    s = Settings.model_validate(
+        {
+            "routing": {"fallback_executor": ["strong"]},
+            "executors": {
+                "cheap": {"adapter": "codex", "tier": "fast"},
+                "strong": {"adapter": "claude", "tier": "strong"},
+            },
+        }
+    )
+    # top1 по оценкам роутера выше потолка: подмена на него нарушила бы потолок.
+    d = RouteDecision(
+        router=RouterKind.jev,
+        executor="cheap",
+        confidence=0.3,
+        scores={"strong": 0.95, "cheap": 0.9},
+    )
+    out, _ = post_guards(d, s, ["cheap", "strong"], max_capability="fast")
+    assert out.executor == "cheap"
+    # Цепочка содержит только исполнителя выше потолка: выбор роутера остаётся.
+    assert out.meta["warning"] == "fallback executor unavailable: strong"
+
+
+def test_post_fallback_keeps_perimeter_over_ceiling():
+    """Периметр сильнее потолка: fallback выше `max_capability` остаётся внутри периметра."""
+    from agent_dispatch.models import RouteDecision, RouterKind
+
+    s = Settings.model_validate(
+        {
+            "routing": {"fallback_executor": ["external"]},
+            "executors": {
+                "strong_internal": {
+                    "adapter": "opencode",
+                    "model": "m",
+                    "tier": "strong",
+                    "corporate": True,
+                },
+                "external": {"adapter": "codex", "tier": "fast"},
+            },
+        }
+    )
+    d = RouteDecision(
+        router=RouterKind.jev,
+        executor="strong_internal",
+        confidence=0.3,
+        scores={"strong_internal": 0.9},
+        judgments={"corporate_data": _corporate_judgment()},
+    )
+    out, _ = post_guards(d, s, ["strong_internal", "external"], max_capability="fast")
+    assert out.executor == "strong_internal"
+    assert any("perimeter was kept" in note for note in out.meta["selection_notes"])
+
+
+def test_post_guards_keeps_perimeter_when_all_corporate_executors_are_cooling():
+    """Остывание всех корпоративных исполнителей не открывает периметр молча."""
+    from agent_dispatch.models import Judgment, RouteDecision, RouterKind
+
+    s = Settings.model_validate(
+        {
+            "routing": {"fallback_executor": ["external"]},
+            "executors": {
+                "external": {"adapter": "codex", "tier": "balanced"},
+                "internal": {
+                    "adapter": "opencode",
+                    "model": "m",
+                    "tier": "balanced",
+                    "corporate": True,
+                },
+            },
+        }
+    )
+    d = RouteDecision(
+        router=RouterKind.jev,
+        executor="external",
+        confidence=0.99,
+        scores={"external": 0.99},
+        judgments={
+            "corporate_data": Judgment(
+                kind="noul", value=True, confidence=0.9, probabilities={"true": 0.95}
+            )
+        },
+    )
+    # `internal` остывает и в кандидаты не попал.
+    out, _ = post_guards(d, s, ["external"])
+    assert out.meta["perimeter"] == "answered"
+    assert any("no in-perimeter executor" in note for note in out.meta["selection_notes"])

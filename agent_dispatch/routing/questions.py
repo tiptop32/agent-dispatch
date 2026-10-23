@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from agent_dispatch.models import DispatchRequest, Judgment
@@ -95,6 +96,22 @@ def build_questions(capabilities: list[str], *, ask_corporate: bool = False) -> 
     return questions
 
 
+#: Допуск на шум округления вероятностей у провайдера.
+_EPSILON = 1e-6
+
+
+def _check_probability(name: str, value: float) -> float:
+    """Вероятность обязана быть конечным числом из [0, 1].
+
+    NaN и значения вне отрезка читались бы как уверенные ответы: NaN дал бы
+    «нет» с полной уверенностью, 1.5 — «да». Это ошибка роутера, а не ответ.
+    """
+    if not math.isfinite(value) or not -_EPSILON <= value <= 1.0 + _EPSILON:
+        raise RouterError(f"invalid noul answer: {name}" if name else "invalid probabilities")
+    # Шум округления провайдера (1.0000001) это не ошибка роутера.
+    return min(1.0, max(0.0, value))
+
+
 def _probabilities(answer: dict[str, Any], labels: list[str] | None = None) -> dict[str, float]:
     probs = answer.get("probabilities")
     if probs is None:
@@ -103,6 +120,8 @@ def _probabilities(answer: dict[str, Any], labels: list[str] | None = None) -> d
         probs = {str(k): float(v) for k, v in probs.items()}
     except (AttributeError, TypeError, ValueError) as exc:
         raise RouterError("invalid probabilities") from exc
+    for value in probs.values():
+        _check_probability("", value)
     if labels and not probs:
         value = answer.get("score", answer.get("choice"))
         probs = {label: 1.0 if str(value) == label else 0.0 for label in labels}
@@ -112,7 +131,11 @@ def _probabilities(answer: dict[str, Any], labels: list[str] | None = None) -> d
 def _judgment_from(name: str, answer: dict[str, Any]) -> Judgment | None:
     kind = answer.get("type")
     if kind == "noul":
-        probability = float(answer.get("noul", answer.get("probability", 0.0)))
+        raw = answer.get("noul", answer.get("probability"))
+        if raw is None:
+            # Молчаливый 0.0 читался бы как уверенное «нет» — решением быть не может.
+            raise RouterError(f"invalid noul answer: {name}")
+        probability = _check_probability(name, float(raw))
         return Judgment(
             kind="noul",
             value=noul_yes(probability),
@@ -155,7 +178,8 @@ def _parse_answers(
     choice = capability_answer.get("choice") if isinstance(capability_answer, dict) else None
     if choice is None or choice not in capabilities:
         raise RouterError("missing or unknown capability choice")
-    confidence = float(capability_answer.get("confidence", 0.0))
+    # NaN прошёл бы мимо порога `low_confidence`: сравнение с NaN всегда ложно.
+    confidence = _check_probability("", float(capability_answer.get("confidence", 0.0)))
     probabilities = _probabilities(capability_answer)
     if abs(sum(probabilities.values()) - 1.0) > 0.02:
         raise RouterError("capability probabilities do not sum to 1")

@@ -12,9 +12,15 @@ from agent_dispatch.models import (
 )
 
 from .base import Router, RouterError
-from .capability import TIERS, narrows_to_perimeter, select
+from .capability import (
+    PERIMETER_UNKNOWN_NOTE,
+    TIERS,
+    perimeter_applies,
+    perimeter_required,
+    select,
+)
 from .claude_local import ClaudeLocalRouter
-from .guards import fallback_unavailable, pick_fallback, post_guards, single_candidate_decision
+from .guards import fallback_choice, post_guards, single_candidate_decision
 from .jev import JevRouter
 
 
@@ -34,21 +40,23 @@ def _apply_capability_ceiling(
     if capability not in TIERS or TIERS.index(capability) <= TIERS.index(ceiling):
         return decision
 
-    corporate = decision.judgments.get("corporate_data")
-    narrow = narrows_to_perimeter(
+    verdict = perimeter_required(
         candidates,
-        answered_yes=bool(corporate and corporate.value),
-        confidence=corporate.confidence if corporate else 0.0,
         perimeter=settings.routing.corporate_perimeter,
+        corporate=decision.judgments.get("corporate_data"),
         min_confidence=settings.routing.corporate_min_confidence,
+        configured=settings.executors,
     )
+    corporate = decision.judgments.get("corporate_data")
     judgment = decision.judgments.get("judgment")
     pool_args = {
         "judgment": bool(judgment and judgment.value),
-        "corporate": narrow,
+        "corporate": verdict.required,
         "corporate_confidence": corporate.confidence if corporate else None,
     }
     selection = select(capability, candidates, max_capability=ceiling, **pool_args)
+    if verdict.status == "unknown" and PERIMETER_UNKNOWN_NOTE not in selection.notes:
+        selection.notes.append(PERIMETER_UNKNOWN_NOTE)
     # Заметки выбора без потолка («sent to a reasoning agent») описывают уже
     # отменённый выбор: их заменяют заметки нового. Заметки самого роутера
     # (например, о низкой уверенности ответа про корп. данные) остаются.
@@ -69,25 +77,56 @@ async def decide_with_fallback(
     routers: list[Router],
 ) -> tuple[RouteDecision, list[GuardEvent]]:
     names = list(candidates)
-    if len(names) == 1:
+    configured = settings.executors
+    perimeter = perimeter_applies(settings.routing.corporate_perimeter, configured)
+    if len(names) == 1 and not perimeter:
         return single_candidate_decision(names[0]), []
+    # При применимом периметре короткого пути нет: ответ о корп. данных решает
+    # судьбу всей линии задачи (эскалации, вложенных задач). Без вопроса
+    # пришлось бы либо выпускать её наружу, либо запирать в периметре вслепую;
+    # «неизвестно» остаётся только на случай отказа роутеров.
     events: list[GuardEvent] = []
     for router in routers:
         try:
             decision = await router.decide(req, candidates)
             decision = _apply_capability_ceiling(req, decision, candidates, settings)
-            final, post_events = post_guards(decision, settings, names)
+            final, post_events = post_guards(
+                decision, settings, names, max_capability=req.max_capability
+            )
             return final, events + post_events
         except RouterError as exc:
             events.append(
                 GuardEvent(reason=GuardReason.router_unavailable, detail=f"{router.name}: {exc}")
             )
-    fallback = pick_fallback(settings, names)
+    # Роутеров нет или все упали: ответа о корп. данных нет. При включённом
+    # периметре это «неизвестно», и fallback не выходит за периметр (fail
+    # closed): отказ обоих роутеров не должен выводить задачу наружу молча.
+    pool = {name: item for name in names if (item := configured.get(name)) is not None}
+    fallback, notes, warning = fallback_choice(
+        settings,
+        pool,
+        perimeter=perimeter,
+        ceiling=req.max_capability,
+        keep=None,
+        capability=req.max_capability,
+    )
+    meta: dict[str, str | list[str]] = {}
     extra_events: list[GuardEvent] = []
-    meta: dict[str, str] = {}
+    if perimeter:
+        meta["perimeter"] = "unknown"
+        if any(item.corporate for item in pool.values()):
+            notes.append(PERIMETER_UNKNOWN_NOTE)
     if fallback is None:
-        fallback = names[0]
-        warning = fallback_unavailable(settings)
+        capped = [
+            name
+            for name, item in pool.items()
+            if req.max_capability not in TIERS
+            or (item.tier in TIERS and TIERS.index(item.tier) <= TIERS.index(req.max_capability))
+        ]
+        fallback = (capped or names)[0]
+    if notes:
+        meta["selection_notes"] = notes
+    if warning is not None:
         meta["warning"] = warning
         extra_events.append(
             GuardEvent(

@@ -8,7 +8,7 @@ from collections.abc import Collection
 from agent_dispatch.config import ExecutorSettings, Settings
 from agent_dispatch.models import DispatchRequest, Judgment, RouteDecision, RouterKind
 
-from .capability import narrows_to_perimeter, select
+from .capability import perimeter_required, select
 
 STATIC_BASELINE_TIER = "balanced"
 ARM_JUDGMENT = "exploration_arm"
@@ -44,15 +44,14 @@ def _static_executor(
     candidates: dict[str, ExecutorSettings],
     settings: Settings,
 ) -> str:
-    corporate = decision.judgments.get("corporate_data")
-    narrow = narrows_to_perimeter(
+    verdict = perimeter_required(
         candidates,
-        answered_yes=bool(corporate and corporate.value),
-        confidence=corporate.confidence if corporate else 0.0,
         perimeter=settings.routing.corporate_perimeter,
+        corporate=decision.judgments.get("corporate_data"),
         min_confidence=settings.routing.corporate_min_confidence,
+        configured=settings.executors,
     )
-    return select(STATIC_BASELINE_TIER, candidates, corporate=narrow).executor
+    return select(STATIC_BASELINE_TIER, candidates, corporate=verdict.required).executor
 
 
 def apply_exploration(

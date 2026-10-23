@@ -77,6 +77,7 @@ class GuardReason(StrEnum):
     escalated = "escalated"
     review_only = "review_only"
     budget = "budget"
+    perimeter = "perimeter"
 
 
 #: `task` меняет файлы, `review` только читает и возвращает замечания.

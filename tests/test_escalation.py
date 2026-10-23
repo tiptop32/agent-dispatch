@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -8,11 +9,16 @@ import pytest
 from agent_dispatch.config import ExecutorSettings, RoutingSettings, ServerSettings, Settings
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
+from agent_dispatch.executors.base import RunContext
+from agent_dispatch.executors.codex import CodexAdapter
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     DispatchRequest,
     ExecutionResult,
+    FollowupRequest,
     GuardReason,
+    Judgment,
+    RouteDecision,
     RouterKind,
     VerificationInfo,
 )
@@ -142,6 +148,46 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
 )
 def test_should_escalate_returns_expected_reason(result, expected):
     assert should_escalate(result) == expected
+
+
+@pytest.mark.asyncio
+async def test_partial_after_reediting_dirty_file_does_not_escalate(
+    git_repo, tmp_path, monkeypatch
+):
+    # Файл был грязным до запуска, исполнитель переписал его ещё раз и не отдал
+    # отчёт. `changed_files` сравнивает отпечатки содержимого, поэтому правка
+    # видна и эскалации `no_result` нет: иначе новый запуск лёг бы поверх работы.
+    from agent_dispatch.executors import codex as module
+
+    class Outcome:
+        exit_code = 0
+        stdout = "raw stdout tail without a result block"
+        stderr = ""
+        timed_out = False
+        duration_ms = 1
+
+    async def fake_run_cli(argv, **kwargs):
+        (Path(kwargs["cwd"]) / "a.py").write_text("x = 3\n")
+        return Outcome()
+
+    (git_repo / "a.py").write_text("x = 2\n")
+    monkeypatch.setattr(module, "run_cli", fake_run_cli)
+    result = await CodexAdapter(
+        "codex", ExecutorSettings(adapter="codex", command="codex")
+    ).execute(
+        RunContext(
+            cwd=str(git_repo),
+            timeout_seconds=3,
+            env={"PATH": os.environ.get("PATH", "")},
+            log_path=tmp_path / "run.log",
+            task_id="t",
+            prompt="do task",
+        )
+    )
+
+    assert result.status == "partial" and result.meta.get("parse_error")
+    assert result.changed_files == ["a.py"]
+    assert should_escalate(result) is None
 
 
 @pytest.mark.parametrize(
@@ -484,6 +530,250 @@ def _quota(executor: str) -> ExecutionResult:
     return ExecutionResult(
         status="failed", executor=executor, model=None, summary="", error=SPEND_LIMIT
     )
+
+
+@pytest.mark.asyncio
+async def test_perimeter_chain_skips_external_links_and_stops_when_none_left(tmp_path, git_repo):
+    """Периметр корневого решения действует на всей цепочке: внешние звенья пропущены."""
+    storage, adapters, _, dispatcher = await _make_dispatcher(
+        tmp_path, results={"opencode/kimi": _result("opencode/kimi", "failed")}
+    )
+    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    # Роутер выбрал внешнего исполнителя, не спросив о корп. данных: post_guards
+    # сужает решение до периметра, и корневое звено помечено `perimeter: unknown`.
+    dispatcher.routers = [
+        FakeRouter(
+            RouteDecision(
+                router=RouterKind.jev, executor="codex", confidence=0.99, scores={"codex": 0.99}
+            )
+        )
+    ]
+    first = await dispatcher.submit(_request(git_repo, executor=None))
+    records = await _wait_for_records(dispatcher, storage, 1)
+    parent = next(record for record in records if record.task_id == first.task_id)
+
+    assert parent.decision.executor == "opencode/kimi"
+    assert parent.decision.meta["perimeter"] == "unknown"
+    assert len(records) == 1
+    assert records[0].status == "failed"
+    assert records[0].result.meta["escalation_stopped"] == "perimeter"
+    assert not adapters["codex"].calls and not adapters["claude"].calls
+    assert not any(
+        event["kind"] == "escalate" for event in await storage.list_events(first.task_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_perimeter_chain_escalates_to_the_corporate_link(tmp_path, git_repo):
+    """Из цепочки с внешним и корпоративным звеном эскалация выбирает корпоративное."""
+    storage, adapters, _, dispatcher = await _make_dispatcher(
+        tmp_path,
+        results={
+            "opencode/kimi": _result("opencode/kimi", "failed"),
+            "claude": _result("claude"),
+        },
+    )
+    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.settings.executors["claude"].corporate = True
+    dispatcher.routers = [
+        FakeRouter(
+            RouteDecision(
+                router=RouterKind.jev,
+                executor="opencode/kimi",
+                confidence=0.99,
+                scores={"opencode/kimi": 0.99},
+            )
+        )
+    ]
+    first = await dispatcher.submit(_request(git_repo, executor=None))
+    records = await _wait_for_records(dispatcher, storage, 2)
+    child = next(record for record in records if record.escalated_from == first.task_id)
+
+    assert child.decision.executor == "claude"
+    assert "escalation_stopped" not in child.result.meta
+    assert not adapters["codex"].calls
+
+
+class _SequenceRouter:
+    """Роутер, который на каждый вызов отдаёт следующее решение из списка."""
+
+    name = "sequence"
+
+    def __init__(self, decisions: list[RouteDecision]):
+        self.decisions, self.calls = decisions, 0
+
+    async def decide(self, req, candidates):
+        decision = self.decisions[min(self.calls, len(self.decisions) - 1)]
+        self.calls += 1
+        return decision
+
+
+def _jev(executor: str, *, corporate: bool) -> RouteDecision:
+    probability = 0.95 if corporate else 0.05
+    return RouteDecision(
+        router=RouterKind.jev,
+        executor=executor,
+        confidence=0.99,
+        scores={executor: 0.99},
+        judgments={
+            "corporate_data": Judgment(
+                kind="noul",
+                value=corporate,
+                confidence=0.9,
+                probabilities={"true": probability, "false": 1 - probability},
+            )
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_perimeter_survives_reroute_after_executor_failure(tmp_path, git_repo):
+    """Переадресация роутеру после сбоя исполнителя не выходит за периметр корня.
+
+    Новый ответ Jev «не корпоративное» на переадресации не отменяет ответа
+    «корпоративное», по которому корень сузил пул.
+    """
+    storage, adapters, _, dispatcher = await _make_dispatcher(
+        tmp_path, results={"opencode/kimi": _quota("opencode/kimi")}, escalation={}
+    )
+    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.settings.executors["claude"].corporate = True
+    dispatcher.routers = [
+        _SequenceRouter([_jev("opencode/kimi", corporate=True), _jev("codex", corporate=False)])
+    ]
+    first = await dispatcher.submit(_request(git_repo, executor=None))
+    records = await _wait_for_records(dispatcher, storage, 2)
+    child = next(record for record in records if record.escalated_from == first.task_id)
+
+    assert child.decision.executor == "claude"
+    assert not adapters["codex"].calls
+    assert adapters["claude"].calls
+
+
+@pytest.mark.asyncio
+async def test_perimeter_survives_followup_to_router(tmp_path, git_repo):
+    """Follow-up при остывшем исполнителе идёт роутеру, но в периметре исходной задачи."""
+    storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
+    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.settings.executors["claude"].corporate = True
+    dispatcher.routers = [
+        _SequenceRouter([_jev("opencode/kimi", corporate=True), _jev("codex", corporate=False)])
+    ]
+    first = await dispatcher.submit(_request(git_repo, executor=None))
+    assert (await dispatcher.wait(first.task_id, WAIT)).status == "completed"
+    dispatcher.availability.trip("opencode/kimi", "rate_limit", "test", 600)
+
+    record = await dispatcher.followup(first.task_id, FollowupRequest(message="more"))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    assert done.decision.executor == "claude"
+    assert not adapters["codex"].calls
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_nested_task_with_external_executor_is_refused_under_parent_perimeter(
+    tmp_path, git_repo
+):
+    """Вложенный dispatch из корпоративной задачи не уходит к внешнему исполнителю."""
+    storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
+    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.routers = [_SequenceRouter([_jev("opencode/kimi", corporate=True)])]
+    gate = asyncio.Event()
+    adapters["opencode/kimi"].gate = gate
+    parent = await dispatcher.submit(_request(git_repo, executor=None))
+    await asyncio.wait_for(adapters["opencode/kimi"].started.wait(), WAIT)
+
+    child = await dispatcher.submit(
+        _request(git_repo, executor="codex", parent_task_id=parent.task_id).model_copy(
+            update={"hop": 1}
+        )
+    )
+    done = await dispatcher.wait(child.task_id, WAIT)
+    gate.set()
+    await dispatcher.wait(parent.task_id, WAIT)
+
+    assert done.status == "failed"
+    assert done.result.meta["guard"] == "perimeter"
+    assert "corporate perimeter" in done.result.error
+    assert not adapters["codex"].calls
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_task_is_refused_when_every_corporate_executor_is_cooling(tmp_path, git_repo):
+    """Ответ «корпоративное» при остывших корпоративных исполнителях даёт отказ."""
+    storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
+    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.availability.trip("opencode/kimi", "rate_limit", "test", 600)
+    dispatcher.routers = [_SequenceRouter([_jev("codex", corporate=True)])]
+
+    first = await dispatcher.submit(_request(git_repo, executor=None))
+    done = await dispatcher.wait(first.task_id, WAIT)
+
+    assert done.status == "failed"
+    assert done.result.meta["guard"] == "perimeter"
+    assert not adapters["codex"].calls and not adapters["claude"].calls
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_single_corporate_candidate_escalation_stays_inside(tmp_path, git_repo):
+    """Звено, выбранное коротким путём «один кандидат», эскалирует только в периметре."""
+    storage, adapters, _, dispatcher = await _make_dispatcher(
+        tmp_path, results={"opencode/kimi": _result("opencode/kimi", "failed")}
+    )
+    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.availability.trip("claude", "rate_limit", "test", 600)
+    dispatcher.availability.trip("codex", "rate_limit", "test", 600)
+    first = await dispatcher.submit(_request(git_repo, executor=None))
+    done = await dispatcher.wait(first.task_id, WAIT)
+    dispatcher.availability.clear()
+
+    assert done.task_id == first.task_id
+    assert done.decision.meta["perimeter"] == "unknown"
+    assert not adapters["codex"].calls and not adapters["claude"].calls
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_root_explicit_external_executor_is_not_refused_under_perimeter_config(
+    tmp_path, git_repo
+):
+    """Явный `executor` корневой задачи это решение владельца данных: отказа нет."""
+    storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
+    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    done = await dispatcher.wait(
+        (await dispatcher.submit(_request(git_repo, executor="codex"))).task_id, WAIT
+    )
+    assert done.status == "completed" and adapters["codex"].calls
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_perimeter_off_lets_nested_task_use_external_executor(tmp_path, git_repo):
+    """`corporate_perimeter: false`: наследования и отказа нет, как до исправления."""
+    storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
+    dispatcher.settings.routing.corporate_perimeter = False
+    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.routers = [_SequenceRouter([_jev("opencode/kimi", corporate=True)])]
+    gate = asyncio.Event()
+    adapters["opencode/kimi"].gate = gate
+    parent = await dispatcher.submit(_request(git_repo, executor=None))
+    await asyncio.wait_for(adapters["opencode/kimi"].started.wait(), WAIT)
+
+    child = await dispatcher.submit(
+        _request(git_repo, executor="codex", parent_task_id=parent.task_id).model_copy(
+            update={"hop": 1}
+        )
+    )
+    done = await dispatcher.wait(child.task_id, WAIT)
+    gate.set()
+    finished = await dispatcher.wait(parent.task_id, WAIT)
+
+    assert done.status == "completed" and adapters["codex"].calls
+    assert "perimeter" not in finished.decision.meta
+    await storage.close()
 
 
 def test_next_executor_skips_unavailable_link(tmp_path):

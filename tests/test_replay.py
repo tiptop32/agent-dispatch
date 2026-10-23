@@ -26,6 +26,7 @@ from evals.replay.harness import (
     git_acceptance,
     load,
     load_decisions,
+    perimeter_violations,
     render,
     replay,
     router_vs_static,
@@ -1164,3 +1165,29 @@ def test_children_refusals_recount_the_quota_by_todays_rule():
     assert "max_children refusals: 4, today's rule (limit 2) admits 1" in render(
         {**replay([]), "children_refusals": report}
     )
+
+
+def test_perimeter_violations_follow_the_whole_lineage():
+    """Запуск на внешнем исполнителе под периметром предка это нарушение, отказ нет."""
+    root = _task("root0000", "failed", executor="internal")
+    root.perimeter = "answered"
+    leaked = _task("leak0000", "completed", executor="codex/sol", parent="root0000")
+    nested = _task("nest0000", "completed", executor="codex/sol", parent_task_id="root0000")
+    followup = _task("foll0000", "completed", executor="codex/sol")
+    followup.followup_of = "root0000"
+    refused = _task(
+        "refu0000",
+        "failed",
+        executor="codex/sol",
+        parent_task_id="root0000",
+        result=_result("failed", meta={"guard": "perimeter"}),
+    )
+    free = _task("free0000", "completed", executor="codex/sol")
+    inside = _task("insi0000", "completed", executor="internal", parent="root0000")
+
+    report = perimeter_violations(
+        [root, leaked, nested, followup, refused, free, inside], lambda name: name == "internal"
+    )
+
+    assert report["count"] == 3
+    assert {row["task_id"] for row in report["runs"]} == {"leak0000", "nest0000", "foll0000"}

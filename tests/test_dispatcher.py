@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -189,6 +191,59 @@ async def test_per_cwd_lock_serializes_same_repo(tmp_path, git_repo):
     a["codex"].gate.set()
     await d.wait(r1.task_id, WAIT)
     await d.wait(r2.task_id, WAIT)
+
+
+def _git(repo: Path, *args: str) -> None:
+    """git-команда в репе без унаследованных GIT_* (как в conftest.git_repo)."""
+    env = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, "HOME": str(repo)}
+    subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True)
+
+
+@pytest.mark.asyncio
+async def test_per_cwd_lock_keys_working_copy_root(tmp_path, git_repo):
+    """Корень и подкаталог одной рабочей копии стоят в одной очереди lock."""
+    _, st, a, d = await _make(tmp_path)
+    a["codex"].gate = asyncio.Event()
+    sub = git_repo / "sub"
+    sub.mkdir()
+    r1 = await d.submit(_req(git_repo))
+    r2 = await d.submit(_req(sub))
+    await asyncio.wait_for(a["codex"].started.wait(), WAIT)
+    # Ждём, пока r2 дойдёт до lock: slot выдан, дальше только ключ lock. Если бы
+    # ключом был cwd, r2 стартовал бы за миллисекунды; окно ниже это ловит.
+    async with asyncio.timeout(WAIT):
+        while not any(  # noqa: ASYNC110
+            e["kind"] == "slot" for e in await st.list_events(r2.task_id)
+        ):
+            await asyncio.sleep(0.01)
+    await asyncio.sleep(0.2)
+    assert len(a["codex"].calls) == 1
+    a["codex"].gate.set()
+    await d.wait(r1.task_id, WAIT)
+    await d.wait(r2.task_id, WAIT)
+
+
+@pytest.mark.asyncio
+async def test_per_cwd_lock_keeps_separate_worktrees_parallel(tmp_path, git_repo):
+    """Отдельные `git worktree` одного репозитория друг друга не ждут."""
+    _, _, a, d = await _make(tmp_path)
+    wt1, wt2 = tmp_path / "wt1", tmp_path / "wt2"
+    _git(git_repo, "worktree", "add", str(wt1), "-b", "wt1")
+    _git(git_repo, "worktree", "add", str(wt2), "-b", "wt2")
+    a["codex"].gate = asyncio.Event()
+    r1 = await d.submit(_req(wt1))
+    r2 = await d.submit(_req(wt2))
+    async with asyncio.timeout(WAIT):
+        while len(a["codex"].calls) < 2:  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+    a["codex"].gate.set()
+    await d.wait(r1.task_id, WAIT)
+    await d.wait(r2.task_id, WAIT)
+
+
+# Каталог вне git dispatcher не принимает вообще (guard `bad_cwd` в `submit`),
+# поэтому отдельный тест на fallback-ключ для не-git `cwd` не нужен: до `_cwd_lock`
+# такая задача не доходит.
 
 
 @pytest.mark.asyncio
