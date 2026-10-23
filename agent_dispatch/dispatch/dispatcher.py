@@ -505,6 +505,13 @@ class Dispatcher:
             # Повторная маршрутизация после сбоя исполнителя: те, кто уже брал
             # задачу, в выбор не входят, иначе роутер вернул бы её им же.
             exclude = set(await self._escalation_chain(record))
+        inherited = await self._lineage_perimeter(record, ancestors_only=True)
+        if record.request.executor is None and inherited:
+            # Переадресация, follow-up и вложенная задача наследуют периметр
+            # предка: новый ответ Jev «не корпоративное» не выпускает их наружу.
+            exclude |= {
+                name for name, item in self.settings.executors.items() if not item.corporate
+            }
         routing = await self._route(
             record.request,
             is_escalation=record.escalated_from is not None,
@@ -512,9 +519,17 @@ class Dispatcher:
             current_task_id=record.task_id,
         )
         if routing.guard and routing.guard.reason != GuardReason.user_override:
+            if inherited and routing.guard.reason == GuardReason.unavailable:
+                routing.guard.detail += (
+                    " inside the corporate perimeter inherited from an ancestor task"
+                )
             await self._guard_failure(record, routing.guard)
             return None
         decision = routing.decision
+        refusal = self._perimeter_refusal(decision, inherited)
+        if refusal is not None:
+            await self._guard_failure(record, refusal)
+            return None
         if record.escalated_from is not None:
             decision = decision.model_copy(
                 update={"router": RouterKind.fallback, "reason": GuardReason.escalated}
@@ -1069,10 +1084,19 @@ class Dispatcher:
         unavailable = self.availability.unavailable() | review_only_executors(
             record.request, self.settings
         )
-        nxt = next_executor(decision.executor, self.settings, tried, unavailable)
-        plan = EscalationPlan(
-            reason=reason, tried=tried, executor=nxt, reroute=nxt is None and bool(failure)
+        # Периметр предка действует на каждом звене: он читается из базы,
+        # поэтому переживает рестарт демона.
+        corporate_only = await self._lineage_perimeter(record) is not None
+        nxt = next_executor(
+            decision.executor, self.settings, tried, unavailable, corporate_only=corporate_only
         )
+        # Переадресация роутеру остаётся: `_prepare` сузит её выбор до периметра.
+        reroute = nxt is None and bool(failure)
+        if corporate_only and nxt is None and not reroute:
+            if next_executor(decision.executor, self.settings, tried, unavailable) is not None:
+                # Внешние звенья пропущены, а корпоративных не осталось.
+                result.meta["escalation_stopped"] = "perimeter"
+        plan = EscalationPlan(reason=reason, tried=tried, executor=nxt, reroute=reroute)
         if not plan.hands_off:
             return plan
         stop = await self._budget_stop(links, result)
@@ -1082,6 +1106,67 @@ class Dispatcher:
         # работу (`integration_held`): цепочка кончается здесь, работа
         # интегрируется, как у любой исчерпанной цепочки.
         return EscalationPlan(reason=f"{reason}; {stop}", tried=tried)
+
+    async def _lineage_perimeter(
+        self, record: TaskRecord, *, ancestors_only: bool = False
+    ) -> str | None:
+        """Статус периметра, унаследованный от предков задачи, или None.
+
+        Звенья эскалации, переадресация роутеру, follow-up и вложенные задачи
+        не видят ответа Jev о корп. данных исходной задачи. Требование
+        читается из `decision.meta.perimeter` самой задачи (кроме
+        `ancestors_only`) и всех её предков по `escalated_from`, `followup_of`
+        и `parent_task_id` в базе, поэтому переживает рестарт демона.
+        Выключенный в конфиге периметр не наследуется.
+        """
+        if not self.settings.routing.corporate_perimeter:
+            return None
+        pending: list[TaskRecord] = [record]
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current.task_id in seen:
+                continue
+            seen.add(current.task_id)
+            own = current is not record or not ancestors_only
+            status = current.decision.meta.get("perimeter") if current.decision else None
+            if own and status in ("answered", "unknown"):
+                return status
+            for parent_id in (
+                current.escalated_from,
+                current.request.followup_of,
+                current.parent_task_id or current.request.parent_task_id,
+            ):
+                if parent_id and parent_id not in seen:
+                    parent = await self.storage.get_task(parent_id)
+                    if parent is not None:
+                        pending.append(parent)
+        return None
+
+    def _perimeter_refusal(
+        self, decision: RouteDecision, inherited: str | None
+    ) -> GuardEvent | None:
+        """Последний рубеж: задача под периметром не уходит к внешнему исполнителю.
+
+        Под периметром задача, чьё решение его потребовало (`meta.perimeter`),
+        или наследница предка под периметром. Явный `executor` корневой задачи
+        это решение владельца данных и отказа не получает: у него нет ни
+        предка, ни `meta.perimeter`.
+        """
+        configured = self.settings.executors.get(decision.executor)
+        if configured is None or configured.corporate:
+            return None
+        if inherited is None and decision.meta.get("perimeter") not in ("answered", "unknown"):
+            return None
+        source = "an ancestor task" if inherited else "this task (corporate_data)"
+        return GuardEvent(
+            reason=GuardReason.perimeter,
+            detail=(
+                f"corporate perimeter required by {source}: {decision.executor} is outside "
+                "the perimeter and no in-perimeter executor is available"
+            ),
+            executor=decision.executor,
+        )
 
     async def _budget_stop(
         self, links: list[tuple[str, str]], result: ExecutionResult
@@ -1199,10 +1284,24 @@ class Dispatcher:
         await self.storage.update_task(record)
         self._notify(record.task_id)
 
+    async def _cwd_lock_key(self, cwd: str) -> str:
+        """Ключ lock: корень конкретной рабочей копии, а не строка `cwd`.
+
+        `repo/` и `repo/sub/` делят один git-индекс, поэтому сериализуются
+        одним lock. Отдельные `git worktree` того же репозитория — независимые
+        рабочие копии со своими индексами: общий git dir ключом не годится, они
+        должны идти параллельно. Вне git ключом остаётся разрешённый `cwd`.
+        """
+        resolved = await asyncio.to_thread(Path(cwd).resolve)
+        try:
+            return str(await asyncio.to_thread(worktree.repo_root, resolved))
+        except worktree.WorktreeError:
+            return str(resolved)
+
     @contextlib.asynccontextmanager
     async def _cwd_lock(self, cwd: str) -> AsyncIterator[None]:
         """Lock на рабочую копию; запись снимается, когда её больше никто не ждёт."""
-        key = str(Path(cwd).resolve())  # noqa: ASYNC240
+        key = await self._cwd_lock_key(cwd)
         lock, waiters = self._cwd_locks.get(key, (asyncio.Lock(), 0))
         self._cwd_locks[key] = (lock, waiters + 1)
         try:

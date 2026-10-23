@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from agent_dispatch.config import ExecutorSettings
+from agent_dispatch.models import Judgment
 
 TIERS: tuple[str, ...] = ("fast", "balanced", "strong")
 
@@ -53,6 +54,31 @@ def has_corporate(candidates: dict[str, ExecutorSettings]) -> bool:
     return any(settings.corporate for settings in candidates.values())
 
 
+#: Почему пул сужен без ответа Jev: вопрос не задавался или ответа нет.
+PERIMETER_UNKNOWN_NOTE = (
+    "no corporate_data answer (router fallback or a router that does not ask); "
+    "the corporate perimeter is on, so the pool was narrowed to in-perimeter "
+    "executors (fail closed)"
+)
+
+#: Внутри кандидатов нет исполнителя периметра: сужать некого, но молчать нельзя.
+NO_IN_PERIMETER_NOTE = "task involves corporate data but no in-perimeter executor is available"
+
+
+@dataclass
+class PerimeterVerdict:
+    """Применим ли периметр к решению и почему.
+
+    `required` значит, что пул сужен до `corporate: true`; `status` —
+    `answered` (по ответу Jev) или `unknown` (ответа нет, сужение fail closed);
+    оба пусты, когда периметр не применим.
+    """
+
+    required: bool
+    status: str | None = None
+    note: str | None = None
+
+
 def narrows_to_perimeter(
     candidates: dict[str, ExecutorSettings],
     *,
@@ -70,6 +96,57 @@ def narrows_to_perimeter(
     return bool(
         perimeter and has_corporate(candidates) and answered_yes and confidence >= min_confidence
     )
+
+
+def perimeter_applies(perimeter: bool, configured: dict[str, ExecutorSettings]) -> bool:
+    """Периметр включён и в конфиге есть включённый `corporate: true` исполнитель.
+
+    Считается по конфигу, а не по доступным сейчас кандидатам: остывание всех
+    корпоративных исполнителей не должно молча открывать периметр.
+    """
+    return perimeter and any(item.corporate and item.enabled for item in configured.values())
+
+
+def perimeter_required(
+    candidates: dict[str, ExecutorSettings],
+    *,
+    perimeter: bool,
+    corporate: Judgment | None,
+    min_confidence: float,
+    configured: dict[str, ExecutorSettings] | None = None,
+) -> PerimeterVerdict:
+    """Единственное место, решающее, применим ли периметр к решению.
+
+    Три случая. Периметр выключен или среди кандидатов нет `corporate: true` —
+    не применим. Ответ Jev есть — прежнее правило `narrows_to_perimeter`
+    вместе с `corporate_min_confidence`. Ответа нет, пока периметр включён и
+    корпоративные исполнители в пуле есть, — применим (fail closed): fallback
+    роутеров и `claude_local`, который вопрос не задаёт, не должны выводить
+    задачу за периметр молча.
+
+    `configured` (исполнители из конфига) решает, применим ли периметр вообще;
+    без него судят по `candidates`. Требование без корпоративных кандидатов
+    остаётся требованием: отказ выносит диспетчер (`guard: perimeter`).
+    """
+    if not perimeter_applies(perimeter, {**(configured or {}), **candidates}):
+        return PerimeterVerdict(required=False)
+    if corporate is None:
+        return PerimeterVerdict(required=True, status="unknown", note=PERIMETER_UNKNOWN_NOTE)
+    # То же правило, что `narrows_to_perimeter`, но без проверки кандидатов:
+    # применимость уже решена по конфигу выше.
+    if corporate.value and corporate.confidence >= min_confidence:
+        return PerimeterVerdict(required=True, status="answered")
+    if corporate.value:
+        # Ответ «да», но не увереннее порога: это монетка, а не решение.
+        return PerimeterVerdict(
+            required=False,
+            note=(
+                f"corporate_data answered yes but only at confidence {corporate.confidence:.2f}, "
+                f"below routing.corporate_min_confidence={min_confidence:.2f}: "
+                "the perimeter filter was not applied"
+            ),
+        )
+    return PerimeterVerdict(required=False)
 
 
 def _nearest_tiers(tier: str) -> list[str]:

@@ -400,6 +400,90 @@ async def test_client_and_auth_errors_do_not_retry(status):
 
 @pytest.mark.asyncio
 @respx.mock
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"type": "noul"},
+        {"type": "noul", "noul": float("nan")},
+        {"type": "noul", "noul": 1.5},
+        {"type": "noul", "noul": -0.1},
+    ],
+)
+async def test_noul_without_valid_probability_is_router_error(answer):
+    # Молчаливый или вне [0, 1] ответ читался бы как уверенное «да»/«нет».
+    s = settings()
+    payload = {
+        "answers": {
+            "capability": {
+                "type": "choice",
+                "choice": "balanced",
+                "probabilities": {"balanced": 1},
+                "confidence": 0.95,
+            },
+            "judgment": answer,
+        }
+    }
+    route = respx.post(s.router.jev.base_url).mock(
+        return_value=httpx.Response(200, content=json.dumps(payload))
+    )
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RouterError, match="invalid noul answer: judgment"):
+            await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), CANDIDATES)
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_score_probability_out_of_range_is_router_error():
+    s = settings()
+    payload = {
+        "answers": {
+            "capability": {
+                "type": "choice",
+                "choice": "balanced",
+                "probabilities": {"balanced": 1},
+                "confidence": 0.95,
+            },
+            "difficulty": {"type": "score", "score": 1, "probabilities": {"1": 1.5}},
+        }
+    }
+    route = respx.post(s.router.jev.base_url).mock(return_value=httpx.Response(200, json=payload))
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RouterError, match="invalid probabilities"):
+            await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), CANDIDATES)
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_missing_corporate_answer_is_router_error():
+    # Вопрос задан, ответа нет: неполный ответ молча читался бы как уверенное
+    # «нет» и открывал периметр. Это ошибка роутера, дальше работает fallback
+    # цепочка, где периметр всё равно применяется (fail closed).
+    s = settings()
+    candidates = {
+        "external": ExecutorSettings(adapter="codex", tier="fast"),
+        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+    }
+    payload = {
+        "answers": {
+            "capability": {
+                "type": "choice",
+                "choice": "fast",
+                "probabilities": {"fast": 1},
+                "confidence": 0.95,
+            }
+        }
+    }
+    route = respx.post(s.router.jev.base_url).mock(return_value=httpx.Response(200, json=payload))
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RouterError, match="missing answer: corporate_data"):
+            await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), candidates)
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_unknown_choice_sum_and_missing_key_errors():
     s = settings()
     for payload in [
@@ -428,3 +512,107 @@ async def test_missing_api_key_does_not_call_network():
         with pytest.raises(RouterError):
             await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), CANDIDATES)
     assert not route.called
+
+
+def _corporate_payload(corporate_answer, *, confidence=0.95):
+    return {
+        "answers": {
+            "capability": {
+                "type": "choice",
+                "choice": "fast",
+                "probabilities": {"fast": 1},
+                "confidence": confidence,
+            },
+            "corporate_data": corporate_answer,
+        }
+    }
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_corporate_answer_of_wrong_type_is_router_error():
+    # `score` со значением 0 читался бы как уверенное «нет» и открывал периметр.
+    s = settings()
+    candidates = {
+        "external": ExecutorSettings(adapter="codex", tier="fast"),
+        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+    }
+    payload = _corporate_payload(
+        {"type": "score", "score": 0, "confidence": 1, "probabilities": {"0": 1}}
+    )
+    respx.post(s.router.jev.base_url).mock(return_value=httpx.Response(200, json=payload))
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RouterError, match="invalid noul answer: corporate_data"):
+            await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), candidates)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_nan_capability_confidence_is_router_error():
+    # NaN прошёл бы мимо порога low_confidence: сравнение с NaN всегда ложно.
+    s = settings()
+    candidates = {"codex": ExecutorSettings(adapter="codex", tier="fast")}
+    payload = {
+        "answers": {
+            "capability": {
+                "type": "choice",
+                "choice": "fast",
+                "probabilities": {"fast": 1},
+                "confidence": "NaN",
+            }
+        }
+    }
+    respx.post(s.router.jev.base_url).mock(return_value=httpx.Response(200, json=payload))
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RouterError):
+            await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), candidates)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_corporate_question_is_asked_when_corporate_executors_are_cooling():
+    # Корпоративный исполнитель остывает и в кандидатах его нет, но в конфиге
+    # он есть: вопрос задаётся, иначе периметр открывался бы молча.
+    s = Settings.model_validate(
+        {
+            "secrets": {"OPENROUTER_API_KEY": "k"},
+            "routing": {"fallback_executor": ["external"]},
+            "executors": {
+                "external": {"adapter": "codex", "tier": "fast"},
+                "internal": {
+                    "adapter": "opencode",
+                    "model": "m",
+                    "tier": "fast",
+                    "corporate": True,
+                },
+            },
+        }
+    )
+    candidates = {"external": s.executors["external"]}
+    route = respx.post(s.router.jev.base_url).mock(
+        return_value=httpx.Response(200, json=_corporate_payload({"type": "noul", "noul": 0.9}))
+    )
+    async with httpx.AsyncClient() as client:
+        result = await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), candidates)
+    sent = json.loads(route.calls[0].request.content)
+    assert "corporate_data" in sent["questions"]
+    assert result.meta["perimeter"] == "answered"
+
+
+def test_probability_rounding_noise_is_clamped_not_an_error():
+    from agent_dispatch.routing.questions import parse_answers
+
+    _, confidence, _, judgments = parse_answers(
+        {
+            "capability": {
+                "type": "choice",
+                "choice": "fast",
+                "probabilities": {"fast": 1.0000001},
+                "confidence": 1.0000001,
+            },
+            "corporate_data": {"type": "noul", "noul": 1.0000001},
+        },
+        ["fast"],
+    )
+    assert confidence == 1.0
+    assert judgments["corporate_data"].probabilities["true"] == 1.0

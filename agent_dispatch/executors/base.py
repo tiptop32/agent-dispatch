@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import tempfile
 from collections.abc import Awaitable, Callable
@@ -94,12 +95,17 @@ class BaseExecutorAdapter:
     ) -> ExecutionResult:
         """Общий цикл CLI-адаптера: snapshot, запуск, snapshot, разбор вывода.
 
+        Снимки сравниваются по отпечаткам содержимого (`workspace.diff`), поэтому
+        правка файла, который был грязным ещё до запуска, попадает в
+        `changed_files`, как и откат исполнителем чужой правки.
+
         `run_cli_fn` передаётся каждым адаптером из его собственного модуля, а не
         берётся отсюда по умолчанию: тесты подменяют `run_cli` именно в модуле
         адаптера, и дефолт здесь молча уводил бы вызов мимо подмены.
         """
         try:
-            before = workspace.snapshot(ctx.cwd)
+            # Хеширование грязных файлов не должно держать цикл событий демона.
+            before = await asyncio.to_thread(workspace.snapshot, ctx.cwd)
         except subprocess.CalledProcessError:
             return cwd_error_result(self.name, self.settings.model, ctx.cwd, ctx.log_path)
         try:
@@ -122,7 +128,7 @@ class BaseExecutorAdapter:
                 meta={"log_path": str(ctx.log_path)},
             )
         try:
-            after = workspace.snapshot(ctx.cwd)
+            after = await asyncio.to_thread(workspace.snapshot, ctx.cwd)
         except subprocess.CalledProcessError:
             return cwd_error_result(self.name, self.settings.model, ctx.cwd, ctx.log_path)
         changed = workspace.diff(before, after)

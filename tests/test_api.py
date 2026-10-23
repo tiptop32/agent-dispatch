@@ -196,6 +196,28 @@ async def test_get_task_wait_returns_final_status(api):
 
 
 @pytest.mark.asyncio
+async def test_get_task_wait_follows_escalation_of_finished_parent(api):
+    client, dispatcher, _, adapters, repo, settings = api
+    settings.escalation = {"codex": ["claude"]}
+    adapters["codex"].result = ExecutionResult(
+        status="failed", executor="codex", model=None, summary="", error="boom"
+    )
+    adapters["claude"].gate = asyncio.Event()
+    response = await client.post("/tasks", headers=headers(), json=payload(repo, wait_seconds=0))
+    task_id = response.json()["task_id"]
+    await asyncio.wait_for(adapters["claude"].started.wait(), 5)
+    parent = await dispatcher.get(task_id)
+    assert parent is not None and parent.status == TaskStatus.failed
+    adapters["claude"].gate.set()
+
+    response = await client.get(f"/tasks/{task_id}?wait=1", headers=headers())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["task_id"] != task_id
+
+
+@pytest.mark.asyncio
 async def test_get_task_wait_timeout_returns_running(api, monkeypatch):
     client, _, _, adapters, repo, _ = api
     adapters["codex"].gate = asyncio.Event()

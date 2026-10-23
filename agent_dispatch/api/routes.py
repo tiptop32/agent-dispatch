@@ -134,7 +134,9 @@ def build_router() -> APIRouter:
         record = await deps.dispatcher.get(task_id)
         if record is None:
             raise HTTPException(404, "task not found")
-        if wait > 0 and record.status not in FINAL_STATUSES:
+        if wait > 0:
+            # Завершённое звено тоже идёт в `wait`: тот следует за эскалацией,
+            # иначе ответ зависел бы от того, успел ли родитель упасть до опроса.
             record = await deps.dispatcher.wait(task_id, min(wait, MAX_WAIT_SECONDS))
         return to_view(record)
 

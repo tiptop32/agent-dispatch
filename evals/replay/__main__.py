@@ -17,6 +17,7 @@ from .harness import (
     exploration_comparison,
     load,
     load_decisions,
+    perimeter_violations,
     render,
     replay,
     router_vs_static,
@@ -76,6 +77,9 @@ def main() -> int:
         limit_group=limit_group,
         review_only=settings.routing.review_only,
         recheck=lambda name: name in executors and executors[name].limit_reset == "recheck",
+    )
+    report["perimeter_violations"] = perimeter_violations(
+        tasks, lambda name: name in executors and executors[name].corporate
     )
     report["children_refusals"] = children_refusals(tasks, settings.routing.max_children)
     report["delegations"] = delegations(tasks)

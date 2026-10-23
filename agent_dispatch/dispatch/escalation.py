@@ -38,15 +38,21 @@ def next_executor(
     settings: Settings,
     tried: list[str],
     unavailable: set[str] | frozenset[str] = frozenset(),
+    *,
+    corporate_only: bool = False,
 ) -> str | None:
     """Следующее звено цепочки: включённое, ещё не пробованное и не остывающее.
 
     Недоступное звено пропускается, а не обрывает цепочку: эскалация к
     исполнителю с исчерпанным лимитом только сожгла бы ещё одну попытку.
+    `corporate_only` сужает цепочку до исполнителей периметра данных, когда
+    корневое решение цепочки сузило пул: за периметр эскалация не выходит.
     """
     for executor in settings.escalation.get(current, []):
         configured = settings.executors.get(executor)
         if configured is None or not configured.enabled:
+            continue
+        if corporate_only and not configured.corporate:
             continue
         if executor not in tried and executor not in unavailable:
             return executor

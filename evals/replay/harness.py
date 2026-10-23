@@ -94,6 +94,9 @@ class Task:
     events: list[dict] = field(default_factory=list)
     #: Общий git dir cwd из события `git` при `submit`; у задач до него None.
     git_common_dir: str | None = None
+    #: `decision.meta.perimeter` задачи (`answered`/`unknown`) или None.
+    perimeter: str | None = None
+    followup_of: str | None = None
 
 
 @dataclass
@@ -124,7 +127,9 @@ def load(db_path: Path) -> list[Task]:
         rows = conn.execute(
             "select task_id, coalesce(executor, ''), status, created_at, started_at, finished_at,"
             " coalesce(duration_ms, 0), escalated_from, result_json, source_agent,"
-            " coalesce(json_extract(request_json, '$.kind'), 'task'), cwd, parent_task_id"
+            " coalesce(json_extract(request_json, '$.kind'), 'task'), cwd, parent_task_id,"
+            " json_extract(decision_json, '$.meta.perimeter'),"
+            " json_extract(request_json, '$.followup_of')"
             " from tasks order by created_at"
         ).fetchall()
         # Только нужные события: таблица растёт с каждой задачей.
@@ -158,9 +163,47 @@ def load(db_path: Path) -> list[Task]:
             parent_task_id=row[12],
             events=events.get(row[0], []),
             git_common_dir=git.get(row[0]),
+            perimeter=row[13],
+            followup_of=row[14],
         )
         for row in rows
     ]
+
+
+def perimeter_violations(tasks: list[Task], corporate: Callable[[str], bool]) -> dict:
+    """Запуски вне корпоративного периметра, который требовала задача или её предок.
+
+    Требование читается так же, как в `Dispatcher._lineage_perimeter`: своё
+    `decision.meta.perimeter` или любого предка по `escalated_from`,
+    `followup_of` и `parent_task_id`. Отказы guard'а не запуски. Порог ноль:
+    любой такой запуск это утечка корпоративного кода наружу. `corporate`
+    судит по текущему конфигу: исполнитель, позже снятый с периметра, даст
+    ложное срабатывание, а не пропуск.
+    """
+    by_id = {task.task_id: task for task in tasks}
+
+    def required(task: Task) -> str | None:
+        pending, seen = [task], set()
+        while pending:
+            current = pending.pop()
+            if current.task_id in seen:
+                continue
+            seen.add(current.task_id)
+            if current.perimeter in ("answered", "unknown"):
+                return current.perimeter
+            for parent_id in (current.escalated_from, current.followup_of, current.parent_task_id):
+                if parent_id in by_id:
+                    pending.append(by_id[parent_id])
+        return None
+
+    rows = [
+        {"task_id": task.task_id[:8], "executor": task.executor, "perimeter": status}
+        for task in tasks
+        if not guard_refusal(task)
+        and not corporate(task.executor)
+        and (status := required(task)) is not None
+    ]
+    return {"count": len(rows), "runs": rows}
 
 
 def load_decisions(db_path: Path) -> list[Decision]:
@@ -1051,6 +1094,13 @@ def render(report: dict) -> str:
         f"avg {info['avg_seconds']:.1f} s, max {info['max_seconds']:.1f} s"
         for group, info in waits.items()
     ]
+    if "perimeter_violations" in report:
+        info = report["perimeter_violations"]
+        lines.append(f"runs outside a required corporate perimeter (must be 0): {info['count']}")
+        lines += [
+            f"  {row['task_id']} {row['executor']} (perimeter {row['perimeter']})"
+            for row in info["runs"]
+        ]
     if "children_refusals" in report:
         info = report["children_refusals"]
         lines.append(

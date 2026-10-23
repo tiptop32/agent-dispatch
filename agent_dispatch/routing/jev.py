@@ -11,7 +11,13 @@ from agent_dispatch.config import ExecutorSettings, Settings
 from agent_dispatch.models import DispatchRequest, Judgment, RouteDecision, RouterKind
 
 from .base import RouterError
-from .capability import has_corporate, narrows_to_perimeter, select, tiers_present
+from .capability import (
+    PerimeterVerdict,
+    perimeter_applies,
+    perimeter_required,
+    select,
+    tiers_present,
+)
 from .questions import build_questions, build_state, parse_answers
 
 
@@ -20,31 +26,22 @@ class JevRouter:
 
     def _corporate_verdict(
         self, corporate: Judgment | None, candidates: dict[str, ExecutorSettings]
-    ) -> tuple[bool, str | None]:
+    ) -> PerimeterVerdict:
         """Сужать ли пул до периметра, и что об этом сказать.
 
         `noul`-ответ вида «скорее да» с уверенностью 0.06 это монетка, а не
         решение, и отсекать по нему весь пул вслепую нельзя. Порог живёт в
         `routing.corporate_min_confidence` и по умолчанию равен нулю: ослабление
-        периметра данных должен включить человек, а не дефолт.
+        периметра данных должен включить человек, а не дефолт. Правило одно для
+        всех, кто сужает пул: `capability.perimeter_required`.
         """
         routing = self.settings.routing
-        answered_yes = bool(corporate and corporate.value)
-        confidence = corporate.confidence if corporate else 0.0
-        narrow = narrows_to_perimeter(
+        return perimeter_required(
             candidates,
-            answered_yes=answered_yes,
-            confidence=confidence,
             perimeter=routing.corporate_perimeter,
+            corporate=corporate,
             min_confidence=routing.corporate_min_confidence,
-        )
-        if narrow or not answered_yes or confidence >= routing.corporate_min_confidence:
-            return narrow, None
-        threshold = routing.corporate_min_confidence
-        return False, (
-            f"corporate_data answered yes but only at confidence {corporate.confidence:.2f}, "
-            f"below routing.corporate_min_confidence={threshold:.2f}: "
-            "the perimeter filter was not applied"
+            configured=self.settings.executors,
         )
 
     def __init__(
@@ -63,7 +60,9 @@ class JevRouter:
         if not api_key:
             raise RouterError(f"missing API key: {cfg.api_key_env}")
         capabilities = tiers_present(candidates)
-        ask_corporate = has_corporate(candidates) and self.settings.routing.corporate_perimeter
+        ask_corporate = perimeter_applies(
+            self.settings.routing.corporate_perimeter, {**self.settings.executors, **candidates}
+        )
         body = {
             "model": cfg.model,
             "state": build_state(req),
@@ -90,9 +89,18 @@ class JevRouter:
                 capability, confidence, tier_scores, judgments = parse_answers(
                     payload.get("answers", {}), capabilities
                 )
-                judgment = judgments.get("judgment")
+                answers = payload.get("answers", {})
+                if ask_corporate and not isinstance(answers.get("corporate_data"), dict):
+                    # Вопрос задан, ответа нет: неполный ответ молча читался бы
+                    # как уверенное «нет» и открывал периметр. Это ошибка роутера.
+                    raise RouterError("missing answer: corporate_data")
                 corporate = judgments.get("corporate_data")
-                narrow, extra_note = self._corporate_verdict(corporate, candidates)
+                if ask_corporate and (corporate is None or corporate.kind != "noul"):
+                    # `score`/`choice` со значением 0 читался бы как «нет».
+                    raise RouterError("invalid noul answer: corporate_data")
+                judgment = judgments.get("judgment")
+                verdict = self._corporate_verdict(corporate, candidates)
+                narrow, extra_note = verdict.required, verdict.note
                 if not ask_corporate:
                     # Вопрос не задавался: ответа нет, и заметке о нём не место.
                     extra_note = None
@@ -114,6 +122,8 @@ class JevRouter:
                 }
                 if selection.notes:
                     meta["selection_notes"] = selection.notes
+                if verdict.required:
+                    meta["perimeter"] = verdict.status
                 return RouteDecision(
                     router=RouterKind.jev,
                     executor=selection.executor,
