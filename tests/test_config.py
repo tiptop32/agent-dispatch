@@ -371,3 +371,22 @@ def test_limit_group_defaults_to_the_shared_account(adapter, model, explicit, ex
 
     item = ExecutorSettings(adapter=adapter, model=model, limit_group=explicit)
     assert item.resolved_limit_group("opencode/kimi") == expected
+
+
+@pytest.mark.parametrize("value", [-1, True, float("inf"), float("nan")])
+def test_preferred_executor_wait_rejects_invalid_values(tmp_config_dir, value):
+    import yaml
+
+    (tmp_config_dir / "config.yaml").write_text(
+        yaml.safe_dump({"routing": {"preferred_executor_max_wait_seconds": value}})
+    )
+    with pytest.raises(ConfigError, match="preferred_executor_max_wait_seconds"):
+        load_settings(tmp_config_dir)
+
+
+@pytest.mark.parametrize("value", [0, 0.25, 60])
+def test_preferred_executor_wait_loads_user_override(tmp_config_dir, value):
+    (tmp_config_dir / "config.yaml").write_text(
+        f"routing:\n  preferred_executor_max_wait_seconds: {value}\n"
+    )
+    assert load_settings(tmp_config_dir).routing.preferred_executor_max_wait_seconds == value

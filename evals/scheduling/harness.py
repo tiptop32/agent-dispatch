@@ -448,7 +448,43 @@ async def scenario_stress(root: Path, seed: int, rounds: int = 12) -> Verdict:
     return Verdict(f"stress_race_seed_{seed}", not reasons, reasons)
 
 
+async def scenario_queue_fallback(root: Path) -> Verdict:
+    """Preferred stays first; overflow uses a free equivalent group only once."""
+    reasons: list[str] = []
+    async with SchedulingLab(root, max_tasks=2, max_per_group=1) as lab:
+        lab.settings.routing.preferred_executor_max_wait_seconds = 0.02
+        lab.settings.routing.corporate_perimeter = False
+        lab.settings.executors[CLAUDE].tier = "strong"
+        first = await lab.submit(lab.req(lab.repo()))
+        await lab.wait_started(CODEX)
+        overflow = await lab.submit(lab.req(lab.repo()))
+        await lab.wait_started(KIMI)
+        record = await lab.storage.get_task(overflow)
+        if record.decision.executor != KIMI:
+            reasons.append("overflow did not persist the effective executor")
+        if lab.adapters[CODEX].calls != 1 or lab.adapters[KIMI].calls != 1:
+            reasons.append("overflow executed more than once or displaced preferred")
+        if lab.adapters[CLAUDE].calls:
+            reasons.append("overflow changed capability tier")
+        slots = [
+            e["payload"] for e in await lab.storage.list_events(overflow) if e["kind"] == "slot"
+        ]
+        if not slots or not slots[0].get("queue_fallback"):
+            reasons.append("overflow did not leave queue fallback evidence")
+        await lab.dispatcher.cancel(overflow)
+        await lab.dispatcher.cancel(first)
+        # Exercise the same pools again after cancellation, then drain them.
+        next_task = await lab.submit(lab.req(lab.repo()))
+        await lab.wait_calls(CODEX, 2)
+        await lab.drain()
+        if (await lab.storage.get_task(next_task)).result.executor != CODEX:
+            reasons.append("preferred did not recover after cancellation")
+        reasons.extend(await lab.leaks())
+    return Verdict("queue_fallback_equivalent_capacity", not reasons, reasons)
+
+
 SCENARIOS = (
+    scenario_queue_fallback,
     scenario_review_unblocked,
     scenario_limit_groups_under_global_ceiling,
     scenario_excess_reviews_queue,

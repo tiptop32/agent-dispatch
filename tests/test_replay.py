@@ -9,6 +9,8 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from agent_dispatch.config import ExecutorSettings
 from agent_dispatch.models import ExecutionResult
 from evals.replay.harness import (
@@ -82,14 +84,14 @@ def _db(tmp_path: Path, rows: list[tuple]) -> Path:
     return path
 
 
-def _slot_event(path: Path, task_id: str, group: str, wait_seconds: float) -> None:
+def _slot_event(path: Path, task_id: str, group: str, wait_seconds: float, **policy) -> None:
     conn = sqlite3.connect(path)
     conn.execute(
         "insert into events (task_id, ts, kind, payload_json) values (?, ?, 'slot', ?)",
         (
             task_id,
             "2026-09-23T12:00:00+00:00",
-            json.dumps({"limit_group": group, "wait_seconds": wait_seconds}),
+            json.dumps({"limit_group": group, "wait_seconds": wait_seconds, **policy}),
         ),
     )
     conn.commit()
@@ -1251,3 +1253,22 @@ def test_perimeter_violations_follow_the_whole_lineage():
 
     assert report["count"] == 3
     assert {row["task_id"] for row in report["runs"]} == {"leak0000", "nest0000", "foll0000"}
+
+
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_queue_policy_metrics_exclude_legacy_and_handle_small_samples(tmp_path, count):
+    db = _db(tmp_path, [("a" * 32, "codex/sol", "10:00", "10:01", 1, None, _result("completed"))])
+    _slot_event(db, "a" * 32, "codex", 999)
+    for index in range(count):
+        _slot_event(db, "a" * 32, "codex", 10 + index * 20, queue_fallback=index == 1)
+    report = replay(load(db))
+    policy = report["queue_policy"]
+    assert policy["samples"] == count
+    assert policy["switched"] == (1 if count == 2 else 0)
+    assert policy["switch_share"] == (None if count == 0 else 0 if count == 1 else 0.5)
+    assert policy["avg_seconds"] == (None if count == 0 else 10 if count == 1 else 20)
+    assert policy["median_seconds"] == policy["avg_seconds"]
+    assert policy["p95_seconds"] == (29 if count == 2 else None)
+    text = render(report)
+    assert ("no policy slot events yet" in text) == (count == 0)
+    assert ("unmeasured (requires 2 samples)" in text) == (count == 1)

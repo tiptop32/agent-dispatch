@@ -26,6 +26,7 @@ routing:
   autonomous_confidence: 0.85  # выше: решению можно доверять без присмотра
   min_margin: 0.10
   explore_share: 0.0          # доля пригодных решений Jev для статического balanced-исполнителя
+  preferred_executor_max_wait_seconds: 60  # 0 выключает резерв по очереди; только тот же тир
   fallback_executor: codex     # или список [a, b]: первый доступный, остальные в резерве
   max_hops: 2
   max_children: 2

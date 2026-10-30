@@ -39,6 +39,7 @@ from agent_dispatch.models import (
     TaskStatus,
 )
 from agent_dispatch.routing.base import Router
+from agent_dispatch.routing.capability import JUDGMENT_ADAPTER
 from agent_dispatch.routing.decision import decide_with_fallback
 from agent_dispatch.routing.exploration import apply_exploration
 from agent_dispatch.routing.guards import candidates, pre_guards, review_only_executors
@@ -483,15 +484,14 @@ class Dispatcher:
             prepared = await self._prepare(record)
             if prepared is None:
                 return
-            decision, adapter = prepared
-            await self._execute(record, decision, adapter)
+            await self._execute(record, prepared)
         except asyncio.CancelledError:
             await self._mark_cancelled(record)
             raise
         except Exception as exc:
             await self._mark_failed(record, exc)
 
-    async def _prepare(self, record: TaskRecord) -> tuple[RouteDecision, ExecutorAdapter] | None:
+    async def _prepare(self, record: TaskRecord) -> Routing | None:
         """Маршрутизация и guard'ы. None значит, что задача уже закрыта отказом."""
         record.status = TaskStatus.routing
         await self.storage.update_task(record)
@@ -551,7 +551,8 @@ class Dispatcher:
                 ),
             )
             return None
-        return decision, adapter
+        routing.decision = decision
+        return routing
 
     async def _daily_budget_guard(self, extra: float = 0.0) -> GuardEvent | None:
         """Отказ `budget`, если расходы с местной полуночи (плюс `extra`) у лимита."""
@@ -570,9 +571,8 @@ class Dispatcher:
             ),
         )
 
-    async def _execute(
-        self, record: TaskRecord, decision: RouteDecision, adapter: ExecutorAdapter
-    ) -> None:
+    async def _execute(self, record: TaskRecord, routing: Routing) -> None:
+        decision = routing.decision
         req, task_id = record.request, record.task_id
         review = req.kind == "review"
         # Ревью читает рабочую копию как есть: worktree от HEAD не видел бы
@@ -581,7 +581,7 @@ class Dispatcher:
         mode = req.workspace_mode or self.settings.execution.workspace_mode
         if review:
             mode = "in_place"
-        capacity = self._capacity(record, decision)
+        capacity = self._capacity(record, decision, routing.candidates)
         # В режиме worktree исполнители не делят дерево, поэтому lock нужен
         # только на время переноса результата обратно в рабочую копию.
         lock = (
@@ -589,7 +589,8 @@ class Dispatcher:
             if req.hop == 0 and mode == "in_place" and not review
             else contextlib.nullcontext()
         )
-        async with capacity, lock:
+        async with capacity as decision, lock:
+            adapter = self.adapters[decision.executor]
             # Путь и ветка известны до создания: отмена посреди `worktree.create`
             # бросает ожидание, но поток доводит каталог до конца, и корутина
             # никогда не узнает о дереве, которое уже есть на диске.
@@ -645,39 +646,104 @@ class Dispatcher:
                     await self._note_kept_worktree(record, *target, exc)
                 raise
 
-    @contextlib.asynccontextmanager
-    async def _capacity(self, record: TaskRecord, decision: RouteDecision) -> AsyncIterator[None]:
-        """Занять ёмкость корневой задачи, не блокируя чужую группу.
+    async def _queue_backups(
+        self, record: TaskRecord, decision: RouteDecision, names: list[str]
+    ) -> list[str]:
+        """Только эквивалентные кандидаты, оставшиеся после маршрутизации."""
+        req = record.request
+        if req.executor is not None or record.escalated_from is not None:
+            return []
+        selected = self.settings.executors[decision.executor]
+        corporate_only = await self._lineage_perimeter(record) is not None
+        judgment = decision.judgments.get("judgment")
+        reasoning_only = bool(judgment and judgment.value and selected.adapter == JUDGMENT_ADAPTER)
+        return [
+            name
+            for name in names
+            if name != decision.executor
+            and (item := self.settings.executors[name]).tier == selected.tier
+            and (not corporate_only or item.corporate)
+            and (not reasoning_only or item.adapter == JUDGMENT_ADAPTER)
+            and self.settings.limit_group(name) != self.settings.limit_group(decision.executor)
+        ]
 
-        Вложенная работа обходит корневые пулы, а ревью сохраняет свой прежний
-        отдельный пул. Задача на правку сначала ждёт группу и лишь затем общий
-        потолок, поэтому занятая группа не создаёт head-of-line blocking.
-        """
+    def _group_semaphore(self, executor: str) -> asyncio.Semaphore:
+        return self._group_semaphores.setdefault(
+            self.settings.limit_group(executor),
+            asyncio.Semaphore(self.settings.server.max_concurrent_per_group),
+        )
+
+    async def _acquire_group(
+        self, record: TaskRecord, decision: RouteDecision, names: list[str]
+    ) -> tuple[RouteDecision, asyncio.Semaphore]:
+        preferred = self._group_semaphore(decision.executor)
+        timeout = self.settings.routing.preferred_executor_max_wait_seconds
+        backups = await self._queue_backups(record, decision, names) if timeout else []
+        if backups and preferred.locked():
+            try:
+                async with asyncio.timeout(timeout):
+                    await preferred.acquire()
+                return decision, preferred
+            except TimeoutError:
+                pass
+            # locked() honours queued waiters. On the single event loop an
+            # unlocked semaphore's acquire() completes without suspension:
+            # the availability check and reservation are atomic and FIFO-safe.
+            unavailable = self.availability.unavailable()
+            for name in backups:
+                if name in unavailable:
+                    continue
+                semaphore = self._group_semaphore(name)
+                if not semaphore.locked():
+                    await semaphore.acquire()
+                    effective = decision.model_copy(deep=True)
+                    effective.executor = name
+                    effective.meta["queue_fallback"] = {
+                        "preferred_executor": decision.executor,
+                        "reason": "preferred_group_timeout",
+                    }
+                    return effective, semaphore
+        await preferred.acquire()
+        return decision, preferred
+
+    @contextlib.asynccontextmanager
+    async def _capacity(
+        self, record: TaskRecord, decision: RouteDecision, names: list[str]
+    ) -> AsyncIterator[RouteDecision]:
+        """Занять группу, затем общий слот; ревью и вложенные задачи отдельно."""
         req = record.request
         if req.hop > 0:
-            yield
+            yield decision
             return
         if req.kind == "review":
             async with self._review_semaphore:
-                yield
+                yield decision
             return
 
-        group = self.settings.limit_group(decision.executor)
-        semaphore = self._group_semaphores.setdefault(
-            group, asyncio.Semaphore(self.settings.server.max_concurrent_per_group)
-        )
         started = time.monotonic()
-        async with semaphore:
+        preferred_executor = decision.executor
+        decision, semaphore = await self._acquire_group(record, decision, names)
+        try:
+            switched = decision.executor != preferred_executor
+            if switched:
+                record.decision = decision
+                await self.storage.update_task(record)
             async with self._semaphore:
                 await self.storage.add_event(
                     record.task_id,
                     "slot",
                     {
-                        "limit_group": group,
+                        "limit_group": self.settings.limit_group(decision.executor),
                         "wait_seconds": round(time.monotonic() - started, 6),
+                        "preferred_executor": preferred_executor,
+                        "executor": decision.executor,
+                        "queue_fallback": switched,
+                        "switch_reason": "preferred_group_timeout" if switched else None,
                     },
                 )
-                yield
+                yield decision
+        finally:
+            semaphore.release()
 
     async def _run_executor(
         self,

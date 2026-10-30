@@ -46,6 +46,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
+from statistics import median, quantiles
 
 from agent_dispatch.config import ExecutorSettings
 from agent_dispatch.executors import worktree
@@ -271,6 +272,28 @@ def _queue_wait_by_limit_group(tasks: list[Task]) -> dict[str, dict]:
     }
 
 
+def _queue_policy(tasks: list[Task]) -> dict:
+    """Only events carrying the new policy flag enter its denominator."""
+    slots = [
+        event["payload"]
+        for task in tasks
+        for event in task.events
+        if event["kind"] == "slot" and "queue_fallback" in event["payload"]
+    ]
+    waits = [slot["wait_seconds"] for slot in slots]
+    switched = sum(slot["queue_fallback"] is True for slot in slots)
+    return {
+        "samples": len(slots),
+        "switched": switched,
+        "switch_share": switched / len(slots) if slots else None,
+        "avg_seconds": round(sum(waits) / len(waits), 1) if waits else None,
+        "median_seconds": round(median(waits), 1) if waits else None,
+        "p95_seconds": round(quantiles(waits, n=100, method="inclusive")[94], 1)
+        if len(waits) >= 2
+        else None,
+    }
+
+
 def replay(
     tasks: list[Task],
     cooldown: int = 900,
@@ -406,6 +429,7 @@ def replay(
         "review_only_failed": sum(1 for task in restricted if task.status == "failed"),
         "review_only_minutes": round(sum(task.duration_ms for task in restricted) / 60000, 1),
         "queue_wait_by_limit_group": _queue_wait_by_limit_group(tasks),
+        "queue_policy": _queue_policy(tasks),
         "section_windows": {
             "executor_failures": _window(failure_times),
             "avoidable_runs": _window(avoidable_times),
@@ -1199,6 +1223,17 @@ def render(report: dict) -> str:
         f"avg {info['avg_seconds']:.1f} s, max {info['max_seconds']:.1f} s"
         for group, info in waits.items()
     ]
+    policy = report["queue_policy"]
+    if policy["samples"]:
+        p95 = policy["p95_seconds"]
+        p95_text = f"{p95:.1f} s" if p95 is not None else "unmeasured (requires 2 samples)"
+        lines.append(
+            f"queue policy: {policy['switched']} switched of {policy['samples']} "
+            f"({policy['switch_share']:.1%}), avg {policy['avg_seconds']:.1f} s, "
+            f"median {policy['median_seconds']:.1f} s, p95 {p95_text}"
+        )
+    else:
+        lines.append("queue policy: no policy slot events yet")
     if "perimeter_violations" in report:
         info = report["perimeter_violations"]
         lines.append(f"runs outside a required corporate perimeter (must be 0): {info['count']}")
