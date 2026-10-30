@@ -97,6 +97,8 @@ class Task:
     #: `decision.meta.perimeter` задачи (`answered`/`unknown`) или None.
     perimeter: str | None = None
     followup_of: str | None = None
+    #: Явные оценки вызывающего, сохранённые через `/tasks/{id}/feedback`.
+    feedback: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -135,17 +137,20 @@ def load(db_path: Path) -> list[Task]:
         # Только нужные события: таблица растёт с каждой задачей.
         event_rows = conn.execute(
             "select task_id, ts, kind, payload_json from events"
-            " where kind in ('slot', 'git') order by id"
+            " where kind in ('slot', 'git', 'feedback') order by id"
         ).fetchall()
     finally:
         conn.close()
     events: dict[str, list[dict]] = {}
     git: dict[str, str] = {}
+    feedback: dict[str, list[dict]] = {}
     for task_id, ts, kind, payload in event_rows:
         data = json.loads(payload)
         events.setdefault(task_id, []).append({"ts": ts, "kind": kind, "payload": data})
         if kind == "git":
             git[task_id] = data["common_dir"]
+        elif kind == "feedback":
+            feedback.setdefault(task_id, []).append({"ts": ts, **data})
     return [
         Task(
             task_id=row[0],
@@ -165,6 +170,7 @@ def load(db_path: Path) -> list[Task]:
             git_common_dir=git.get(row[0]),
             perimeter=row[13],
             followup_of=row[14],
+            feedback=feedback.get(row[0], []),
         )
         for row in rows
     ]
@@ -839,6 +845,105 @@ def acceptance(
     }
 
 
+def feedback_summary(tasks: list[Task]) -> dict:
+    """Сводка явной обратной связи, чтобы не подменять её git-эвристикой.
+
+    Для задачи учитывается последняя оценка: вызывающий мог сначала отметить
+    её неудачной, а после follow-up принять результат. Guard-отказы и задачи
+    без результата не входят в знаменатель покрытия.
+    """
+    eligible = [task for task in tasks if task.result is not None and not guard_refusal(task)]
+    latest: dict[str, dict] = {}
+    for task in eligible:
+        if task.feedback:
+            latest[task.task_id] = task.feedback[-1]
+    outcomes = Counter(item.get("outcome", "unknown") for item in latest.values())
+    return {
+        "eligible": len(eligible),
+        "labeled": len(latest),
+        "unlabeled": len(eligible) - len(latest),
+        "coverage": round(len(latest) / len(eligible), 3) if eligible else None,
+        "outcomes": dict(outcomes.most_common()),
+    }
+
+
+def recommendations(report: dict) -> list[dict[str, str]]:
+    """Приоритеты, выведенные из отчёта, а не из текущего конфига.
+
+    Рекомендации намеренно не меняют настройки автоматически. Они дают
+    владельцу измеримый следующий шаг и явно отмечают, когда данных мало.
+    """
+    result: list[dict[str, str]] = []
+    delegations_info = report.get("delegations", {})
+    if delegations_info.get("wasted_share", 0) >= 0.10:
+        result.append(
+            {
+                "priority": "high",
+                "metric": "delegations.wasted_share",
+                "action": (
+                    "Разобрать причины wasted и добавить guard или fallback для крупнейшей группы."
+                ),
+                "evidence": (
+                    f"{delegations_info['wasted']}/{delegations_info['roots']} цепочек "
+                    f"({delegations_info['wasted_share']:.0%}) не дали результата"
+                ),
+            }
+        )
+    review_failed = report.get("review_only_failed", 0)
+    if review_failed:
+        result.append(
+            {
+                "priority": "high",
+                "metric": "review_only_failed",
+                "action": "Проверить снимок review_only и запретить рабочие задачи этому пулу.",
+                "evidence": f"{review_failed} запусков review-only завершились ошибкой",
+            }
+        )
+    timeout_info = report.get("timeouts", {})
+    if timeout_info.get("unknown", 0):
+        result.append(
+            {
+                "priority": "medium",
+                "metric": "timeouts.unknown",
+                "action": (
+                    "Обновить исполнителей, чтобы каждый жёсткий таймаут "
+                    "записывал last_output_age_s."
+                ),
+                "evidence": (
+                    f"{timeout_info['unknown']} из {timeout_info['count']} таймаутов "
+                    "нельзя классифицировать"
+                ),
+            }
+        )
+    feedback_info = report.get("feedback", {})
+    if feedback_info.get("eligible", 0) and feedback_info.get("labeled", 0) == 0:
+        result.append(
+            {
+                "priority": "medium",
+                "metric": "feedback.coverage",
+                "action": (
+                    "После принятия или переделки задачи записывать feedback, "
+                    "чтобы проверить git-эвристику."
+                ),
+                "evidence": f"0/{feedback_info['eligible']} завершённых задач имеют явную оценку",
+            }
+        )
+    experiment = report.get("exploration", {})
+    arms = experiment.get("arms", {})
+    if arms and min(arms.get(arm, {}).get("n", 0) for arm in ("explore", "jev")) < 30:
+        result.append(
+            {
+                "priority": "low",
+                "metric": "exploration.sample_size",
+                "action": (
+                    "Не менять routing по experiment до минимум 30 завершённых наблюдений на arm."
+                ),
+                "evidence": "Одна или обе arms имеют малую выборку",
+            }
+        )
+    return result
+
+
 #: Вывод не старше этого к моменту убийства: агент работал до конца.
 ACTIVE_BEFORE_KILL_S = 120
 
@@ -1190,4 +1295,21 @@ def render(report: dict) -> str:
             )
         if info["warning"]:
             lines.append(info["warning"])
+    if "feedback" in report:
+        info = report["feedback"]
+        lines.append(
+            f"explicit feedback: {info['labeled']} of {info['eligible']} eligible tasks "
+            f"({_pct(info['coverage'])}), unlabeled {info['unlabeled']}"
+        )
+        if info["outcomes"]:
+            lines.append(
+                "  outcomes: "
+                + ", ".join(f"{outcome} {count}" for outcome, count in info["outcomes"].items())
+            )
+    if "recommendations" in report:
+        lines.append("recommended actions:")
+        lines += [
+            f"  [{item['priority']}] {item['metric']}: {item['action']} ({item['evidence']})"
+            for item in report["recommendations"]
+        ]
     return "\n".join(lines)

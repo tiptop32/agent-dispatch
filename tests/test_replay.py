@@ -23,10 +23,12 @@ from evals.replay.harness import (
     children_refusals,
     delegations,
     exploration_comparison,
+    feedback_summary,
     git_acceptance,
     load,
     load_decisions,
     perimeter_violations,
+    recommendations,
     render,
     replay,
     router_vs_static,
@@ -92,6 +94,64 @@ def _slot_event(path: Path, task_id: str, group: str, wait_seconds: float) -> No
     )
     conn.commit()
     conn.close()
+
+
+def _feedback_event(
+    path: Path,
+    task_id: str,
+    outcome: str,
+    ts: str = "2026-09-23T12:01:00+00:00",
+) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "insert into events (task_id, ts, kind, payload_json) values (?, ?, 'feedback', ?)",
+        (task_id, ts, json.dumps({"outcome": outcome, "note": "checked"})),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_load_keeps_feedback_and_summary_uses_latest_outcome(tmp_path):
+    db = _db(
+        tmp_path,
+        [
+            ("a" * 32, "codex/sol", "10:00", "10:01", 1, None, _result("completed")),
+            ("b" * 32, "codex/sol", "10:02", "10:03", 1, None, _result("failed")),
+        ],
+    )
+    _feedback_event(db, "a" * 32, "failure", "2026-09-23T12:01:00+00:00")
+    _feedback_event(db, "a" * 32, "user_accepted", "2026-09-23T12:02:00+00:00")
+    tasks = load(db)
+
+    assert tasks[0].feedback[-1]["outcome"] == "user_accepted"
+    assert feedback_summary(tasks) == {
+        "eligible": 2,
+        "labeled": 1,
+        "unlabeled": 1,
+        "coverage": 0.5,
+        "outcomes": {"user_accepted": 1},
+    }
+
+
+def test_recommendations_prioritize_observed_waste_and_missing_instrumentation():
+    report = {
+        "delegations": {"wasted": 2, "roots": 10, "wasted_share": 0.2},
+        "review_only_failed": 3,
+        "timeouts": {"count": 4, "unknown": 2},
+        "feedback": {"eligible": 10, "labeled": 0},
+        "exploration": {"arms": {"explore": {"n": 10}, "jev": {"n": 40}}},
+    }
+
+    items = recommendations(report)
+
+    assert [item["metric"] for item in items] == [
+        "delegations.wasted_share",
+        "review_only_failed",
+        "timeouts.unknown",
+        "feedback.coverage",
+        "exploration.sample_size",
+    ]
+    assert "2/10" in items[0]["evidence"]
 
 
 def test_replay_counts_runs_sent_to_an_executor_that_was_down(tmp_path):

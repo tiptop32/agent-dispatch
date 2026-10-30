@@ -15,9 +15,11 @@ from .harness import (
     default_limit_group,
     delegations,
     exploration_comparison,
+    feedback_summary,
     load,
     load_decisions,
     perimeter_violations,
+    recommendations,
     render,
     replay,
     router_vs_static,
@@ -84,6 +86,7 @@ def main() -> int:
     report["children_refusals"] = children_refusals(tasks, settings.routing.max_children)
     report["delegations"] = delegations(tasks)
     report["timeouts"] = timeouts(tasks)
+    report["feedback"] = feedback_summary(tasks)
     # Один locator на прогон: дифы эксперимента судятся второй раз из кэша.
     locator = GitLocator()
     if not args.no_git:
@@ -104,6 +107,7 @@ def main() -> int:
         window_hours=args.accept_window_hours,
         with_acceptance=not args.no_git,
     )
+    report["recommendations"] = recommendations(report)
     print(json.dumps(report, indent=2, ensure_ascii=False) if args.json else render(report))
     return 0
 
