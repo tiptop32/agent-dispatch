@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__agent-dispatch__status",
+      "Bash(uv run ruff check .)",
+      "Bash(uv run ruff format --check .)",
+      "mcp__mcphub__gitlab-get_merge_request",
+      "mcp__agent-dispatch__route",
+      "mcp__mcphub__allure-testops-testops_find_testresults"
+    ]
+  }
+}
