@@ -457,3 +457,14 @@ def test_preferred_executor_wait_loads_user_override(tmp_config_dir, value):
         f"routing:\n  preferred_executor_max_wait_seconds: {value}\n"
     )
     assert load_settings(tmp_config_dir).routing.preferred_executor_max_wait_seconds == value
+
+
+def test_user_order_of_executors_wins_over_defaults(tmp_path):
+    # Внутри тира выбор идёт по порядку исполнителей: omp/x5-code-large пользователя
+    # стоит первым и должен остаться первым, хотя в дефолтном конфиге он после omp/sol.
+    (tmp_path / "config.yaml").write_text(
+        "executors:\n  omp/x5-code-large: {tier: balanced}\n  omp/sol: {tier: balanced}\n"
+    )
+    names = list(load_settings(tmp_path).executors)
+    assert names.index("omp/x5-code-large") < names.index("omp/sol")
+    assert "omp/terra" in names  # дефолтные, которых нет у пользователя, остаются

@@ -368,6 +368,19 @@ def load_settings(config_dir: Path | None = None) -> Settings:
     else:
         user = {}
     merged = _deep_merge(defaults, user or {})
+    # Внутри тира побеждает исполнитель, который выше в файле пользователя: при
+    # совпадении имён с дефолтными (omp/sol, omp/x5-code-large) порядок задаёт
+    # пользователь, а не config_default.yaml. Остальные дефолтные идут следом.
+    user_executors = (user or {}).get("executors")
+    if isinstance(user_executors, dict) and isinstance(merged.get("executors"), dict):
+        merged["executors"] = {
+            **{name: merged["executors"][name] for name in user_executors},
+            **{
+                name: item
+                for name, item in merged["executors"].items()
+                if name not in user_executors
+            },
+        }
     if "secrets" in merged:
         raise ConfigError("secrets: keys belong in the env file, not config.yaml")
     data_dir = os.environ.get("AGENT_DISPATCH_DATA_DIR")
