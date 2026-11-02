@@ -503,5 +503,22 @@ def doctor(
         raise typer.Exit(1)
 
 
+@app.command("migrate-config", help="Migrate config.yaml executors from codex/opencode to omp.")
+def migrate_config(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print a diff, write nothing."),
+) -> None:
+    from agent_dispatch import migrate as migrate_module
+    from agent_dispatch.config import ConfigError
+
+    try:
+        code, report = migrate_module.migrate_file(None, dry_run=dry_run)
+    except ConfigError as error:
+        typer.echo(f"migrate-config: {error}", err=True)
+        raise typer.Exit(1) from error
+    typer.echo(report, nl=False)
+    if code:
+        raise typer.Exit(code)
+
+
 if __name__ == "__main__":
     app()

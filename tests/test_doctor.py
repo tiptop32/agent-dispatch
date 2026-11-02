@@ -15,9 +15,11 @@ from agent_dispatch.config import load_settings
 from agent_dispatch.doctor import (
     Check,
     _install_check,
-    codex_env_check,
     format_checks,
     install_check,
+    omp_mcp_env_check,
+    omp_version_check,
+    omp_x5_profile_check,
     run_checks,
     stale_files,
     worktrees_check,
@@ -26,10 +28,39 @@ from agent_dispatch.serve_state import ServeState, write_state
 
 runner = CliRunner()
 FAKE = Path(__file__).parent / "fakes" / "version_only.sh"
+FAKE_OMP = Path(__file__).parent / "fakes" / "omp.sh"
 JEV_RESPONSE = Path(__file__).parent / "fixtures" / "jev" / "response_ok.json"
-CODEX_ENV_VARS_LINE = (
-    'env_vars = ["AGENT_DISPATCH_HOP", "AGENT_DISPATCH_TASK_ID", "AGENT_DISPATCH_ROOT_AGENT"]'
+OMP_HOP_VARS = ("AGENT_DISPATCH_HOP", "AGENT_DISPATCH_TASK_ID", "AGENT_DISPATCH_ROOT_AGENT")
+# Все omp-исполнители дефолтного конфига: run_checks проверяет каждый, включая выключенных.
+DEFAULT_OMP_EXECUTORS = (
+    "omp/sol",
+    "omp/terra",
+    "omp/luna",
+    "omp/x5-code-large",
+    "omp/x5-small-coder",
+    "omp/copilot-code-flash",
+    "omp/copilot-code-flash-thinking",
 )
+GREEN_MCP_JSON = {
+    "mcpServers": {
+        "agent-dispatch": {
+            "command": "agent-dispatch",
+            "args": ["mcp"],
+            "env": {
+                "AGENT_DISPATCH_SOURCE_AGENT": "omp",
+                **{var: var for var in OMP_HOP_VARS},
+            },
+        }
+    }
+}
+GREEN_X5_PROFILE = """\
+enabledModels:
+  - copilot-x5/*
+modelRoles:
+  default: copilot-x5/x5-airun-code-large
+  smol: copilot-x5/copilot-code-flash
+  slow: copilot-x5/x5-airun-small-coder
+"""
 
 
 def _package_tree(root: Path, files: dict[str, str]) -> Path:
@@ -48,23 +79,19 @@ def _configure(
     key: str | None = None,
     backend: str = "jev",
     claude_command: str = "claude",
-    codex_command: str | None = None,
+    omp_wrapper: str | None = None,
 ):
     lines = []
-    for name in ("claude", "codex", "opencode/kimi"):
+    for name in ("claude", *DEFAULT_OMP_EXECUTORS):
         if name == broken:
             command = "/nonexistent"
-        elif name == "codex" and codex_command is not None:
-            command = codex_command
+        elif name == "omp/sol" and omp_wrapper is not None:
+            command = omp_wrapper
         else:
             command = str(FAKE)
         lines.append(f"  {name}:")
-        # codex и opencode ушли из дефолтного конфига: адаптер и модель задаются явно.
-        if name == "codex":
-            lines.append("    adapter: codex")
-        elif name == "opencode/kimi":
-            lines.append("    adapter: opencode")
-            lines.append("    model: x5/kimi")
+        # Адаптер и модель приходят из дефолтного конфига (merge по имени),
+        # пользовательская запись подменяет только команду CLI.
         lines.append(f'    command: "{command}"')
     (tmp_config_dir / "config.yaml").write_text(
         f"router:\n  backend: {backend}\n  claude_local:\n    command: {claude_command!r}\n"
@@ -82,119 +109,204 @@ def _state(port: int = 17434) -> ServeState:
 
 
 @pytest.fixture(autouse=True)
-def _no_codex_config(tmp_path_factory, monkeypatch):
-    """Проверка codex смотрит в tmp CODEX_HOME, а не в настоящий ~/.codex."""
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path_factory.mktemp("codex")))
+def _omp_home(tmp_path_factory, monkeypatch):
+    """Проверки omp смотрят во временный HOME с зелёным конфигом, а не в настоящий ~/.omp."""
+    home = tmp_path_factory.mktemp("omp-home")
+    omp = home / ".omp"
+    agent = omp / "agent"
+    agent.mkdir(parents=True)
+    (agent / "mcp.json").write_text(json.dumps(GREEN_MCP_JSON))
+    profile = omp / "profiles" / "x5" / "agent"
+    profile.mkdir(parents=True)
+    (profile / "config.yml").write_text(GREEN_X5_PROFILE)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(doctor_module, "OMP_COMMAND", str(FAKE_OMP))
+    return omp
 
 
-def _codex_config(tmp_path: Path, body: str) -> Path:
-    path = tmp_path / "config.toml"
-    path.write_text(body)
-    return path
+def _mcp_env(**env: str) -> dict:
+    return {"mcpServers": {"agent-dispatch": {"command": "x", "env": env}}}
 
 
-def test_codex_env_check_warns_with_the_line_to_add(tmp_path):
-    path = _codex_config(
-        tmp_path, '[mcp_servers.agent-dispatch]\ncommand = "agent-dispatch"\nargs = ["mcp"]\n'
-    )
+def test_omp_mcp_env_check_ok_when_hop_vars_forwarded(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps(GREEN_MCP_JSON))
 
-    check = codex_env_check(path)
-
-    assert not check.ok
-    assert "does not forward AGENT_DISPATCH_HOP" in check.detail
-    assert CODEX_ENV_VARS_LINE in check.detail
-    assert "[mcp_servers.agent-dispatch]" in check.detail
-
-
-def test_codex_env_check_lists_each_missing_var(tmp_path):
-    path = _codex_config(
-        tmp_path,
-        '[mcp_servers.agent-dispatch]\nenv_vars = ["AGENT_DISPATCH_HOP"]\n',
-    )
-
-    check = codex_env_check(path)
-
-    assert not check.ok
-    assert "does not forward AGENT_DISPATCH_TASK_ID, AGENT_DISPATCH_ROOT_AGENT" in check.detail
-
-
-def test_codex_env_check_ok_when_all_vars_forwarded(tmp_path):
-    path = _codex_config(
-        tmp_path,
-        "[mcp_servers.agent-dispatch]\n" + CODEX_ENV_VARS_LINE + "\n",
-    )
-
-    check = codex_env_check(path)
+    check = omp_mcp_env_check(path)
 
     assert check.ok and "forwarded" in check.detail
 
 
-def test_codex_env_check_skips_without_codex_config(tmp_path):
-    check = codex_env_check(tmp_path / "config.toml")
+def test_omp_mcp_env_check_lists_each_missing_var(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text(
+        json.dumps(
+            _mcp_env(
+                AGENT_DISPATCH_HOP="AGENT_DISPATCH_HOP",
+                AGENT_DISPATCH_SOURCE_AGENT="codex",
+            )
+        )
+    )
+
+    check = omp_mcp_env_check(path)
+
+    assert not check.ok
+    assert "does not forward AGENT_DISPATCH_TASK_ID, AGENT_DISPATCH_ROOT_AGENT" in check.detail
+    assert "AGENT_DISPATCH_SOURCE_AGENT=omp" in check.detail
+
+
+def test_omp_mcp_env_check_skips_without_omp_config(tmp_path):
+    check = omp_mcp_env_check(tmp_path / "mcp.json")
     assert check.ok and "skipped" in check.detail
 
 
-def test_codex_env_check_skips_without_agent_dispatch_server(tmp_path):
-    path = _codex_config(tmp_path, '[mcp_servers.other]\ncommand = "x"\n')
+def test_omp_mcp_env_check_fails_without_agent_dispatch_server(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps({"mcpServers": {"other": {"command": "x"}}}))
 
-    check = codex_env_check(path)
+    check = omp_mcp_env_check(path)
 
-    assert check.ok and "no agent-dispatch server" in check.detail
-
-
-def test_codex_env_check_uses_codex_home(monkeypatch, tmp_path):
-    _codex_config(
-        tmp_path,
-        "[mcp_servers.agent-dispatch]\n" + CODEX_ENV_VARS_LINE + "\n",
-    )
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-
-    assert doctor_module._codex_env_check().ok
+    # omp установлен, но сервер agent-dispatch не настроен: hop-переменные
+    # проверить нечем, проверка падает, а не молча проходит.
+    assert not check.ok and "no agent-dispatch" in check.detail
 
 
-def test_codex_env_check_reports_broken_toml(tmp_path):
-    path = _codex_config(tmp_path, "[mcp_servers.agent-dispatch\n")
+def test_omp_mcp_env_check_reports_broken_json(tmp_path):
+    path = tmp_path / "mcp.json"
+    path.write_text("{not json")
 
-    check = codex_env_check(path)
+    check = omp_mcp_env_check(path)
 
     assert not check.ok and "cannot parse" in check.detail
 
 
-@pytest.mark.asyncio
-async def test_run_checks_includes_codex_env_vars_check(tmp_config_dir, monkeypatch, tmp_path):
-    monkeypatch.setenv(
-        "CODEX_HOME",
-        str(_codex_config(tmp_path, '[mcp_servers.agent-dispatch]\ncommand = "x"\n').parent),
+def test_omp_mcp_env_check_uses_home_env(monkeypatch, tmp_path):
+    agent = tmp_path / ".omp" / "agent"
+    agent.mkdir(parents=True)
+    (agent / "mcp.json").write_text(json.dumps(GREEN_MCP_JSON))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert doctor_module._omp_mcp_env_check().ok
+
+
+def test_omp_version_check_ok_with_recent_version():
+    check = omp_version_check(str(FAKE_OMP))
+    assert check.ok and "18.16.0" in check.detail
+
+
+def test_omp_version_check_fails_below_minimum(tmp_path, monkeypatch):
+    old = tmp_path / "omp-old"
+    old.write_text("#!/bin/sh\necho omp 18.14.2\n")
+    old.chmod(0o755)
+
+    check = omp_version_check(str(old))
+
+    assert not check.ok
+    assert "older than required 18.15.0" in check.detail
+
+
+def test_omp_version_check_rejects_unparseable_output(tmp_path):
+    broken = tmp_path / "omp-broken"
+    broken.write_text("#!/bin/sh\necho omp\n")
+    broken.chmod(0o755)
+
+    check = omp_version_check(str(broken))
+
+    assert not check.ok and "cannot parse" in check.detail
+
+
+def test_omp_version_check_reports_missing_binary(tmp_path):
+    check = omp_version_check(str(tmp_path / "no-such-omp"))
+    assert not check.ok and "cannot run" in check.detail
+
+
+def test_omp_version_check_uses_module_command(monkeypatch):
+    # run_checks вызывает проверку без аргумента: команда читается из глобала,
+    # чтобы тесты подменяли её одной строкой.
+    monkeypatch.setattr(doctor_module, "OMP_COMMAND", str(FAKE_OMP))
+    assert omp_version_check().ok
+
+
+def test_omp_x5_profile_check_accepts_green_profile(_omp_home):
+    check = omp_x5_profile_check(_omp_home / "profiles" / "x5" / "agent" / "config.yml")
+    assert check.ok and "inside copilot-x5" in check.detail
+
+
+def test_omp_x5_profile_check_fails_without_profile(_omp_home):
+    (_omp_home / "profiles" / "x5" / "agent" / "config.yml").unlink()
+
+    check = omp_x5_profile_check(_omp_home / "profiles" / "x5" / "agent" / "config.yml")
+
+    assert not check.ok and "wide open" in check.detail
+
+
+def test_omp_x5_profile_check_fails_with_role_outside_provider(_omp_home):
+    path = _omp_home / "profiles" / "x5" / "agent" / "config.yml"
+    path.write_text(
+        "enabledModels:\n  - copilot-x5/*\nmodelRoles:\n  default: openrouter/some-model\n"
     )
+
+    check = omp_x5_profile_check(path)
+
+    assert not check.ok
+    assert "периметр дырявый" in check.detail
+    assert "modelRoles outside copilot-x5" in check.detail
+
+
+def test_omp_x5_profile_check_fails_with_enabled_model_outside_provider(_omp_home):
+    path = _omp_home / "profiles" / "x5" / "agent" / "config.yml"
+    path.write_text(
+        "enabledModels:\n  - copilot-x5/*\n  - openrouter/*\n"
+        "modelRoles:\n  default: copilot-x5/x5-airun-code-large\n"
+    )
+
+    check = omp_x5_profile_check(path)
+
+    assert not check.ok and "enabledModels outside copilot-x5" in check.detail
+
+
+def test_omp_x5_profile_check_fails_without_enabled_models(_omp_home):
+    path = _omp_home / "profiles" / "x5" / "agent" / "config.yml"
+    path.write_text("modelRoles:\n  default: copilot-x5/x5-airun-code-large\n")
+
+    check = omp_x5_profile_check(path)
+
+    assert not check.ok and "enabledModels do not restrict" in check.detail
+
+
+@pytest.mark.asyncio
+async def test_run_checks_includes_omp_mcp_env_check(tmp_config_dir, _omp_home):
+    path = _omp_home / "agent" / "mcp.json"
+    path.write_text(json.dumps(_mcp_env(AGENT_DISPATCH_HOP="AGENT_DISPATCH_HOP")))
     settings = _configure(tmp_config_dir)
 
     checks = await run_checks(settings)
 
-    check = next(c for c in checks if c.name == "codex-env-vars")
-    assert not check.ok and CODEX_ENV_VARS_LINE in check.detail
+    check = next(c for c in checks if c.name == "omp-mcp-env")
+    assert not check.ok and "AGENT_DISPATCH_TASK_ID" in check.detail
 
 
 @pytest.mark.asyncio
 async def test_executor_check_names_a_key_trapped_in_the_dispatch_env_file(
     tmp_config_dir, tmp_path
 ):
-    # Wrapper codex-agent-lb падает до `exec`, если ключа нет в его env. Ключ
+    # Wrapper agent-lb падает до `exec`, если ключа нет в его env. Ключ
     # в env-файле agent-dispatch туда не попадёт: child_env вырезает секреты.
-    wrapper = tmp_path / "codex-agent-lb"
+    wrapper = tmp_path / "omp-agent-lb"
     wrapper.write_text(
         "#!/bin/sh\n"
-        "echo 'codex-agent-lb: Missing environment variable: AGENT_LB_API_KEY' >&2\n"
+        "echo 'omp-agent-lb: Missing environment variable: AGENT_LB_API_KEY' >&2\n"
         "exit 78\n"
     )
     wrapper.chmod(0o755)
     value = "lb-secret-value"  # pragma: allowlist secret
-    settings = _configure(tmp_config_dir, codex_command=str(wrapper))
+    settings = _configure(tmp_config_dir, omp_wrapper=str(wrapper))
     (tmp_config_dir / "env").write_text(f"AGENT_LB_API_KEY={value}\n")
     settings = load_settings()
 
     checks = await run_checks(settings)
 
-    check = next(c for c in checks if c.name == "executor:codex")
+    check = next(c for c in checks if c.name == "executor:omp/sol")
     assert not check.ok
     assert "AGENT_LB_API_KEY is in the agent-dispatch env file" in check.detail
     assert value not in check.detail
@@ -205,17 +317,17 @@ async def test_executor_check_gives_no_env_file_hint_for_a_process_env_key(
     tmp_config_dir, tmp_path, monkeypatch
 ):
     # Ключ роутера только в окружении демона: совет «переложить из env-файла» был бы ложью.
-    wrapper = tmp_path / "codex-agent-lb"
+    wrapper = tmp_path / "omp-agent-lb"
     wrapper.write_text(
         "#!/bin/sh\necho 'Missing environment variable: OPENROUTER_API_KEY' >&2\nexit 78\n"
     )
     wrapper.chmod(0o755)
     monkeypatch.setenv("OPENROUTER_API_KEY", "from-process-env")
-    settings = _configure(tmp_config_dir, codex_command=str(wrapper))
+    settings = _configure(tmp_config_dir, omp_wrapper=str(wrapper))
 
     checks = await run_checks(settings)
 
-    check = next(c for c in checks if c.name == "executor:codex")
+    check = next(c for c in checks if c.name == "executor:omp/sol")
     assert not check.ok and "agent-dispatch env file" not in check.detail
 
 
@@ -431,14 +543,14 @@ async def test_daemon_check_reports_not_running(tmp_config_dir):
 async def test_executor_check_reports_version(tmp_config_dir):
     settings = _configure(tmp_config_dir)
     checks = await run_checks(settings)
-    assert any(c.name == "executor:codex" and c.ok and c.detail == "1.2.3" for c in checks)
+    assert any(c.name == "executor:omp/sol" and c.ok and c.detail == "1.2.3" for c in checks)
 
 
 @pytest.mark.asyncio
 async def test_executor_check_reports_error(tmp_config_dir):
-    settings = _configure(tmp_config_dir, broken="codex")
+    settings = _configure(tmp_config_dir, broken="omp/sol")
     checks = await run_checks(settings)
-    assert any(c.name == "executor:codex" and not c.ok for c in checks)
+    assert any(c.name == "executor:omp/sol" and not c.ok for c in checks)
 
 
 @pytest.mark.asyncio
@@ -462,7 +574,8 @@ async def test_jev_check_calls_router_online(tmp_config_dir):
 @pytest.mark.asyncio
 @respx.mock
 async def test_claude_local_backend_does_not_require_jev_or_call_it(tmp_config_dir):
-    claude = Path(__file__).parent / "fakes" / "claude_router_ok.sh"
+    # Фейковый роутер возвращает omp/sol: codex в дефолтных исполнителях больше не существует.
+    claude = Path(__file__).parent / "fakes" / "claude_router_ok_omp.sh"
     settings = _configure(tmp_config_dir, backend="claude_local", claude_command=str(claude))
     _mock_health(settings, _state())
     checks = await run_checks(settings, online=True)
@@ -480,9 +593,9 @@ def test_doctor_json_is_parseable(tmp_config_dir):
 
 
 def test_doctor_exits_one_when_any_check_fails(tmp_config_dir):
-    _configure(tmp_config_dir, broken="codex")
+    _configure(tmp_config_dir, broken="omp/sol")
     result = runner.invoke(app, ["doctor"])
-    assert result.exit_code == 1 and "FAIL  executor:codex" in result.stdout
+    assert result.exit_code == 1 and "FAIL  executor:omp/sol" in result.stdout
 
 
 @respx.mock

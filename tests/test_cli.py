@@ -552,8 +552,49 @@ def test_help_lists_all_commands():
         "feedback",
         "export",
         "doctor",
+        "migrate-config",
     ):
         assert command in result.stdout
+
+
+OLD_CLI_CONFIG = """\
+executors:
+  codex/sol:
+    adapter: codex
+    model: gpt-5.6-sol
+"""
+
+
+def test_migrate_config_dry_run_prints_diff_without_writing(tmp_config_dir):
+    (tmp_config_dir / "config.yaml").write_text(OLD_CLI_CONFIG)
+
+    result = runner.invoke(app, ["migrate-config", "--dry-run"])
+
+    assert result.exit_code == 0
+    diff_lines = result.stdout.splitlines()
+    assert any(line.startswith("-") and "adapter: codex" in line for line in diff_lines)
+    assert any(line.startswith("+") and "adapter: omp" in line for line in diff_lines)
+    assert (tmp_config_dir / "config.yaml").read_text() == OLD_CLI_CONFIG
+    assert not list(tmp_config_dir.glob("config.yaml.bak-*"))
+
+
+def test_migrate_config_writes_backup_and_migrated_file(tmp_config_dir):
+    (tmp_config_dir / "config.yaml").write_text(OLD_CLI_CONFIG)
+
+    result = runner.invoke(app, ["migrate-config"])
+
+    assert result.exit_code == 0
+    text = (tmp_config_dir / "config.yaml").read_text()
+    assert "adapter: omp" in text
+    backups = list(tmp_config_dir.glob("config.yaml.bak-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text() == OLD_CLI_CONFIG
+
+
+def test_migrate_config_missing_config_exits_nonzero(tmp_config_dir):
+    result = runner.invoke(app, ["migrate-config"])
+    assert result.exit_code == 1
+    assert "не найден" in result.stdout
 
 
 @respx.mock

@@ -88,17 +88,20 @@ def test_fallback_chain_members_must_exist_and_chain_is_not_empty(
         load_settings()
 
 
-def test_opencode_executor_requires_model(tmp_config_dir: Path) -> None:
-    (tmp_config_dir / "config.yaml").write_text(
-        """executors:
+def test_legacy_adapter_in_user_config_requires_migration(tmp_config_dir: Path) -> None:
+    # Конфиг с исполнителями codex/opencode больше не стартует: нужна явная миграция.
+    for adapter, model in (("codex", None), ("opencode", "copilot/x")):
+        lines = "adapter: " + adapter
+        if model:
+            lines += f"\n    model: {model}"
+        (tmp_config_dir / "config.yaml").write_text(
+            f"""executors:
   custom:
-    adapter: opencode
-    description: Missing model
+    {lines}
 """
-    )
-
-    with pytest.raises(ConfigError, match=r"executors\.custom\.model"):
-        load_settings()
+        )
+        with pytest.raises(ConfigError, match="agent-dispatch migrate-config"):
+            load_settings(tmp_config_dir)
 
 
 def test_omp_executor_requires_model(tmp_config_dir: Path) -> None:
@@ -126,12 +129,13 @@ def test_command_defaults_to_adapter(tmp_config_dir: Path) -> None:
     (tmp_config_dir / "config.yaml").write_text(
         """executors:
   local:
-    adapter: codex
+    adapter: omp
+    model: agent-lb/gpt-5.6-sol
     description: Local
 """
     )
 
-    assert load_settings().executors["local"].resolved_command == "codex"
+    assert load_settings().executors["local"].resolved_command == "omp"
 
 
 def test_default_extra_args_come_from_packaged_config(tmp_config_dir: Path) -> None:
@@ -169,7 +173,8 @@ def test_executors_merge_by_name(tmp_config_dir: Path) -> None:
   claude:
     enabled: false
   custom:
-    adapter: codex
+    adapter: omp
+    model: agent-lb/gpt-5.6-sol
     description: Custom executor
 """
     )
@@ -181,7 +186,7 @@ def test_executors_merge_by_name(tmp_config_dir: Path) -> None:
         "--permission-mode",
         "acceptEdits",
     ]
-    assert settings.executors["custom"].adapter == "codex"
+    assert settings.executors["custom"].adapter == "omp"
     assert "claude" not in settings.enabled_executors()
     assert "custom" in settings.enabled_executors()
 

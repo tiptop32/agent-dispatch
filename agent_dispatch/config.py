@@ -330,6 +330,28 @@ def _error_path(error: dict[str, Any]) -> str:
     return ".".join(str(part) for part in location) or "config"
 
 
+#: Адаптеры, которых больше нет в дефолтах: конфиг с ними нужно мигрировать.
+_LEGACY_ADAPTERS = ("codex", "opencode")
+
+
+def _reject_legacy_adapters(user: dict, user_path: Path) -> None:
+    """Старый конфиг с codex/opencode исполнителями даёт понятную ошибку, не traceback."""
+    executors = user.get("executors")
+    if not isinstance(executors, dict):
+        return
+    legacy = sorted(
+        name
+        for name, fields in executors.items()
+        if isinstance(fields, dict) and fields.get("adapter") in _LEGACY_ADAPTERS
+    )
+    if legacy:
+        names = ", ".join(legacy)
+        raise ConfigError(
+            f"{user_path}: executors {names}: adapter codex/opencode удалён из agent-dispatch, "
+            "запустите agent-dispatch migrate-config"
+        )
+
+
 def load_settings(config_dir: Path | None = None) -> Settings:
     directory = _config_path(config_dir)
     default_path = Path(__file__).with_name("config_default.yaml")
@@ -342,6 +364,7 @@ def load_settings(config_dir: Path | None = None) -> Settings:
             raise ConfigError(f"{user_path}: invalid YAML: {error}") from error
         if not isinstance(user, dict):
             raise ConfigError(f"{user_path}: top-level must be a mapping")
+        _reject_legacy_adapters(user, user_path)
     else:
         user = {}
     merged = _deep_merge(defaults, user or {})

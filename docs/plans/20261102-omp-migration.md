@@ -227,11 +227,11 @@
 - Modify: `agent_dispatch/cli.py`, `agent_dispatch/config.py`, `agent_dispatch/doctor.py`
 - Modify: `tests/test_cli.py`, `tests/test_doctor.py`
 
-- [ ] команда `agent-dispatch migrate-config` в `cli.py`: `codex/*` и `opencode/*` → `omp/*`, бэкап рядом, идемпотентно, `--dry-run` печатает дифф
-- [ ] старый конфиг без миграции даёт ошибку старта с именем команды миграции, а не трейсбек pydantic
-- [ ] doctor: `codex-env-vars` → `omp-mcp-env` (проброс `AGENT_DISPATCH_*`), версия omp не ниже зафиксированной, профиль x5 без внешних провайдеров
-- [ ] тесты: миграция полного конфига, повторная миграция, неизвестный исполнитель, ошибка старта, каждая проверка doctor в зелёном и красном случае
-- [ ] гейт зелёный
+- [x] команда `agent-dispatch migrate-config` в `cli.py`: `codex/*` и `opencode/*` → `omp/*`, бэкап рядом, идемпотентно, `--dry-run` печатает дифф
+- [x] старый конфиг без миграции даёт ошибку старта с именем команды миграции, а не трейсбек pydantic
+- [x] doctor: `codex-env-vars` → `omp-mcp-env` (проброс `AGENT_DISPATCH_*`), версия omp не ниже зафиксированной, профиль x5 без внешних провайдеров
+- [x] тесты: миграция полного конфига, повторная миграция, неизвестный исполнитель, ошибка старта, каждая проверка doctor в зелёном и красном случае
+- [x] гейт зелёный
 
 ### Task 7: Перенос скилов в omp-setup
 **Depends on:** Task 2
@@ -293,6 +293,7 @@
 **Depends on:** Task 11
 - [ ] записать откат в `docs/research/omp-cli-facts.md`: путь к бэкапу конфига, команда установки прежней версии uv tool (коммит до Task 10), рестарт демона
 - ➕ [ ] симлинк `~/.claude/skills/gpt-review` вместо `codex-review`, ссылки в plan-dispatch и review-refactor на gpt-review (после установки omp-setup, иначе ревью сломается)
+- ➕ [ ] пользовательский config.yaml переносить вручную по образцу `migrate-config --dry-run`: команда теряет комментарии (PyYAML) и оставляет старые description («Codex CLI…»), а Jev выбирает и по описаниям
 - [ ] `agent-dispatch migrate-config` с бэкапом, переустановка uv tool, перезапуск демона (memory installed-tool-is-a-copy), `doctor` на установленной копии
 - [ ] `uv run agent-dispatch doctor --online` зелёный
 - [ ] `uv run python -m evals.smoke --executors omp/sol,omp/terra,omp/luna,omp/x5-code-large` зелёный

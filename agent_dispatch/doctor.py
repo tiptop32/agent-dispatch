@@ -4,13 +4,15 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
+import subprocess
 import time
-import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
 import httpx
+import yaml
 from pydantic import BaseModel
 
 import agent_dispatch
@@ -106,45 +108,164 @@ def _config_check() -> Check:
     return Check(name="config", ok=True, detail=detail)
 
 
-#: Codex не передаёт родительское окружение MCP-серверам по умолчанию: без этих
+#: omp не передаёт родительское окружение MCP-серверам по умолчанию: без этих
 #: переменных вложенный dispatch исполнителя приходит с hop=0 и без родителя.
-CODEX_HOP_VARS = ("AGENT_DISPATCH_HOP", "AGENT_DISPATCH_TASK_ID", "AGENT_DISPATCH_ROOT_AGENT")
-CODEX_ENV_VARS_LINE = (
-    'env_vars = ["AGENT_DISPATCH_HOP", "AGENT_DISPATCH_TASK_ID", "AGENT_DISPATCH_ROOT_AGENT"]'
+OMP_DISPATCH_VARS = (
+    "AGENT_DISPATCH_HOP",
+    "AGENT_DISPATCH_TASK_ID",
+    "AGENT_DISPATCH_ROOT_AGENT",
 )
+OMP_SOURCE_VAR = "AGENT_DISPATCH_SOURCE_AGENT"
+OMP_SOURCE_VALUE = "omp"
+#: Минимальная версия omp, с которой работает миграция и профиль x5.
+OMP_MIN_VERSION = "18.15.0"
+OMP_COMMAND = "omp"
+X5_PROFILE_PROVIDER = "copilot-x5/"
 
 
-def codex_env_check(path: Path) -> Check:
-    """Проверяет, что MCP-сервер agent-dispatch в codex получает hop-переменные."""
-    name = "codex-env-vars"
+def _omp_dir() -> Path:
+    """Каталог установки omp; HOME берём из окружения, чтобы тесты подменяли его."""
+    home = os.environ.get("HOME") or str(Path.home())
+    return Path(home) / ".omp"
+
+
+def omp_mcp_env_check(path: Path) -> Check:
+    """Проверяет, что MCP-сервер agent-dispatch в omp получает hop-переменные."""
+    name = "omp-mcp-env"
     if not path.is_file():
-        return Check(name=name, ok=True, detail=f"no codex config ({path}), skipped")
+        return Check(name=name, ok=True, detail=f"no omp mcp config ({path}), skipped")
     try:
-        with path.open("rb") as fh:
-            config = tomllib.load(fh)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        config = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
         return Check(name=name, ok=False, detail=f"cannot parse {path}: {exc}")
-    server = config.get("mcp_servers", {}).get("agent-dispatch")
+    servers = config.get("mcpServers") if isinstance(config, dict) else None
+    server = servers.get("agent-dispatch") if isinstance(servers, dict) else None
     if not isinstance(server, dict):
-        return Check(name=name, ok=True, detail=f"no agent-dispatch server in {path}, skipped")
-    forwarded = server.get("env_vars") or []
-    missing = [var for var in CODEX_HOP_VARS if var not in forwarded]
+        return Check(name=name, ok=False, detail=f"{path}: no agent-dispatch MCP server")
+    env = server.get("env")
+    env = env if isinstance(env, dict) else {}
+    # Переменная пробрасывается записью вида "VAR": "VAR": имя и значение совпадают.
+    missing = [var for var in OMP_DISPATCH_VARS if env.get(var) != var]
+    if env.get(OMP_SOURCE_VAR) != OMP_SOURCE_VALUE:
+        missing.append(f"{OMP_SOURCE_VAR}={OMP_SOURCE_VALUE}")
     if not missing:
-        return Check(name=name, ok=True, detail=f"{path}: hop vars forwarded")
+        return Check(name=name, ok=True, detail=f"{path}: hop vars forwarded, source=omp")
     return Check(
         name=name,
         ok=False,
         detail=(
-            f"{path}: [mcp_servers.agent-dispatch] does not forward {', '.join(missing)}; "
-            f"Codex does not pass the parent env to MCP servers by default, add under "
-            f"[mcp_servers.agent-dispatch]: {CODEX_ENV_VARS_LINE}"
+            f"{path}: mcpServers.agent-dispatch.env does not forward {', '.join(missing)}; "
+            f"omp does not pass the parent env to MCP servers by default, add under "
+            f'mcpServers.agent-dispatch.env entries like "{OMP_DISPATCH_VARS[0]}": '
+            f'"{OMP_DISPATCH_VARS[0]}" and {OMP_SOURCE_VAR}: "{OMP_SOURCE_VALUE}"'
         ),
     )
 
 
-def _codex_env_check() -> Check:
-    home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
-    return codex_env_check(home / "config.toml")
+def _version_tuple(text: str) -> tuple[int, ...] | None:
+    match = re.search(r"\d+(?:\.\d+)+", text)
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(0).split("."))
+
+
+def _version_at_least(version: tuple[int, ...], minimum: tuple[int, ...]) -> bool:
+    width = max(len(version), len(minimum))
+    padded = version + (0,) * (width - len(version))
+    padded_minimum = minimum + (0,) * (width - len(minimum))
+    return padded >= padded_minimum
+
+
+def omp_version_check(command: str | None = None) -> Check:
+    """Проверяет, что CLI omp установлен и не старее зафиксированного минимума."""
+    name = "omp-version"
+    binary = command or OMP_COMMAND
+    try:
+        outcome = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=15, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Check(name=name, ok=False, detail=f"cannot run {binary} --version: {exc}")
+    if outcome.returncode != 0:
+        stderr = outcome.stderr.strip() or f"exit code {outcome.returncode}"
+        return Check(name=name, ok=False, detail=f"{binary} --version failed: {stderr}")
+    stdout = outcome.stdout.strip()
+    version = stdout.splitlines()[0] if stdout else ""
+    parsed = _version_tuple(version)
+    if parsed is None:
+        return Check(name=name, ok=False, detail=f"cannot parse version from {version!r}")
+    minimum = _version_tuple(OMP_MIN_VERSION) or ()
+    if not _version_at_least(parsed, minimum):
+        found = ".".join(str(part) for part in parsed)
+        return Check(
+            name=name,
+            ok=False,
+            detail=f"omp {found} is older than required {OMP_MIN_VERSION}: update oh-my-pi",
+        )
+    return Check(name=name, ok=True, detail=f"omp {version} ({OMP_MIN_VERSION} required)")
+
+
+def omp_x5_profile_check(path: Path) -> Check:
+    """Профиль x5 должен держать все роли и enabledModels внутри copilot-x5."""
+    name = "omp-x5-profile"
+    if not path.is_file():
+        return Check(
+            name=name,
+            ok=False,
+            detail=(
+                f"{path}: x5 profile not found, corporate perimeter is wide open; "
+                "install the x5 profile from omp-setup"
+            ),
+        )
+    try:
+        config = yaml.safe_load(path.read_text())
+    except (OSError, yaml.YAMLError) as exc:
+        return Check(name=name, ok=False, detail=f"cannot parse {path}: {exc}")
+    if not isinstance(config, dict):
+        return Check(name=name, ok=False, detail=f"{path}: top-level must be a mapping")
+    problems: list[str] = []
+    roles = config.get("modelRoles")
+    roles = roles if isinstance(roles, dict) else {}
+    if not roles:
+        problems.append("modelRoles are not set")
+    else:
+        outside_roles = sorted(
+            f"{role}={roles[role]}"
+            for role, value in roles.items()
+            if not (isinstance(value, str) and value.startswith(X5_PROFILE_PROVIDER))
+        )
+        if outside_roles:
+            problems.append("modelRoles outside copilot-x5: " + ", ".join(outside_roles))
+    enabled = config.get("enabledModels")
+    if not isinstance(enabled, list) or not enabled:
+        problems.append("enabledModels do not restrict providers")
+    else:
+        outside_enabled = sorted(
+            model
+            for model in enabled
+            if not (isinstance(model, str) and model.startswith(X5_PROFILE_PROVIDER))
+        )
+        if outside_enabled:
+            problems.append("enabledModels outside copilot-x5: " + ", ".join(outside_enabled))
+    if problems:
+        return Check(
+            name=name, ok=False, detail=f"{path}: периметр дырявый: " + "; ".join(problems)
+        )
+    return Check(
+        name=name, ok=True, detail=f"{path}: all roles and enabledModels inside copilot-x5"
+    )
+
+
+def _omp_mcp_env_check() -> Check:
+    return omp_mcp_env_check(_omp_dir() / "agent" / "mcp.json")
+
+
+def _omp_version_check() -> Check:
+    return omp_version_check()
+
+
+def _omp_x5_profile_check() -> Check:
+    return omp_x5_profile_check(_omp_dir() / "profiles" / "x5" / "agent" / "config.yml")
 
 
 def _trapped_secret_hint(settings: Settings, error: str) -> str:
@@ -222,7 +343,9 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
             )
         )
     checks.append(await _daemon_check(settings))
-    checks.append(_codex_env_check())
+    checks.append(_omp_mcp_env_check())
+    checks.append(_omp_version_check())
+    checks.append(_omp_x5_profile_check())
     checks.append(worktrees_check(settings))
     safe_env = child_env(settings)
     for name, executor in settings.executors.items():

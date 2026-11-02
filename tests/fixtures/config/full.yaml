@@ -28,7 +28,7 @@ executors:
   claude:
     enabled: false
   local:
-    adapter: codex
+    adapter: omp
     command: codex-custom
     model: gpt-example
     extra_args: ["--quiet"]
