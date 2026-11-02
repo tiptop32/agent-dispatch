@@ -214,12 +214,12 @@
 - Modify: `agent_dispatch/config.py`, `agent_dispatch/config_default.yaml`, `config.example.yaml`, `agent_dispatch/models.py`, `agent_dispatch/routing/guards.py`, `evals/replay/harness.py`
 - Modify: `tests/test_config.py`, `tests/test_config_example.py`, `tests/test_guards.py`, `tests/test_models.py`, `tests/test_limits.py`, `tests/test_replay.py`, `tests/fixtures/config/{full,bad_escalation}.yaml`
 
-- [ ] исполнители `omp/*`, `adapter` omp, `fallback_executor: omp/sol`, цепочки `escalation`, `review_only: {omp: [claude]}`
-- [ ] `resolved_limit_group` для omp по провайдеру из `model`; `limit_reset: recheck` для agent-lb
-- [ ] `SourceAgent` и наборы источников получают `omp`, `codex` и `opencode` остаются для истории
-- [ ] `evals/replay/harness.py`: группы лимитов и `review_only` для omp, исторические `codex/*` и `opencode/*` по-прежнему разбираются
-- [ ] тесты: периметр выбирает только `omp/x5-*`, `review_only` для источника `omp`, группы лимитов, replay на исторической задаче `codex/sol` и `opencode/x5-code-large`, example равен default
-- [ ] гейт зелёный
+- [x] исполнители `omp/*`, `adapter` omp, `fallback_executor: omp/sol`, цепочки `escalation`, `review_only: {omp: [claude]}`
+- [x] `resolved_limit_group` для omp по провайдеру из `model`; `limit_reset: recheck` для agent-lb
+- [x] `SourceAgent` и наборы источников получают `omp`, `codex` и `opencode` остаются для истории
+- [x] `evals/replay/harness.py`: группы лимитов и `review_only` для omp, исторические `codex/*` и `opencode/*` по-прежнему разбираются
+- [x] тесты: периметр выбирает только `omp/x5-*`, `review_only` для источника `omp`, группы лимитов, replay на исторической задаче `codex/sol` и `opencode/x5-code-large`, example равен default
+- [x] гейт зелёный
 
 ### Task 6: Миграция пользовательского конфига и doctor
 **Depends on:** Task 5

@@ -429,3 +429,54 @@ def test_post_guards_keeps_perimeter_when_all_corporate_executors_are_cooling():
     out, _ = post_guards(d, s, ["external"])
     assert out.meta["perimeter"] == "answered"
     assert any("no in-perimeter executor" in note for note in out.meta["selection_notes"])
+
+
+def omp_settings():
+    return Settings.model_validate(
+        {
+            "routing": {"fallback_executor": "omp/sol", "review_only": {"omp": ["claude"]}},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "omp/sol": {"adapter": "omp", "model": "agent-lb/gpt-6.1-sol"},
+                "omp/x5-code-large": {
+                    "adapter": "omp",
+                    "model": "copilot-x5/x5-airun-code-large",
+                    "corporate": True,
+                },
+            },
+        }
+    )
+
+
+def test_candidates_exclude_omp_adapter_for_omp_source(git_repo):
+    # Источник omp не получает работу в свой же адаптер, как codex и opencode.
+    s = omp_settings()
+    assert candidates(s, set(), SourceAgent.omp, 0) == ["claude"]
+    assert len(candidates(s, set(), SourceAgent.omp, 1)) == 3
+
+
+def test_perimeter_narrows_the_choice_to_omp_x5():
+    """Корпоративные данные: исполнитель берётся только из omp/x5-*."""
+    from agent_dispatch.models import RouteDecision, RouterKind
+
+    s = omp_settings()
+    d = RouteDecision(
+        router=RouterKind.jev,
+        executor="omp/sol",
+        confidence=0.99,
+        scores={"omp/sol": 0.99},
+        judgments={"corporate_data": _corporate_judgment()},
+    )
+    out, _ = post_guards(d, s, ["claude", "omp/sol", "omp/x5-code-large"])
+    assert out.executor == "omp/x5-code-large"
+    assert out.meta["perimeter"] == "answered"
+
+
+def test_review_only_for_omp_source_bars_claude_from_edits(git_repo):
+    from agent_dispatch.routing.guards import review_only_executors
+
+    s = omp_settings()
+    req = DispatchRequest(task="x", cwd=str(git_repo), source_agent=SourceAgent.omp)
+    assert review_only_executors(req, s) == {"claude"}
+    review = req.model_copy(update={"kind": "review"})
+    assert review_only_executors(review, s) == set()

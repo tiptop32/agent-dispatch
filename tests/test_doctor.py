@@ -58,7 +58,14 @@ def _configure(
             command = codex_command
         else:
             command = str(FAKE)
-        lines.extend([f"  {name}:", f'    command: "{command}"'])
+        lines.append(f"  {name}:")
+        # codex и opencode ушли из дефолтного конфига: адаптер и модель задаются явно.
+        if name == "codex":
+            lines.append("    adapter: codex")
+        elif name == "opencode/kimi":
+            lines.append("    adapter: opencode")
+            lines.append("    model: x5/kimi")
+        lines.append(f'    command: "{command}"')
     (tmp_config_dir / "config.yaml").write_text(
         f"router:\n  backend: {backend}\n  claude_local:\n    command: {claude_command!r}\n"
         + "executors:\n"

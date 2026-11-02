@@ -32,6 +32,9 @@ def _settings(tmp_path: Path) -> Settings:
         "codex/sol": ExecutorSettings(adapter="codex", model="sol"),
         "opencode/a": ExecutorSettings(adapter="opencode", model="x5/a"),
         "opencode/b": ExecutorSettings(adapter="opencode", model="x5/b"),
+        "omp/a": ExecutorSettings(adapter="omp", model="agent-lb/a"),
+        "omp/b": ExecutorSettings(adapter="omp", model="agent-lb/b"),
+        "omp/x5": ExecutorSettings(adapter="omp", model="copilot-x5/c"),
     }
     return Settings(
         server=ServerSettings(data_dir=tmp_path),
@@ -108,6 +111,17 @@ async def test_opencode_limit_group_is_the_provider(tmp_path, git_repo):
     )
     await _run(dispatcher, git_repo, "opencode/a")
     assert set(availability.cooldowns()) == {"opencode/a", "opencode/b"}
+
+
+@pytest.mark.asyncio
+async def test_omp_limit_group_is_the_provider(tmp_path, git_repo):
+    # agent-lb один на все роли omp, copilot-x5 — отдельный аккаунт: его лимит
+    # не выносится вместе с балансером.
+    _, _, _, availability, dispatcher = await _make(
+        tmp_path, {"omp/a": _failed("omp/a", "insufficient_quota")}
+    )
+    await _run(dispatcher, git_repo, "omp/a")
+    assert set(availability.cooldowns()) == {"omp/a", "omp/b"}
 
 
 @pytest.mark.asyncio

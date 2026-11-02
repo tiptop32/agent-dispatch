@@ -9,7 +9,7 @@ from mcp.client._memory import InMemoryTransport
 from mcp.client.client import Client
 
 import agent_dispatch.models as model_types
-from agent_dispatch.config import ExecutorSettings, ServerSettings, Settings
+from agent_dispatch.config import ExecutorSettings, RoutingSettings, ServerSettings, Settings
 from agent_dispatch.mcp.client import DaemonUnavailable, DispatchClient
 from agent_dispatch.mcp.server import build_server
 from agent_dispatch.models import (
@@ -27,6 +27,7 @@ from agent_dispatch.serve_state import ServeState
 def settings(tmp_path):
     return Settings(
         server=ServerSettings(data_dir=tmp_path),
+        routing=RoutingSettings(fallback_executor="codex"),
         executors={"codex": ExecutorSettings(adapter="codex")},
     )
 
@@ -341,7 +342,7 @@ def _executor_row(name, adapter, *, cooldown=None, available=True, enabled=True,
 @pytest.mark.asyncio
 @respx.mock
 async def test_executors_tool_names_who_is_out_of_limits_and_review_only(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGENT_DISPATCH_SOURCE_AGENT", "codex")
+    monkeypatch.setenv("AGENT_DISPATCH_SOURCE_AGENT", "omp")
     weekly = {
         "kind": "quota",
         "until": "2026-10-03T00:01:00+00:00",
@@ -365,7 +366,7 @@ async def test_executors_tool_names_who_is_out_of_limits_and_review_only(tmp_pat
     )
     assert "weekly limit" in lines[1]
     assert lines[2] == "unavailable: opencode/kimi (not installed)"
-    assert lines[3] == "review only from codex (kind='review'): claude/opus, claude/haiku"
+    assert lines[3] == "review only from omp (kind='review'): claude/opus, claude/haiku"
     assert "codex/off" not in text
 
 

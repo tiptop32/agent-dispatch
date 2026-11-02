@@ -16,6 +16,7 @@ async def test_claude_local_ok():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
+            "routing": {"fallback_executor": "codex"},
             "router": {
                 "backend": "claude_local",
                 "claude_local": {"command": "tests/fakes/claude_router_ok.sh"},
@@ -32,6 +33,7 @@ async def test_claude_local_bad():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
+            "routing": {"fallback_executor": "codex"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_bad.sh"}},
             "executors": {"codex": {"adapter": "codex"}},
         }
@@ -48,6 +50,7 @@ async def test_claude_local_confidence_and_router():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
+            "routing": {"fallback_executor": "codex"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_ok.sh"}},
             "executors": {"codex": {"adapter": "codex"}},
         }
@@ -64,6 +67,7 @@ async def test_claude_local_unknown_executor():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
+            "routing": {"fallback_executor": "codex"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_ok.sh"}},
             "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
         }
@@ -80,6 +84,7 @@ async def test_claude_local_invalid_json():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
+            "routing": {"fallback_executor": "codex"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_bad.sh"}},
             "executors": {"codex": {"adapter": "codex"}},
         }
@@ -100,6 +105,7 @@ async def test_claude_local_env_keeps_home_and_removes_secret(tmp_path, monkeypa
     s = Settings.model_validate(
         {
             "server": {"data_dir": str(tmp_path / "data")},
+            "routing": {"fallback_executor": "codex"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_capture.sh"}},
             "executors": {"codex": {"adapter": "codex"}},
         }
@@ -122,6 +128,7 @@ async def test_claude_local_unwritable_log_dir_is_router_error(tmp_path):
         {
             "server": {"data_dir": str(blocker)},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_ok.sh"}},
+            "routing": {"fallback_executor": "codex"},
             "executors": {"codex": {"adapter": "codex"}},
         }
     )
@@ -137,6 +144,7 @@ async def test_claude_local_missing_command_is_router_error():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
+            "routing": {"fallback_executor": "codex"},
             "router": {"claude_local": {"command": "/nonexistent/claude"}},
             "executors": {"codex": {"adapter": "codex"}},
         }

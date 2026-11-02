@@ -35,5 +35,5 @@ executors:
     enabled: true
     description: Local test executor
 escalation:
-  local: [codex]
+  local: [claude]
 

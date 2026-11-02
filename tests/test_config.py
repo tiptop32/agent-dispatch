@@ -18,14 +18,18 @@ def test_defaults_without_user_files_are_working(tmp_config_dir: Path) -> None:
 
     assert settings.server.host == "127.0.0.1"
     assert settings.server.port == 7433
-    assert settings.routing.fallback_executor == "codex"
+    assert settings.routing.fallback_executor == "omp/sol"
     assert settings.routing.explore_share == 0.0
     assert settings.execution.idle_timeout_seconds == 900
+    # codex и opencode ушли из дефолтов; их адаптеры остались для старых строк БД.
     assert set(settings.enabled_executors()) == {
         "claude",
-        "codex",
-        "opencode/kimi",
+        "omp/sol",
+        "omp/terra",
+        "omp/luna",
+        "omp/x5-code-large",
     }
+    assert "codex" not in settings.executors and "opencode/kimi" not in settings.executors
 
 
 @pytest.mark.parametrize("value", [-0.01, 1.01])
@@ -97,10 +101,24 @@ def test_opencode_executor_requires_model(tmp_config_dir: Path) -> None:
         load_settings()
 
 
+def test_omp_executor_requires_model(tmp_config_dir: Path) -> None:
+    # omp строит вызов и группу лимита из `model`: без неё исполнитель не имеет смысла.
+    (tmp_config_dir / "config.yaml").write_text(
+        """executors:
+  omp/custom:
+    adapter: omp
+    description: Missing model
+"""
+    )
+
+    with pytest.raises(ConfigError, match=r"executors\.omp/custom\.model"):
+        load_settings()
+
+
 def test_escalation_executor_names_must_exist(tmp_config_dir: Path) -> None:
     copy_fixture(tmp_config_dir, "bad_escalation.yaml")
 
-    with pytest.raises(ConfigError, match=r"escalation\.codex"):
+    with pytest.raises(ConfigError, match=r"escalation\.omp/sol"):
         load_settings()
 
 
@@ -119,7 +137,30 @@ def test_command_defaults_to_adapter(tmp_config_dir: Path) -> None:
 def test_default_extra_args_come_from_packaged_config(tmp_config_dir: Path) -> None:
     settings = load_settings()
 
-    assert settings.executors["codex"].extra_args == ["--sandbox", "workspace-write"]
+    assert settings.executors["claude"].extra_args[0] == "--permission-mode"
+    assert settings.executors["omp/sol"].extra_args == []
+
+
+def test_omp_executors_come_from_packaged_config(tmp_config_dir: Path) -> None:
+    settings = load_settings()
+
+    sol = settings.executors["omp/sol"]
+    assert sol.adapter == "omp"
+    assert sol.tier == "balanced"
+    assert sol.limit_group == "agent-lb"
+    assert sol.limit_reset == "recheck"
+    assert settings.executors["omp/luna"].tier == "fast"
+
+    x5 = settings.executors["omp/x5-code-large"]
+    assert x5.corporate is True
+    assert x5.resolved_limit_group("omp/x5-code-large") == "omp:copilot-x5"
+    assert sol.resolved_limit_group("omp/sol") == "agent-lb"
+    assert settings.executors["omp/x5-small-coder"].enabled is False
+    assert settings.executors["omp/copilot-code-flash"].tier == "fast"
+    assert settings.executors["omp/copilot-code-flash-thinking"].tier == "balanced"
+    assert settings.routing.fallback_chain == ["omp/sol"]
+    assert settings.routing.review_only == {"omp": ["claude"]}
+    assert settings.escalation["omp/luna"] == ["omp/terra", "omp/sol", "claude"]
 
 
 def test_executors_merge_by_name(tmp_config_dir: Path) -> None:
@@ -340,6 +381,7 @@ def test_concurrency_limits_reject_zero_and_negatives(
     ("rule", "message"),
     [
         ({"codex": ["gpt"]}, r"unknown adapter 'gpt'"),
+        ({"omp": ["gpt"]}, r"unknown adapter 'gpt'"),
         ({"cursor": ["claude"]}, r"review_only\.cursor: unknown source agent"),
     ],
 )
@@ -352,8 +394,19 @@ def test_review_only_rule_is_validated(tmp_config_dir: Path, rule, message) -> N
 
 
 def test_user_config_can_switch_the_review_rule_off(tmp_config_dir: Path) -> None:
-    (tmp_config_dir / "config.yaml").write_text("routing:\n  review_only:\n    codex: []\n")
-    assert load_settings(tmp_config_dir).routing.review_only == {"codex": []}
+    (tmp_config_dir / "config.yaml").write_text("routing:\n  review_only:\n    omp: []\n")
+    assert load_settings(tmp_config_dir).routing.review_only == {"omp": []}
+
+
+def test_review_only_keeps_codex_as_a_source_for_old_tasks(tmp_config_dir: Path) -> None:
+    # Старые строки БД хранят source_agent codex: правило для него валидно,
+    # пока исторические задачи разбираются.
+    (tmp_config_dir / "config.yaml").write_text("routing:\n  review_only:\n    codex: [claude]\n")
+    # Дефолтное правило omp не пропадает: пользовательский ключ дополняет его.
+    assert load_settings(tmp_config_dir).routing.review_only == {
+        "omp": ["claude"],
+        "codex": ["claude"],
+    }
 
 
 @pytest.mark.parametrize(
@@ -363,6 +416,8 @@ def test_user_config_can_switch_the_review_rule_off(tmp_config_dir: Path) -> Non
         ("codex", "gpt-5.6-sol", None, "codex"),
         ("opencode", "copilot/x5-airun-code-large", None, "opencode:copilot"),
         ("opencode", "kimi", None, "opencode/kimi"),
+        ("omp", "agent-lb/gpt-6.1-sol", None, "omp:agent-lb"),
+        ("omp", "copilot-x5/x5-airun-code-large", None, "omp:copilot-x5"),
         ("codex", "sol", "codex-lb", "codex-lb"),
     ],
 )

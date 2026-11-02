@@ -187,7 +187,9 @@ async def test_omp_child_env_has_no_lb_key_and_no_settings_secrets(git_repo, tmp
 
 
 def test_omp_adapter_requires_model():
-    with pytest.raises(ValueError, match="omp executor requires model"):
+    # Проверка в конфиге срабатывает раньше: pydantic отвергает исполнителя omp
+    # без модели ещё на валидации.
+    with pytest.raises(ValueError, match="model is required for adapter omp"):
         OmpAdapter("omp", ExecutorSettings(adapter="omp", command="omp", model=None), data_dir=".")
 
 

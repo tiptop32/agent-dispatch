@@ -22,6 +22,7 @@ class SourceAgent(StrEnum):
     claude = "claude"
     codex = "codex"
     opencode = "opencode"
+    omp = "omp"
     cli = "cli"
     unknown = "unknown"
 

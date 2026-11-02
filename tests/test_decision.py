@@ -25,7 +25,10 @@ class Good:
 @pytest.mark.asyncio
 async def test_fallback_chain():
     s = Settings.model_validate(
-        {"executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}}}
+        {
+            "routing": {"fallback_executor": "codex"},
+            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+        }
     )
     d, events = await decide_with_fallback(
         DispatchRequest(task="x", cwd="."), {"claude": "c", "codex": "d"}, s, [Bad(), Good()]
@@ -49,7 +52,10 @@ class Counting:
 @pytest.mark.asyncio
 async def test_jev_ok_has_no_events():
     s = Settings.model_validate(
-        {"executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}}}
+        {
+            "routing": {"fallback_executor": "codex"},
+            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+        }
     )
     d, events = await decide_with_fallback(
         DispatchRequest(task="x", cwd="."), {"claude": "c", "codex": "d"}, s, [Counting("jev")]
@@ -188,7 +194,10 @@ async def test_capped_decision_notes_describe_the_new_choice_not_the_old_one():
 @pytest.mark.asyncio
 async def test_jev_error_then_claude_and_event():
     s = Settings.model_validate(
-        {"executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}}}
+        {
+            "routing": {"fallback_executor": "codex"},
+            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+        }
     )
     good = Counting("claude_local")
     d, events = await decide_with_fallback(
@@ -203,7 +212,10 @@ async def test_jev_error_then_claude_and_event():
 @pytest.mark.asyncio
 async def test_both_errors_fallback_confidence_zero():
     s = Settings.model_validate(
-        {"executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}}}
+        {
+            "routing": {"fallback_executor": "codex"},
+            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+        }
     )
     d, events = await decide_with_fallback(
         DispatchRequest(task="x", cwd="."),
@@ -239,7 +251,10 @@ async def test_fallback_unavailable_uses_first_candidate_and_event():
 @pytest.mark.asyncio
 async def test_single_candidate_skips_routers():
     s = Settings.model_validate(
-        {"executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}}}
+        {
+            "routing": {"fallback_executor": "codex"},
+            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+        }
     )
     router = Counting("jev")
     d, events = await decide_with_fallback(
@@ -290,11 +305,19 @@ def test_build_routers_by_backend():
     import httpx
 
     s = Settings.model_validate(
-        {"router": {"backend": "jev"}, "executors": {"codex": {"adapter": "codex"}}}
+        {
+            "router": {"backend": "jev"},
+            "routing": {"fallback_executor": "codex"},
+            "executors": {"codex": {"adapter": "codex"}},
+        }
     )
     assert [r.name for r in build_routers(s, httpx.AsyncClient())] == ["jev", "claude_local"]
     s = Settings.model_validate(
-        {"router": {"backend": "claude_local"}, "executors": {"codex": {"adapter": "codex"}}}
+        {
+            "router": {"backend": "claude_local"},
+            "routing": {"fallback_executor": "codex"},
+            "executors": {"codex": {"adapter": "codex"}},
+        }
     )
     assert [r.name for r in build_routers(s, httpx.AsyncClient())] == ["claude_local"]
 

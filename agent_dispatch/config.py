@@ -76,7 +76,7 @@ class RoutingSettings(_ConfigModel):
     preferred_executor_max_wait_seconds: float = Field(60.0, ge=0, allow_inf_nan=False, strict=True)
     #: Куда уходит задача без уверенного решения роутера. Строка или упорядоченный
     #: список: берётся первый доступный кандидат, остальные идут резервом.
-    fallback_executor: str | list[str] = "codex"
+    fallback_executor: str | list[str] = "omp/sol"
     max_hops: int = Field(2, ge=0)
     max_children: int = Field(2, ge=0)
     #: Порог уверенности ответа Jev о корпоративных данных. Ответ ниже порога не
@@ -103,9 +103,11 @@ class RoutingSettings(_ConfigModel):
     #: выключает и это.
     quota_cooldown_seconds: int = Field(3600, ge=1)
     #: Источник -> адаптеры, которым он вправе отдать только ревью (`kind: review`),
-    #: но не задачу на правку. По умолчанию Codex не тратит токены Claude на
-    #: работу, которую делает сам, а просит у него только ревью.
-    review_only: dict[str, list[str]] = Field(default_factory=lambda: {"codex": ["claude"]})
+    #: но не задачу на правку. По умолчанию omp не тратит токены Claude на
+    #: работу, которую делает сам, а просит у него только ревью. codex остаётся
+    #: валидным источником: старые строки БД и follow-up по старым задачам
+    #: продолжают разбираться.
+    review_only: dict[str, list[str]] = Field(default_factory=lambda: {"omp": ["claude"]})
     #: Потолок расходов цепочки эскалации вместе с подзадачами её звеньев, в
     #: долларах. Дошла до него — следующее звено не запускается. Считаются только
     #: расходы, о которых сообщил CLI (claude, opencode; codex цену не сообщает).
@@ -124,8 +126,10 @@ class RoutingSettings(_ConfigModel):
 
     @model_validator(mode="after")
     def validate_review_only(self) -> RoutingSettings:
-        sources = {"claude", "codex", "opencode", "cli", "unknown"}
-        adapters = {"claude", "codex", "opencode"}
+        # codex и opencode остаются валидными источниками: старые строки БД,
+        # follow-up и replay по историческим задачам их читают.
+        sources = {"claude", "codex", "opencode", "omp", "cli", "unknown"}
+        adapters = {"claude", "codex", "opencode", "omp"}
         for source, targets in self.review_only.items():
             if source not in sources:
                 raise ValueError(f"review_only.{source}: unknown source agent")
@@ -190,8 +194,9 @@ class ExecutorSettings(_ConfigModel):
 
     @model_validator(mode="after")
     def validate_adapter(self) -> ExecutorSettings:
-        if self.adapter == "opencode" and not self.model:
-            raise ValueError("model is required for adapter opencode")
+        # omp строит группу лимита и вызов из `model`, как opencode из провайдера.
+        if self.adapter in {"opencode", "omp"} and not self.model:
+            raise ValueError(f"model is required for adapter {self.adapter}")
         return self
 
     @property
@@ -201,9 +206,11 @@ class ExecutorSettings(_ConfigModel):
     def resolved_limit_group(self, name: str) -> str:
         if self.limit_group:
             return self.limit_group
-        if self.adapter == "opencode":
+        # У opencode и omp один аккаунт на провайдера из `model`
+        # (agent-lb, copilot-x5), а не на все модели адаптера.
+        if self.adapter in {"opencode", "omp"}:
             provider = (self.model or "").split("/", 1)
-            return f"opencode:{provider[0]}" if len(provider) == 2 else name
+            return f"{self.adapter}:{provider[0]}" if len(provider) == 2 else name
         return self.adapter
 
 
@@ -349,7 +356,7 @@ def load_settings(config_dir: Path | None = None) -> Settings:
     except ValidationError as error:
         first = error.errors()[0]
         path = _error_path(first)
-        if "model is required for adapter opencode" in first["msg"]:
+        if "model is required for adapter" in first["msg"]:
             path = f"{path}.model"
         raise ConfigError(f"{path}: {first['msg']}") from error
     except ValueError as error:

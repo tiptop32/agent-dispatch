@@ -210,14 +210,14 @@ def test_verify_rename_requires_updated_tests_and_correct_result(tmp_path):
     assert verdict.ok, verdict.reasons
 
 
-def test_select_routers_returns_requested_in_process_router(monkeypatch):
+def test_select_routers_returns_requested_in_process_router(tmp_config_dir, monkeypatch):
     from agent_dispatch.config import load_settings
 
     selected = select_routers(load_settings(), "claude_local")
     assert [router.name for router in selected] == ["claude_local"]
 
 
-def test_routing_daemon_uses_client(tmp_path, monkeypatch):
+def test_routing_daemon_uses_client(tmp_path, tmp_config_dir, monkeypatch):
     import asyncio
 
     import evals.routing.__main__ as routing_main

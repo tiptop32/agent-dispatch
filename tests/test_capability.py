@@ -9,7 +9,7 @@ from agent_dispatch.routing.questions import noul_certainty, noul_yes
 def ex(adapter="codex", tier="balanced", corporate=False):
     return ExecutorSettings(
         adapter=adapter,
-        model="m" if adapter == "opencode" else None,
+        model="m" if adapter in {"opencode", "omp"} else None,
         tier=tier,
         corporate=corporate,
     )
@@ -101,6 +101,15 @@ def test_corporate_data_restricts_the_pool():
     assert any("corporate" in note for note in selection.notes)
 
 
+def test_corporate_data_selects_only_omp_x5():
+    pool = {
+        "omp/sol": ex("omp", "balanced"),
+        "omp/x5-code-large": ex("omp", "balanced", corporate=True),
+    }
+    selection = select("balanced", pool, corporate=True)
+    assert selection.executor == "omp/x5-code-large"
+
+
 def test_corporate_data_without_an_internal_executor_is_reported_not_silently_ignored():
     external_only = {"codex": ex(), "opus": ex("claude", "strong")}
     selection = select("balanced", external_only, corporate=True)
@@ -139,6 +148,7 @@ def test_select_without_candidates_is_an_error_not_a_silent_default():
 
 
 def settings(**routing):
+    routing.setdefault("fallback_executor", "codex")
     return Settings.model_validate(
         {"executors": {"codex": {"adapter": "codex"}}, "routing": routing}
     )

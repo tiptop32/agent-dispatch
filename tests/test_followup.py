@@ -621,14 +621,14 @@ async def test_followup_is_judged_by_the_current_caller(tmp_path, git_repo):
         dispatcher, (await dispatcher.submit(_req(git_repo, executor="claude"))).task_id
     )
 
-    # Codex вправе отдать Claude только ревью: follow-up от codex на правку
+    # omp вправе отдать Claude только ревью: follow-up от omp на правку
     # должен получить тот же отказ, что и прямой dispatch.
     record = await dispatcher.followup(
-        first.task_id, FollowupRequest(message="more", source_agent=SourceAgent.codex)
+        first.task_id, FollowupRequest(message="more", source_agent=SourceAgent.omp)
     )
     done = await _done(dispatcher, record.task_id)
 
-    assert done.request.source_agent == SourceAgent.codex
+    assert done.request.source_agent == SourceAgent.omp
     assert done.status == TaskStatus.failed
     assert done.result.meta["guard"] == "review_only"
     assert len(adapters["claude"].calls) == 1

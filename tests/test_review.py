@@ -116,23 +116,32 @@ async def _run(dispatcher: Dispatcher, req: DispatchRequest):
     return await dispatcher.wait((await dispatcher.submit(req)).task_id, WAIT)
 
 
-def test_default_config_keeps_codex_work_away_from_claude():
-    assert RoutingSettings().review_only == {"codex": ["claude"]}
+def test_default_config_keeps_omp_work_away_from_claude():
+    # Источник codex остаётся валидным для старых строк БД, но дефолтное
+    # правило теперь про omp.
+    assert RoutingSettings().review_only == {"omp": ["claude"]}
+
+
+def test_review_only_still_accepts_codex_as_a_source():
+    assert (
+        "codex"
+        in RoutingSettings.model_validate({"review_only": {"codex": ["claude"]}}).review_only
+    )
 
 
 @pytest.mark.asyncio
-async def test_router_never_offers_claude_for_codex_work(tmp_path, git_repo):
+async def test_router_never_offers_claude_for_omp_work(tmp_path, git_repo):
     _, adapters, router, dispatcher = await _make(tmp_path)
-    done = await _run(dispatcher, _req(git_repo))
-    # codex/sol вне выбора по exclude_source_agent, claude/opus по review_only.
-    assert router.candidates == [["opencode/a", "opencode/b"]]
+    done = await _run(dispatcher, _req(git_repo, source="omp"))
+    # claude/opus вне выбора по review_only, остальные доступны.
+    assert router.candidates == [["codex/sol", "opencode/a", "opencode/b"]]
     assert done.status == "completed" and adapters["claude/opus"].calls == []
 
 
 @pytest.mark.asyncio
-async def test_explicit_claude_for_codex_work_is_refused_without_a_run(tmp_path, git_repo):
+async def test_explicit_claude_for_omp_work_is_refused_without_a_run(tmp_path, git_repo):
     _, adapters, _, dispatcher = await _make(tmp_path)
-    done = await _run(dispatcher, _req(git_repo, executor="claude/opus"))
+    done = await _run(dispatcher, _req(git_repo, source="omp", executor="claude/opus"))
     assert done.status == "failed" and done.result.meta["guard"] == "review_only"
     assert "kind='review'" in done.result.error
     assert adapters["claude/opus"].calls == []
@@ -161,10 +170,10 @@ async def test_review_through_the_router_may_pick_claude(tmp_path, git_repo):
 
 
 @pytest.mark.asyncio
-async def test_escalation_of_codex_work_skips_claude(tmp_path, git_repo):
+async def test_escalation_of_omp_work_skips_claude(tmp_path, git_repo):
     failed = ExecutionResult(status="failed", executor="opencode/a", model=None, summary="")
     storage, adapters, _, dispatcher = await _make(tmp_path, {"opencode/a": failed})
-    first = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
+    first = await dispatcher.submit(_req(git_repo, source="omp", executor="opencode/a"))
     await dispatcher.wait(first.task_id, WAIT)
     events = await storage.list_events(first.task_id)
     escalate = next(event["payload"] for event in events if event["kind"] == "escalate")

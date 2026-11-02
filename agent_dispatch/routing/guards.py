@@ -99,7 +99,8 @@ def candidates(
         if (
             settings.routing.exclude_source_agent
             and hop == 0
-            and source_agent in {SourceAgent.claude, SourceAgent.codex, SourceAgent.opencode}
+            and source_agent
+            in {SourceAgent.claude, SourceAgent.codex, SourceAgent.opencode, SourceAgent.omp}
             and executor.adapter == source_agent.value
         ):
             continue

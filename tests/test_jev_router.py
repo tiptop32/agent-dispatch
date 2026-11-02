@@ -29,7 +29,11 @@ CANDIDATES = {"codex": ExecutorSettings(adapter="codex", tier="balanced")}
 
 def settings():
     return Settings.model_validate(
-        {"secrets": {"OPENROUTER_API_KEY": "k"}, "executors": {"codex": {"adapter": "codex"}}}
+        {
+            "secrets": {"OPENROUTER_API_KEY": "k"},
+            "routing": {"fallback_executor": "codex"},
+            "executors": {"codex": {"adapter": "codex"}},
+        }
     )
 
 
@@ -201,7 +205,7 @@ async def test_unsure_corporate_answer_below_the_threshold_does_not_narrow_the_p
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
             "executors": {"codex": {"adapter": "codex"}},
-            "routing": {"corporate_min_confidence": 0.5},
+            "routing": {"fallback_executor": "codex", "corporate_min_confidence": 0.5},
         }
     )
     candidates = {
@@ -234,7 +238,7 @@ async def test_confident_corporate_answer_still_narrows_the_perimeter_at_the_sam
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
             "executors": {"codex": {"adapter": "codex"}},
-            "routing": {"corporate_min_confidence": 0.5},
+            "routing": {"fallback_executor": "codex", "corporate_min_confidence": 0.5},
         }
     )
     candidates = {
@@ -267,7 +271,7 @@ async def test_corporate_perimeter_off_does_not_ask_the_question():
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
             "executors": {"codex": {"adapter": "codex"}},
-            "routing": {"corporate_perimeter": False},
+            "routing": {"fallback_executor": "codex", "corporate_perimeter": False},
         }
     )
     candidates = {
@@ -304,7 +308,7 @@ async def test_corporate_perimeter_off_ignores_the_answer():
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
             "executors": {"codex": {"adapter": "codex"}},
-            "routing": {"corporate_perimeter": False},
+            "routing": {"fallback_executor": "codex", "corporate_perimeter": False},
         }
     )
     candidates = {
@@ -504,7 +508,9 @@ async def test_unknown_choice_sum_and_missing_key_errors():
 @pytest.mark.asyncio
 @respx.mock
 async def test_missing_api_key_does_not_call_network():
-    s = Settings.model_validate({"executors": {"codex": {"adapter": "codex"}}})
+    s = Settings.model_validate(
+        {"routing": {"fallback_executor": "codex"}, "executors": {"codex": {"adapter": "codex"}}}
+    )
     route = respx.post(s.router.jev.base_url).mock(
         return_value=httpx.Response(200, json=RESPONSE_OK)
     )

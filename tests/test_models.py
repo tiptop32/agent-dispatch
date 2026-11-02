@@ -179,3 +179,11 @@ def test_strict_schema_accepts_live_codex_last_message() -> None:
         (Path(__file__).parent / "fixtures/agent_output/codex_last_message.json").read_text()
     )
     assert validate_agent_result(raw) == []
+
+
+def test_source_agent_keeps_legacy_values_and_omp():
+    # omp добавлен как источник; codex и opencode остаются для старых строк БД,
+    # follow-up по старым задачам и replay.
+    assert SourceAgent.omp.value == "omp"
+    assert SourceAgent.codex.value == "codex"
+    assert SourceAgent.opencode.value == "opencode"

@@ -238,8 +238,15 @@ def load_decisions(db_path: Path) -> list[Decision]:
 
 
 def default_limit_group(executor: str) -> str:
-    """Группа лимита без конфига: у claude/* и codex/* один аккаунт на все модели."""
-    adapter = executor.split("/", 1)[0]
+    """Группа лимита без конфига: у claude/* и codex/* один аккаунт на все модели.
+
+    У omp группа — провайдер, а не адаптер: исполнители x5 ходят в copilot-x5,
+    остальные в agent-lb, и 429 балансера не должен «остужать» корпоративных.
+    Без конфига провайдер виден только по имени исполнителя (`omp/x5-*`, `omp/copilot-*`).
+    """
+    adapter, _, rest = executor.partition("/")
+    if adapter == "omp":
+        return "omp:copilot-x5" if rest.startswith(("x5-", "copilot-")) else "omp:agent-lb"
     return adapter if adapter in {"claude", "codex"} else executor
 
 
@@ -308,7 +315,9 @@ def replay(
     if since is not None:
         tasks = [task for task in tasks if task.created_at >= since]
     by_id = {task.task_id: task for task in tasks}
-    review_only = {"codex": ["claude"]} if review_only is None else review_only
+    # omp добавлен к codex: оба правила действуют сейчас. codex остаётся для
+    # исторических задач, source_agent которых ещё не переведён на omp.
+    review_only = {"omp": ["claude"], "codex": ["claude"]} if review_only is None else review_only
     failures: list[dict] = []
     failure_times: list[datetime] = []
     # Остывания сбоев: (ключ, когда сбой кончился, до какого момента остывание).

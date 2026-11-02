@@ -315,6 +315,7 @@ def test_commit_without_work_still_returns_none(tmp_path, git_repo):
 def test_prompt_lists_verification_commands(tmp_path, git_repo):
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path),
+        routing=RoutingSettings(fallback_executor="codex"),
         executors={"codex": ExecutorSettings(adapter="codex")},
     )
     req = _req(git_repo, [f"uv run pytest {git_repo}/tests -q"])

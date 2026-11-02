@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_dispatch.config import ExecutorSettings, ServerSettings, Settings
+from agent_dispatch.config import ExecutorSettings, RoutingSettings, ServerSettings, Settings
 from agent_dispatch.mcp.autostart import ensure_daemon
 from agent_dispatch.mcp.client import DaemonUnavailable
 from agent_dispatch.serve_state import ServeState, write_state
@@ -14,6 +14,7 @@ from agent_dispatch.serve_state import ServeState, write_state
 def make_settings(tmp_path):
     return Settings(
         server=ServerSettings(data_dir=tmp_path),
+        routing=RoutingSettings(fallback_executor="codex"),
         executors={"codex": ExecutorSettings(adapter="codex")},
     )
 

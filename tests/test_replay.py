@@ -1272,3 +1272,44 @@ def test_queue_policy_metrics_exclude_legacy_and_handle_small_samples(tmp_path, 
     text = render(report)
     assert ("no policy slot events yet" in text) == (count == 0)
     assert ("unmeasured (requires 2 samples)" in text) == (count == 1)
+
+
+def test_replay_parses_historical_codex_and_opencode_tasks(tmp_path):
+    # Исполнители codex/* и opencode/* ушли из дефолтного конфига, но телеметрия
+    # с ними разбирается как раньше: группы лимита и review_only считаются по
+    # адаптеру без конфига.
+    db = _db(
+        tmp_path,
+        [
+            ("a" * 32, "codex/sol", "10:00", "10:01", 1, None, _result("failed", error=WEEKLY)),
+            ("b" * 32, "opencode/x5-code-large", "11:00", "11:02", 2, None, _result("completed")),
+        ],
+    )
+    report = replay(load(db))
+    assert report["tasks"] == 2
+    assert report["executor_failures"][0]["executor"] == "codex/sol"
+    assert report["executor_failures"][0]["hours"] == 14.0
+    assert report["avoidable_runs"] == []
+
+
+def test_replay_counts_review_only_work_for_the_omp_source(tmp_path):
+    db = _db(
+        tmp_path,
+        [
+            ("a" * 32, "claude/opus", "10:00", "10:10", 10, None, _result("completed"), "omp"),
+            ("b" * 32, "claude/opus", "11:00", "11:05", 5, None, _result("failed"), "omp"),
+        ],
+    )
+    report = replay(load(db))
+    assert (report["review_only_runs"], report["review_only_failed"]) == (2, 1)
+    assert report["review_only_minutes"] == 15.0
+
+
+def test_default_limit_group_splits_omp_by_provider():
+    from evals.replay.harness import default_limit_group
+
+    assert default_limit_group("omp/sol") == default_limit_group("omp/luna") == "omp:agent-lb"
+    assert default_limit_group("omp/x5-code-large") == "omp:copilot-x5"
+    assert default_limit_group("omp/copilot-code-flash") == "omp:copilot-x5"
+    assert default_limit_group("codex/sol") == "codex"
+    assert default_limit_group("opencode/x5-code-large") == "opencode/x5-code-large"
