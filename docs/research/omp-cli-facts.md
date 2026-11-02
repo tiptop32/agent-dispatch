@@ -99,8 +99,17 @@
   Значение `env` вида `"AGENT_DISPATCH_HOP": "AGENT_DISPATCH_HOP"` копируется из окружения omp,
   `"!команда"` выполняется. Сабагенты наследуют MCP родителя (по документации, не проверено).
 
-## Откат переключения (заполняется в Task 12)
+## Откат переключения (Task 12)
 
-- бэкап пользовательского конфига диспетчера: —
-- прежняя версия uv tool: коммит до Task 10 —
-- команды рестарта демона: —
+- Бэкап пользовательского конфига диспетчера: `~/.config/agent-dispatch/config.yaml.bak-20261102-pre-omp`.
+- Прежний код: ветка `main` (до переключения там нет адаптера omp); последний коммит ветки
+  `omp-migration`, где адаптеры codex и opencode ещё в коде: `d477bdf`.
+- Откат:
+  ```sh
+  cp ~/.config/agent-dispatch/config.yaml.bak-20261102-pre-omp ~/.config/agent-dispatch/config.yaml
+  git -C ~/my_git_reps/agent-dispatch worktree add /tmp/agent-dispatch-main main
+  uv tool install --force --reinstall /tmp/agent-dispatch-main
+  kill "$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.local/share/agent-dispatch/serve.json")))["pid"])')"
+  # следующий вызов dispatch/route поднимет демон заново
+  ```
+- omp-конфиг: `install.sh` omp-setup переносит чужие файлы в `*.bak-<дата>` рядом в `~/.omp/agent`.
