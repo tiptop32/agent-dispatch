@@ -317,11 +317,11 @@
 
 ### Task 14: [Final] Документация
 **Depends on:** Task 13
-- [ ] README и `docs/architecture.md` agent-dispatch: omp вместо codex и opencode
-- [ ] `CLAUDE.md` agent-dispatch: переписать codex-правила (`codex-agent-lb`, `codex-env-vars`, флаги до `resume`, `thread_id`, события переподключения, дефолт `review_only`, `opencode: no model response`) на omp
-- [ ] `agent_dispatch/executors/CLAUDE.md` и `tests/CLAUDE.md`
-- [ ] README omp-setup и gpt-review
-- [ ] перенести план в `docs/plans/completed/`
+- [x] README и `docs/architecture.md` agent-dispatch: omp вместо codex и opencode
+- [x] `CLAUDE.md` agent-dispatch: переписать codex-правила (`codex-agent-lb`, `codex-env-vars`, флаги до `resume`, `thread_id`, события переподключения, дефолт `review_only`, `opencode: no model response`) на omp
+- [x] `agent_dispatch/executors/CLAUDE.md` и `tests/CLAUDE.md`
+- [x] README omp-setup и gpt-review
+- [x] перенести план в `docs/plans/completed/`
 
 ## Post-Completion
 - через неделю после переключения: `uv run python -m evals.replay --json`, сравнить долю `completed` у `omp/*`
