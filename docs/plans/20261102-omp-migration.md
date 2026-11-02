@@ -147,14 +147,15 @@
 - Create: `tests/fixtures/omp/`
 - Create: `docs/research/omp-cli-facts.md`
 
-- [ ] `bun install -g @oh-my-pi/pi-coding-agent`, записать версию
-- [ ] снять `omp -p --mode json` на тестовом репо: заголовок сессии, `message_end`, `usage`, стоимость, коды выхода
-- [ ] фикстуры: успех, сбой хода, 429 балансера, неверный ключ, недоступный copilot-x5, ход без ответа, `--max-cost`, ревью только на чтение, resume
-- [ ] снять ошибки: неверный ключ балансера, 429 или лимит аккаунта, недоступный copilot-x5, ход без ответа модели (какой код выхода), `--max-cost`
-- [ ] проверить `apiKey: "!команда"` и что `env | grep AGENT_LB` из bash агента пуст
-- [ ] выяснить: как выбирается профиль (флаг или `PI_CONFIG_DIR`), имена инструментов только на чтение, `--resume` в `-p`, API хуков (начало и конец хода, PreToolUse), проброс env в MCP
-- [ ] проверить, что в профиле только с copilot-x5 сабагент `task` и prewalk не уходят к другим провайдерам
-- [ ] разложить фикстуры без секретов (`detect-secrets`), записать факты в `docs/research/omp-cli-facts.md`
+- [x] `bun install -g @oh-my-pi/pi-coding-agent`, записать версию
+- [x] снять `omp -p --mode json` на тестовом репо: заголовок сессии, `message_end`, `usage`, стоимость, коды выхода
+- [x] фикстуры: успех, сбой хода, 429 балансера, неверный ключ, недоступный copilot-x5, ход без ответа, `--max-cost`, ревью только на чтение, resume
+- [x] снять ошибки: неверный ключ балансера, 429 или лимит аккаунта, недоступный copilot-x5, ход без ответа модели (какой код выхода), `--max-cost`
+- [x] проверить `apiKey: "!команда"` и что `env | grep AGENT_LB` из bash агента пуст
+- [x] выяснить: как выбирается профиль (флаг или `PI_CONFIG_DIR`), имена инструментов только на чтение, `--resume` в `-p`, API хуков (начало и конец хода, PreToolUse), проброс env в MCP
+- [x] проверить, что в профиле только с copilot-x5 сабагент `task` и prewalk не уходят к другим провайдерам
+- [x] разложить фикстуры без секретов (`detect-secrets`), записать факты в `docs/research/omp-cli-facts.md`
+- ⚠️ не снято: 429 и исчерпанный лимит балансера, ход без ответа модели у x5 (фикстур нет, см. `docs/research/omp-cli-facts.md`)
 
 ### Task 2: Репозиторий omp-setup с конфигом и профилем x5
 **Depends on:** Task 1
@@ -165,6 +166,10 @@
 - [ ] `models.yml`: провайдеры `agent-lb` и `copilot-x5`, модели и лимиты из opencode, `apiKey: "!…"` без значений в файле
 - [ ] `config.yml`: роли, `retry.fallbackChains` sol→terra, `approvalMode: yolo`, `enabledProviders` без Claude и Codex
 - [ ] профиль x5: только `copilot-x5`, все роли на x5-моделях
+- ➕ профиль x5: `enabledModels: [copilot-x5/*]`, `retry.maxRetries: 1` не нужен интерактиву, только оверлею диспетчера
+- ➕ `bin/x5-key` и `bin/lb-key`: команды для `apiKey: "!…"` (ключ x5 из Keychain `copilot-x5`, ключ балансера из `~/.config/agent-lb/env`); перенос ключа x5 в Keychain делает координатор в Task 12
+- ➕ выгрузка корпоративного `CN=RootCA` (System.keychain, SHA-1 F75DAB43…) в `~/.omp/agent/x5-root.pem` в `install.sh`; `NODE_EXTRA_CA_CERTS` для интерактивного запуска
+- ➕ `dispatch-overlay.yml` для `--config`: `retry: {maxRetries: 1}`
 - [ ] MCP: mcphub, agent-dispatch (`AGENT_DISPATCH_SOURCE_AGENT=omp`, проброс `AGENT_DISPATCH_*`), context7
 - [ ] `AGENTS.md` из `~/.codex/AGENTS.md` и `~/.config/opencode/AGENTS.md`; `salt-qa-agent-kit/AGENTS.md` только для `~/x5`
 - [ ] `install.sh`: симлинки в `~/.omp/agent` с бэкапом существующих файлов, идемпотентно
@@ -180,6 +185,9 @@
 - Create: `tests/test_adapter_omp.py`, `tests/fakes/omp_ok.sh`, `tests/fakes/omp_env_capture.sh`
 
 - [ ] сборка команды: модель, thinking, `--max-time`, `--session-dir`, `--cwd`, профиль x5 для `corporate: true`
+- ➕ запуск с `stdin=DEVNULL` (без этого omp ждёт EOF на stdin), `--config <dispatch-overlay.yml>`, `NODE_EXTRA_CA_CERTS` для x5
+- ➕ из env omp вырезать `AGENT_LB_API_KEY` (его экспортирует shell пользователя, и он доходит до bash агента)
+- ➕ режим ревью: `--tools read,grep,glob` (инструмента `find` нет, код 2)
 - [ ] `streams_output = True`, разбор NDJSON: `session_id`, итог из последнего `message_end`, `usage` и стоимость
 - [ ] режим ревью с инструментами только на чтение; follow-up через `--resume` в том же профиле
 - [ ] `last_output_age_s` на жёстком таймауте
@@ -193,6 +201,8 @@
 - Modify: `agent_dispatch/executors/health.py`, `tests/test_health.py`
 
 - [ ] лимит и 429 → остывание с `parse_reset`; auth и сбой команды `apiKey` → отказ авторизации; сеть → обычный сбой
+- ➕ в `-p --mode json` нет `httpStatus`: классификация по `errorMessage` ассистентского `message_end` со `stopReason: error` и по stderr (`No API key found for <provider>.` = auth, `Invalid API key` = auth, `Couldn't connect` = сеть, TLS = сеть)
+- ➕ незнакомый `errorMessage` не роняет классификатор (обычный сбой без остывания)
 - [ ] ход без ответа модели → остывание (аналог `opencode: no model response`), по фактам Task 1
 - [ ] текст агента и ошибки MCP не вызывают остывания
 - [ ] тесты на фикстурах Task 1, включая ложные срабатывания (слова rate limit в выводе агента)

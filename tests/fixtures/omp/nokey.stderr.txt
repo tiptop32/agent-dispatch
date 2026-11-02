@@ -1,0 +1,15 @@
+29509 | `);await this.sendCustomMessage({customType:"todo-error-reminder",content:b,display:!1,details:{toolName:a,errorText:y,attemptedArgs:h,attemptedOp:(u&&id(u,"op"))??(h&&id(h,"op"))}},{deliverAs:"nextTurn"})}if(p?.toolName==="checkpoint"&&!c){let m=this.sessionManager.getEntries(),h=null;for(let g=m.length-1;g>=0;g--){let y=m[g];if(y.type==="message"&&y.message===e.message){h=y.id;break}}if(this.#Qt)this.#Qt.checkpointEntryId=h}if(p?.toolName==="rewind"&&!c&&this.#Qt){let m=f?id(f,"report")?.trim()??"":"",h=d?.find((y)=>y.type==="text")?.text?.trim()??"",g=m||h;if(g.length>0)this.#Kt=g}}}if(e.type==="agent_end"){let a=e.messages,l=this.agent.state.messages,c=this.#xt.abortPending,d=(C)=>this.#di(e,l,C);await this.#W.onAgentEnd({currentUsage:()=>this.#Co()});let u=a.findLast((C)=>C.role==="assistant"),p=this.#Or??u;if(this.#Or=void 0,!p){this.#vt=void 0,ie("agent_end maintenance routing",{reason:"no-assistant-message",goalModeEnabled:this.#V?.enabled===!0,goalStatus:this.#V?.goal.status}),await d();return}if(!fT
+29510 | 
+29511 | `),l=s.length>0?s:void 0;if(n==="followUp"&&r.some((c)=>this.#ns(c)))return this.#Qs(i,a,l,t);return this.#yo(i,a,l,this.#Ve,t,"queued")};async#Qs(e,t,n,r){let i=this.#Ve;await this.#d.beginAutoTask();let o=this.#d.classifyAuto(t,r),s=await this.#yo(e,t,n,i,r,"queued"),a=await o;return{commit:()=>{let l=s.commit();if(l===void 0)return;let c=this.#d.applyAuto(a);return c?[...l,c]:l}}}#ns(e){if(this.#He!=="main")return!1;if(e.role==="user")return!e.synthetic&&e.attribution!=="agent";return e.role==="custom"&&iA(e)}async#yo(e,t,n,r,i,o){let s=this.#Nt,a=this.#Ae&&o==="direct",l=()=>this.#Ve===r&&this.#Nt===s&&(!this.#Ae||a)&&!i?.aborted,c={baseXdevCatalogDelivered:!1,commit:()=>{return}};if(this.hasPendingDeferredExtensions)await this.loadDeferredExtensions();let d=this.#an;if(d){let u=Error("MCP discovery still pending");await jo(d,NGe,u,i).catch((p)=>{if(p===u&&this.#an===d)this.#an=void 0;ie("Turn started before MCP discovery finished",{error:String(p)})})}for(let u=0;u<_Uc;u++){if(await this.#yt.transition,!
+29512 | 
+29513 | Use /login, set an API key environment variable, or create ${xo()}
+29514 | Then use /model to select a model.`);if(!await nn("prompt:apiKey",()=>this.#Pe.getApiKey(l,this.sessionId))&&!await this.#X.applyMissingCredentialFallback(o.signal)){if(o.signal.aborted)return!1;throw Error(`No API key found for ${l.provider}.
+                                                                                                                                                                                                                      ^
+error: No API key found for lb-nokey.
+
+Use /login, set an API key environment variable, or create /tmp/claude/omp-agent/agent.db
+      at #$i (/Users/tiptop32/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js:29514:207)
+      at async #Qo (/Users/tiptop32/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js:29508:44354)
+      at async #Js (/Users/tiptop32/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js:29508:41870)
+      at async #Xr (/Users/tiptop32/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js:29501:46918)
+
