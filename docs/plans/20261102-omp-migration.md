@@ -200,13 +200,13 @@
 **Files:**
 - Modify: `agent_dispatch/executors/health.py`, `tests/test_health.py`
 
-- [ ] лимит и 429 → остывание с `parse_reset`; auth и сбой команды `apiKey` → отказ авторизации; сеть → обычный сбой
+- [x] лимит и 429 → остывание с `parse_reset`; auth и сбой команды `apiKey` → отказ авторизации; сеть → обычный сбой
 - ➕ в `-p --mode json` нет `httpStatus`: классификация по `errorMessage` ассистентского `message_end` со `stopReason: error` и по stderr (`No API key found for <provider>.` = auth, `Invalid API key` = auth, `Couldn't connect` = сеть, TLS = сеть)
 - ➕ незнакомый `errorMessage` не роняет классификатор (обычный сбой без остывания)
-- [ ] ход без ответа модели → остывание (аналог `opencode: no model response`), по фактам Task 1
-- [ ] текст агента и ошибки MCP не вызывают остывания
-- [ ] тесты на фикстурах Task 1, включая ложные срабатывания (слова rate limit в выводе агента)
-- [ ] гейт зелёный
+- [x] ход без ответа модели → остывание (аналог `opencode: no model response`), по фактам Task 1
+- [x] текст агента и ошибки MCP не вызывают остывания
+- [x] тесты на фикстурах Task 1, включая ложные срабатывания (слова rate limit в выводе агента)
+- [x] гейт зелёный
 
 ### Task 5: Конфиг, guards и источники
 **Depends on:** Task 3

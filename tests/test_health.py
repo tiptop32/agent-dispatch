@@ -362,3 +362,119 @@ def test_dated_reset_in_the_repeated_hour_picks_the_future_instant():
     assert parse_reset("resets Nov 1 at 1:30am (America/New_York)", now) == datetime(
         2026, 11, 1, 6, 30, tzinfo=UTC
     )
+
+
+# --- omp: классификация по фикстурам живых прогонов (факты Task 1) ------------
+
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from agent_dispatch.executors.health import omp_error  # noqa: E402
+
+OMP_FIXTURES = Path(__file__).parent / "fixtures" / "omp"
+
+
+def _omp_fixture(name: str) -> str:
+    return (OMP_FIXTURES / name).read_text()
+
+
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        pytest.param("badkey.ndjson", "Invalid API key", id="badkey"),
+        pytest.param(
+            "down.ndjson",
+            "Couldn't connect to 127.0.0.1:9 (connection refused)."
+            " Check that the server is running and reachable.",
+            id="down",
+        ),
+        # Последний ход stop (ok.ndjson) и сработавший --max-cost (maxcost.ndjson,
+        # последний ход toolUse) — не сбои CLI.
+        pytest.param("ok.ndjson", None, id="ok-stop"),
+        pytest.param("maxcost.ndjson", None, id="maxcost-tooluse"),
+    ],
+)
+def test_omp_error_reads_the_last_assistant_message_end(fixture, expected):
+    assert omp_error(_omp_fixture(fixture)) == expected
+
+
+def test_omp_error_survives_a_truncated_stream():
+    assert omp_error('{"type":"session"}\n{"type":"message_end","mess') is None
+
+
+def test_omp_error_ignores_message_ends_without_an_error_turn():
+    ndjson = (
+        '{"type":"message_end","message":{"role":"user","content":[]}}\n'
+        '{"type":"message_end","message":{"role":"assistant","content":[],'
+        '"stopReason":"stop","errorMessage":"not an error"}}\n'
+    )
+    assert omp_error(ndjson) is None
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        pytest.param(omp_error(_omp_fixture("badkey.ndjson")), "auth", id="omp-badkey"),
+        pytest.param(omp_error(_omp_fixture("down.ndjson")), "network", id="omp-down"),
+        # Команда `apiKey` упала до старта модели: виден только stderr.
+        pytest.param(_omp_fixture("nokey.stderr.txt"), "auth", id="omp-nokey-stderr"),
+        pytest.param(
+            "TLS certificate verification failed for api-copilot.x5.ru"
+            " (UNABLE_TO_GET_ISSUER_CERT_LOCALLY)",
+            "network",
+            id="omp-tls",
+        ),
+        pytest.param(
+            "omp: no model response (the run ended before the first model reply)",
+            "network",
+            id="omp-no-model-response",
+        ),
+        # Живой формат 429 не снят: классифицируем и по слову, и по коду.
+        pytest.param("429 Too Many Requests", "quota", id="omp-429"),
+    ],
+)
+def test_omp_cli_errors_are_classified(error, expected):
+    assert classify_failure(_failed(error)) == expected
+
+
+def test_omp_429_cools_down_until_the_announced_reset():
+    error = "429 Too Many Requests: rate limit exceeded, resets 5am (Asia/Yekaterinburg)"
+    assert classify_failure(_failed(error)) == "quota"
+    assert parse_reset(error, NOW, YEKT) == datetime(2026, 10, 3, 0, 0, tzinfo=UTC)
+
+
+def test_unknown_omp_error_message_does_not_cool_down():
+    # Незнакомый errorMessage — обычный сбой без остывания, классификатор не падает.
+    assert classify_failure(_failed("Something mysterious went sideways")) is None
+
+
+def test_omp_no_model_response_phrase_inside_another_error_does_not_count():
+    assert classify_failure(_failed("MCP server x failed: omp: no model response")) is None
+
+
+def test_omp_agent_words_about_limits_do_not_cool_down():
+    # Текст ассистента со stopReason stop лежит в summary, а не в error:
+    # слова rate limit / 429 / usage limit в нём исполнителя не выключают.
+    text = "We hit a rate limit, got HTTP 429 and the usage limit notice; a retry fixed it."
+    ndjson = json.dumps(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "stopReason": "stop",
+            },
+        }
+    )
+    assert omp_error(ndjson) is None
+    assert classify_failure(_failed("exit 1", summary=text)) is None
+
+
+def test_omp_maxcost_notice_is_not_an_executor_failure():
+    # Код 3 с `notice` от собственного cost-gate: исполнитель не виноват.
+    notice = (
+        "Cost cap reached: this session spent $0.0002 of its $0.0000 cap"
+        " (--max-cost / session.maxCost), so the next model request was not sent."
+    )
+    assert omp_error(_omp_fixture("maxcost.ndjson")) is None
+    assert classify_failure(_failed("exit code 3", summary=notice)) is None

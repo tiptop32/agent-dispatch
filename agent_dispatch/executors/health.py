@@ -12,10 +12,16 @@ stderr или ошибка из отчёта CLI, туда не попадает
 в нём ищется только событие переподключения codex, и только когда агент ничего
 не изменил. Ошибки MCP-серверов в stderr codex (например, протухший OAuth-токен
 mcphub) намеренно не считаются: исполнитель с ними продолжает работать.
+
+У omp (`-p --mode json`) поля `httpStatus` нет: адаптер извлекает `errorMessage`
+последнего ассистентского хода с ошибкой (`omp_error`) или берёт stderr, а ход
+без единого ответа модели помечает строкой `omp: no model response` по образцу
+opencode.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import UTC, date, datetime, timedelta, tzinfo
@@ -34,7 +40,11 @@ _ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
             # «hit your weekly limit», «hit your session limit», «hit your
             # monthly spend limit», «hit your usage limit» у claude и codex.
             r"spend limit|usage limit|hit your (?:[\w-]+ )*limit|insufficient_quota"
-            r"|rate[ _]limit (?:exceeded|reached)|credit balance is too low|quota exceeded",
+            r"|rate[ _]limit (?:exceeded|reached)|credit balance is too low|quota exceeded"
+            # omp: живой формат 429 не снят (факты Task 1), поэтому и слово,
+            # и голый код — httpStatus в `-p --mode json` не доходит. `\b`
+            # не срабатывает внутри ответов вида `resp_...d4296...`.
+            r"|too many requests|\b429\b",
             re.IGNORECASE,
         ),
     ),
@@ -49,14 +59,27 @@ _ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
             # wrapper `scripts/codex-agent-lb` перед `exit 78`. Только с начала
             # строки: `MCP server x failed: Missing environment variable: ...`
             # это сбой MCP-сервера, и исполнитель с ним работает.
-            r"|(?m:^[ \t]*(?:codex-agent-lb: )?missing environment variable: [`\"]?\w*api_key)",
+            r"|(?m:^[ \t]*(?:codex-agent-lb: )?missing environment variable: [`\"]?\w*api_key)"
+            # omp: команда `apiKey` упала до старта модели (nokey.stderr.txt),
+            # стек в stderr начинается с этой строки.
+            r"|(?m:^[ \t]*error: No API key found for .+\.)",
             re.IGNORECASE,
         ),
     ),
-    # Строку пишет адаптер opencode, а не CLI: opencode молча выходит с кодом 0,
-    # когда запрос к модели не вернулся (`opencode.NO_RESPONSE`). Следующая
-    # задача ждала бы те же минуты.
-    ("network", re.compile(r"^opencode: no model response")),
+    # Первые две строки пишут адаптеры opencode и omp, а не CLI: CLI молча
+    # выходит, когда запрос к модели не вернулся. Следующая задача ждала бы
+    # те же минуты. Дальше два формата omp из живых прогонов (down.ndjson и
+    # факты Task 1): провайдер недоступен и TLS без корпоративного CA.
+    (
+        "network",
+        re.compile(
+            r"^opencode: no model response"
+            r"|^omp: no model response"
+            r"|couldn't connect to .+\(connection refused\)"
+            r"|TLS certificate verification failed",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 #: Событие codex при потере связи с API: `{"type":"error","message":"Reconnecting... 5/5 ..."}`.
@@ -78,6 +101,34 @@ def classify_failure(result: ExecutionResult) -> FailureKind | None:
         if not result.changed_files and _RECONNECT.search(result.summary):
             return "network"
     return None
+
+
+def omp_error(ndjson: str) -> str | None:
+    """`errorMessage` последнего ассистентского `message_end` со `stopReason: error`.
+
+    В `-p --mode json` у omp нет `httpStatus`, классифицировать сбой можно только
+    по этому сообщению и по stderr (факты Task 1). None значит «хода с ошибкой
+    нет»: успех (`ok.ndjson`), сработавший `--max-cost` (`maxcost.ndjson`, последний
+    ход `toolUse`) или обрыв потока — тогда адаптер сам отличает ход без единого
+    ответа модели и помечает его строкой `omp: no model response`.
+    """
+    message: str | None = None
+    for line in ndjson.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # обрыв потока или мусорная строка — не повод ронять разбор
+        if not isinstance(event, dict) or event.get("type") != "message_end":
+            continue
+        content = event.get("message")
+        if not isinstance(content, dict) or content.get("role") != "assistant":
+            continue
+        if content.get("stopReason") == "error" and content.get("errorMessage"):
+            message = content["errorMessage"]
+    return message
 
 
 #: Лимит конкретной модели («hit your Opus limit»), а не всего аккаунта.
