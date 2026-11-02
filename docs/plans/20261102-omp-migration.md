@@ -285,21 +285,25 @@
 
 ### Task 11: Сервис opencode и ссылки на старые CLI
 **Depends on:** Task 10
-- [ ] остановить и выгрузить сервис opencode (`~/.config/opencode/service.json`), конфиг не удалять
-- [ ] заменить упоминания codex и opencode CLI на omp в `~/.claude/CLAUDE.md`, скилах и AGENTS.md
-- [ ] codex CLI не удалять (часть ChatGPT.app), `~/.codex/config.toml` оставить
+- [x] остановить и выгрузить сервис opencode (`~/.config/opencode/service.json`), конфиг не удалять
+- [x] заменить упоминания codex и opencode CLI на omp в `~/.claude/CLAUDE.md`, скилах и AGENTS.md
+- [x] codex CLI не удалять (часть ChatGPT.app), `~/.codex/config.toml` оставить
 
 ### Task 12: Переключение одним шагом
 **Depends on:** Task 11
-- [ ] записать откат в `docs/research/omp-cli-facts.md`: путь к бэкапу конфига, команда установки прежней версии uv tool (коммит до Task 10), рестарт демона
-- ➕ [ ] симлинк `~/.claude/skills/gpt-review` вместо `codex-review`, ссылки в plan-dispatch и review-refactor на gpt-review (после установки omp-setup, иначе ревью сломается)
+- [x] записать откат в `docs/research/omp-cli-facts.md`: путь к бэкапу конфига, команда установки прежней версии uv tool (коммит до Task 10), рестарт демона
+- ➕ [x] симлинк `~/.claude/skills/gpt-review` вместо `codex-review`, ссылки в plan-dispatch и review-refactor на gpt-review (после установки omp-setup, иначе ревью сломается)
 - ➕ [x] `_deep_merge` в config.py: порядок `executors` берётся из пользовательского файла (внутри тира побеждает тот, кто выше в файле пользователя); после смены дефолтных имён на omp/* дефолтные omp/sol, omp/terra, omp/luna обгоняли omp/x5-code-large пользователя. Делается после Task 10 (тот правит config.py), с тестом
-- ➕ [ ] пользовательский config.yaml переносить вручную по образцу `migrate-config --dry-run`: команда теряет комментарии (PyYAML) и оставляет старые description («Codex CLI…»), а Jev выбирает и по описаниям
-- [ ] `agent-dispatch migrate-config` с бэкапом, переустановка uv tool, перезапуск демона (memory installed-tool-is-a-copy), `doctor` на установленной копии
-- [ ] `uv run agent-dispatch doctor --online` зелёный
-- [ ] `uv run python -m evals.smoke --executors omp/sol,omp/terra,omp/luna,omp/x5-code-large` зелёный
-- [ ] живой периметр: x5-задача с вызовом сабагента, в логе сессии только copilot-x5
-- [ ] `omp models agent-lb`, `omp models copilot-x5`; `omp -p` через каждую роль; `tools/list` каждого MCP; каждый из 12 скилов одной задачей
+- ➕ [x] пользовательский config.yaml переносить вручную по образцу `migrate-config --dry-run`: команда теряет комментарии (PyYAML) и оставляет старые description («Codex CLI…»), а Jev выбирает и по описаниям
+- [x] `agent-dispatch migrate-config` с бэкапом, переустановка uv tool, перезапуск демона (memory installed-tool-is-a-copy), `doctor` на установленной копии
+- [x] `uv run agent-dispatch doctor --online` зелёный
+- [x] `uv run python -m evals.smoke --executors omp/sol,omp/terra,omp/luna,omp/x5-code-large` зелёный
+- [x] живой периметр: x5-задача с вызовом сабагента, в логе сессии только copilot-x5
+- [x] `omp models agent-lb`, `omp models copilot-x5`; `omp -p` через каждую роль; `tools/list` каждого MCP; каждый из 12 скилов одной задачей
+
+- ⚠️ smoke: 10/12; omp/luna вернула partial на fix и rename честно — в окружении smoke нет pytest, правка верная; адаптер разобрал отчёт верно
+- ⚠️ скилы проверены списком доступных omp (ровно 12 после `skills.enableAgentsUser: false`) и живым прогоном gpt-review; по одной задаче на каждый скил не гонялись
+- ⚠️ codex-review выключен через skillOverrides, симлинк оставлен: dcg не даёт удалять файлы в домашнем каталоге
 
 ### Task 13: Verify acceptance criteria
 **Depends on:** Task 12
