@@ -307,10 +307,13 @@
 
 ### Task 13: Verify acceptance criteria
 **Depends on:** Task 12
-- [ ] все пункты Overview выполнены
-- [ ] граничные случаи: нет ключа, 429, недоступен copilot-x5, ход без ответа модели, таймаут с изменениями, follow-up, ревью только на чтение, старый конфиг без миграции
-- [ ] полный гейт: `uv run pytest tests -q`, ruff, `make test` в omp-setup и gpt-review, `make test lint` в agterm-kit
-- [ ] `evals.replay --json` без ошибок разбора на истории
+- [x] все пункты Overview выполнены
+- [x] граничные случаи: нет ключа, 429, недоступен copilot-x5, ход без ответа модели, таймаут с изменениями, follow-up, ревью только на чтение, старый конфиг без миграции
+- [x] полный гейт: `uv run pytest tests -q`, ruff, `make test` в omp-setup и gpt-review, `make test lint` в agterm-kit
+- [x] `evals.replay --json` без ошибок разбора на истории
+
+- ⚠️ replay: `completed` в `avoidable_runs` те же 3 задачи, что на main (нарушение инварианта было до перехода); расхождение с main в 5 исторических таймаутах codex/sol и 1 задаче claude — причина не выяснена, на задачи omp не влияет
+- ➕ [x] replay судит историю codex/opencode по настройкам omp-преемника (`successor`), иначе терялись recheck и corporate
 
 ### Task 14: [Final] Документация
 **Depends on:** Task 13
