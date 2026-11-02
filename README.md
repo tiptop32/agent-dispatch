@@ -1,13 +1,13 @@
 # AgentDispatch
 
-Маршрутизация coding-задач между Claude Code, Codex и OpenCode. Start anywhere. Dispatch anywhere.
+Маршрутизация coding-задач между Claude Code и omp. Start anywhere. Dispatch anywhere.
 
 Агент, в котором вы работаете, вызывает один MCP tool `dispatch`. AgentDispatch собирает компактный Task Package, спрашивает у Jev (judgment-модель TypeSafe), какой исполнитель подходит, запускает выбранный CLI в вашей рабочей копии и возвращает структурированный результат. Jev только принимает решение; запуск, guards, таймауты и телеметрия живут в обычном коде.
 
 ```text
 Claude Code ─┐
-Codex ───────┼──→ MCP `dispatch` ──→ демон agent-dispatch ──→ Jev (choice) ──→ guards ──→ исполнитель
-OpenCode ────┘                                                                   claude | codex | opencode/<model>
+omp ──────────┘──→ MCP `dispatch` ──→ демон agent-dispatch ──→ Jev (choice) ──→ guards ──→ исполнитель
+                                                                      claude | omp/<model>
 ```
 
 ## Что внутри
@@ -17,12 +17,12 @@ OpenCode ────┘                                                        
 - Tools: `route` (только решение), `dispatch` (решение + запуск), `dispatch_to` (явный исполнитель), `status`, `executors` (кто доступен сейчас, кто на лимите и до какого времени).
 - У `route` и `dispatch` есть необязательный `max_capability` (`fast`, `balanced` или `strong`). Он ограничивает выбор роутера сверху, не закрепляя конкретного исполнителя; `dispatch_to` и цепочки эскалации потолок игнорируют.
 - Guards в коде: недоступный исполнитель, исчерпанный лимит (до объявленного сброса, на весь аккаунт), правило «только ревью» (`routing.review_only`), лимит глубины делегирования (`max_hops`), лимит сабагентов на задачу (`max_children`), низкая уверенность Jev, таймаут, отмена.
-- Escalation chains из конфига: `opencode/kimi → codex → claude`.
+- Escalation chains из конфига: `omp/luna → omp/terra → omp/sol → claude`, `omp/x5-code-large → omp/x5-small-coder`.
 - Телеметрия каждого решения и результата, экспорт в JSONL для анализа routing accuracy.
 
 ## Установка
 
-Нужны Python 3.11+, `uv`, а также CLI тех исполнителей, которые включены в конфиге: `claude`, `codex`, `opencode`.
+Нужны Python 3.11+, `uv`, а также CLI исполнителей из конфига: `claude`, `omp`.
 
 ```bash
 git clone https://github.com/tiptop32/agent-dispatch.git
@@ -53,18 +53,18 @@ agent-dispatch doctor --online   # плюс живой вызов Jev
 
 ```bash
 agent-dispatch route "fix failing test in tests/test_x.py"
-# executor: codex
+# executor: omp/sol
 # confidence: 0.98
 # router: jev
 
 agent-dispatch dispatch --cwd ~/repo "tests/test_x.py fails; find the bug in src/x.py and fix it"
 # task_id: ...
 # status: completed
-# executor: codex
+# executor: omp/sol
 # changed_files: src/x.py
 # summary: ...
 
-agent-dispatch dispatch --executor opencode/kimi --cwd ~/repo "add a docstring to parse_args in cli.py"
+agent-dispatch dispatch --executor omp/x5-code-large --cwd ~/repo "add a docstring to parse_args in cli.py"
 agent-dispatch status <task_id>
 agent-dispatch executors
 ```
@@ -73,7 +73,7 @@ agent-dispatch executors
 
 ## Подключение к агентам
 
-Один и тот же MCP-сервер подключается ко всем трём агентам. Переменная `AGENT_DISPATCH_SOURCE_AGENT` говорит демону, откуда пришла задача, чтобы не делегировать Codex обратно в Codex.
+Один и тот же MCP-сервер подключается к Claude Code и omp. Переменная `AGENT_DISPATCH_SOURCE_AGENT` говорит демону, откуда пришла задача, чтобы не делегировать omp обратно в omp.
 
 Claude Code:
 
@@ -81,53 +81,42 @@ Claude Code:
 claude mcp add agent-dispatch -e AGENT_DISPATCH_SOURCE_AGENT=claude -- agent-dispatch mcp
 ```
 
-Codex (`~/.codex/config.toml`):
-
-```toml
-[mcp_servers.agent-dispatch]
-command = "agent-dispatch"
-args = ["mcp"]
-env = { AGENT_DISPATCH_SOURCE_AGENT = "codex" }
-env_vars = ["AGENT_DISPATCH_HOP", "AGENT_DISPATCH_TASK_ID", "AGENT_DISPATCH_ROOT_AGENT"]
-tool_timeout_sec = 120
-```
-
-`env_vars` обязателен: Codex не передаёт родительское окружение MCP-серверам по
-умолчанию, и без него вложенный `dispatch` исполнителя приходит в демон с
-`hop=0` и без родителя — исполнитель встаёт в очередь за собственной задачей и
-теряет worktree. `agent-dispatch doctor` проверяет эту строку (проверка
-`codex-env-vars`) и печатает её, если чего-то не хватает.
-
-Для запуска из демона или GUI установите `scripts/codex-agent-lb` как
-`~/.local/bin/codex`. Если в окружении нет `AGENT_LB_API_KEY`, wrapper читает
-только этот ключ из `~/.config/agent-lb/env`, затем запускает текущий нативный
-бинарник Codex. Храните по одной записи `KEY=value` или `export KEY=value` на
-строке и ограничьте права на файл. Wrapper берёт первое непустое значение и
-завершается с кодом `78`, если ключа нет. `agent-dispatch doctor` проверяет,
-что ключ доступен из окружения дочернего процесса или fallback-файла, но не
-печатает значение. Ключ из env-файла AgentDispatch входит в `Settings.secrets`,
-поэтому `child_env` его вырежет: храните ключ в окружении процесса демона или
-в `~/.config/agent-lb/env`.
-
-Wrapper следует за незакреплённым бинарником `standalone/current`.
-Переустановка Codex может заменить глобальный launcher, поэтому для стабильного
-запуска демона задайте явный путь к wrapper в `executors.<name>.command`.
-Сделайте файл исполняемым через `chmod +x`.
-
-Run the deterministic launcher eval with `uv run python -m evals.launcher`.
-
-OpenCode (`~/.config/opencode/opencode.json`):
+omp (`~/.omp/agent/mcp.json`):
 
 ```json
 {
-  "mcp": {
+  "mcpServers": {
     "agent-dispatch": {
-      "type": "local",
       "command": ["agent-dispatch", "mcp"],
-      "environment": { "AGENT_DISPATCH_SOURCE_AGENT": "opencode" }
+      "env": {
+        "AGENT_DISPATCH_SOURCE_AGENT": "omp",
+        "AGENT_DISPATCH_HOP": "AGENT_DISPATCH_HOP",
+        "AGENT_DISPATCH_TASK_ID": "AGENT_DISPATCH_TASK_ID",
+        "AGENT_DISPATCH_ROOT_AGENT": "AGENT_DISPATCH_ROOT_AGENT"
+      }
     }
   }
 }
+```
+
+`omp` передаёт переменные `AGENT_DISPATCH_*` MCP-серверу, поэтому вложенный `dispatch` сохраняет hop, родителя и worktree. Проверка `agent-dispatch doctor` называется `omp-mcp-env`.
+
+Ключ балансера omp получает сам через `apiKey: "!…"`; команда `omp-setup/bin/lb-key` читает его из `~/.config/agent-lb/env`. Диспетчер вырезает `AGENT_LB_API_KEY` из env omp, потому что окружение запускающего процесса доходит до bash-агента.
+
+Конфиг omp поддерживается в `~/my_git_reps/omp-setup`. После перехода старый пользовательский конфиг переносится командой:
+
+```bash
+agent-dispatch migrate-config
+```
+
+Для корпоративных исполнителей используйте профиль `x5`: он ограничивает провайдеры и роли omp корпоративным периметром. Его корневой CA лежит в `~/.omp/agent/x5-root.pem`.
+
+Правило для агентов (добавьте в CLAUDE.md, AGENTS.md или системный промпт):
+
+```text
+When a task could benefit from another coding agent or model, use the AgentDispatch
+`dispatch` tool instead of manually choosing an executor. Do not re-dispatch a task
+that is already marked as delegated unless AgentDispatch explicitly allows escalation.
 ```
 
 Правило для агентов (добавьте в CLAUDE.md, AGENTS.md или системный промпт):
@@ -142,7 +131,7 @@ AgentDispatch не обязателен для каждого запроса: э
 
 ### Таймауты MCP
 
-Задача исполнителя идёт минуты, а tool call в агенте живёт секунды. Поэтому прокси по умолчанию ждёт `mcp.wait_seconds` (50 с) и, если задача не закончилась, возвращает `running` и `task_id`; агент вызывает `status`. Чтобы ждать дольше, поднимите таймаут у хоста (`tool_timeout_sec` в Codex, `MCP_TOOL_TIMEOUT` в Claude Code) и передавайте `wait_seconds` в `dispatch`. Сервер в любом случае отдаёт ответ не позже чем через 600 с.
+Задача исполнителя идёт минуты, а tool call в агенте живёт секунды. Поэтому прокси по умолчанию ждёт `mcp.wait_seconds` (50 с) и, если задача не закончилась, возвращает `running` и `task_id`; агент вызывает `status`. Чтобы ждать дольше, поднимите таймаут у хоста omp или Claude Code и передавайте `wait_seconds` в `dispatch`. Сервер в любом случае отдаёт ответ не позже чем через 600 с.
 
 Ответы MCP по умолчанию компактные и не дублируют текст задачи и полный JSON. Параметр `verbose: true` возвращает полный JSON, а `status` с `wait_seconds` блокируется до 600 секунд вместо цикла опроса.
 
@@ -210,7 +199,7 @@ agent-dispatch worktrees --all --clean        # убрать только без
 
 ### Параллельные задачи
 
-Корневая coding-задача (`hop == 0`, `kind: task`) сначала занимает слот своей `limit_group` (`server.max_concurrent_per_group`, по умолчанию 2), затем общий слот (`server.max_concurrent_tasks`, по умолчанию 4). Поэтому два долгих codex не мешают opencode использовать собственную квоту, но одновременно работают не больше четырёх корневых задач на правку. Порядок group → global не даёт ожидающей группе держать общий слот.
+Корневая coding-задача (`hop == 0`, `kind: task`) сначала занимает слот своей `limit_group` (`server.max_concurrent_per_group`, по умолчанию 2), затем общий слот (`server.max_concurrent_tasks`, по умолчанию 4). Поэтому два долгих omp не мешают Claude использовать собственную квоту, но одновременно работают не больше четырёх корневых задач на правку. Порядок group → global не даёт ожидающей группе держать общий слот.
 
 Ревью (`kind: review`) сохраняет отдельный пул `server.max_concurrent_reviews` (по умолчанию 1). При дефолтах максимум одновременно работающих корневых CLI-процессов равен 5: четыре задачи плюс одно ревью. Вложенные задачи (`hop > 0`) от корневых семафоров не зависят, как и раньше, — правило hop-протокола не меняется. Получение task-слотов пишет событие `slot` с `limit_group` и `wait_seconds`; replay показывает по этим событиям число ожиданий дольше 60 секунд, среднее и максимум каждой группы. Старые задачи без события в расчёт не входят.
 
@@ -238,27 +227,27 @@ agent-dispatch dispatch "Почини парсер дат" --verify "uv run pyte
 agent-dispatch followup <task_id> "Ещё обработай пустую строку"
 ```
 
-В MCP это инструмент `followup(task_id, message)`. Продолжается последнее звено цепочки эскалации тем же исполнителем и в той же рабочей копии; `verify` по умолчанию тот же, что у прошлой задачи. Если прошлый запуск шёл в этом же каталоге, исполнитель продолжает свою сессию CLI (`claude --resume`, `codex exec resume`, `opencode run --session`) и получает только новое сообщение. Иначе (прошлый запуск был в worktree, сессии нет, исполнитель остывает и задачу взял другой) он получает полный Task Package с итогом прошлой попытки: изменённые файлы, ошибка, упавшая проверка, хвост отчёта. Если продолжить сессию не вышло (другая версия CLI, сессия удалена), демон один раз запускает задачу с нуля, в ответе `resume_failed: True`.
+В MCP это инструмент `followup(task_id, message)`. Продолжается последнее звено цепочки эскалации тем же исполнителем и в той же рабочей копии; `verify` по умолчанию тот же, что у прошлой задачи. Если прошлый запуск шёл в этом же каталоге, исполнитель продолжает сессию omp через `--resume <session id>` из первой строки `{"type":"session"}` в том же `cwd`, `--session-dir` и профиле. Иначе он получает полный Task Package с итогом прошлой попытки. Если сессию продолжить нельзя, демон один раз запускает задачу с нуля.
 
 Follow-up всегда идёт in_place. Если работа прошлой задачи не в рабочей копии (`integrate: branch`/`manual` или конфликт интеграции), демон отказывает и называет патч или ветку: сначала перенесите её.
 
 ### Сабагенты и hop-протокол
 
-Исполнитель получает в окружении `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP`. Его собственный MCP-прокси читает их и передаёт в демон, поэтому глубина делегирования известна демону, а не модели. При `max_hops: 2` исполнитель может разбить задачу и отдать до `max_children` подзадач через тот же `dispatch` (каждую роутит Jev), а его сабагенты уже делегировать не могут. Если лимит уже занят, отказ перечисляет `task_id` работающих соседних задач и предлагает вызвать `status(task_id, wait_seconds)`, а не повторять `dispatch`. Компактный MCP-ответ сохраняет эту подсказку. В Codex переменные глубины должен пересылать сам MCP-сервер (`env_vars` в `[mcp_servers.agent-dispatch]`, см. выше) — это проверяет `agent-dispatch doctor`.
+Исполнитель получает в окружении `AGENT_DISPATCH_TASK_ID`, `AGENT_DISPATCH_ROOT_AGENT`, `AGENT_DISPATCH_HOP`. Его собственный MCP-прокси читает их и передаёт в демон, поэтому глубина делегирования известна демону, а не модели. При `max_hops: 2` исполнитель может разбить задачу и отдать до `max_children` подзадач через тот же `dispatch` (каждую роутит Jev), а его сабагенты уже делегировать не могут. Если лимит уже занят, отказ перечисляет `task_id` работающих соседних задач и предлагает вызвать `status(task_id, wait_seconds)`, а не повторять `dispatch`. Компактный MCP-ответ сохраняет эту подсказку. MCP-прокси omp передаёт эти переменные в демон; `agent-dispatch doctor` проверяет их в `omp-mcp-env`. Роли `task`, `prewalk` и `advisor` профиля x5 идут через корпоративные модели.
 
 ### Лимиты исполнителей
 
 Когда CLI отвечает исчерпанным лимитом (`You've hit your weekly limit · resets 5am (Asia/Yekaterinburg)`, `You’ve hit your usage limit. Try again at 5:02 PM.`), демон выводит исполнителя из ротации до названного момента плюс минута запаса. Время без часового пояса считается местным временем машины демона. Если момент не назван, исполнитель перепроверяется через `routing.quota_cooldown_seconds` (3600).
 
-- **Весь аккаунт.** Лимит, авторизация и сеть общие для аккаунта, поэтому вместе с упавшим исполнителем остывают все с тем же `limit_group`: по умолчанию все `claude/*`, все `codex/*`, у `opencode` все модели одного провайдера. Перегрузка модели (`at capacity`) и лимит конкретной модели (`hit your Opus limit`) выводят только её.
+- **Весь аккаунт.** Лимит, авторизация и сеть общие для аккаунта, поэтому вместе с упавшим исполнителем остывают все с тем же `limit_group`: по умолчанию все `claude/*`, а у `omp/*` — все исполнители одного провайдера (`agent-lb` или `omp:copilot-x5`). Перегрузка модели (`at capacity`) и лимит конкретной модели (`hit your Opus limit`) выводят только её.
 - **Лимит расходов** (`monthly spend limit · raise it at …`) человек поднимает сам в любую минуту, поэтому он перепроверяется не реже `quota_cooldown_seconds`, даже если сброс назван через три дня.
-- **Пул аккаунтов за балансировщиком** (codex через codex-lb): сброс в сообщении относится к одному аккаунту, следующий запрос может уйти на свободный. Для таких исполнителей `limit_reset: recheck`:
+- **Пул аккаунтов за балансировщиком.** Для `omp/*` через agent-lb сброс относится к одному аккаунту, следующий запрос может уйти на свободный. Поэтому используется `limit_reset: recheck`.
 
   ```yaml
   executors:
-    codex/sol:
-      adapter: codex
-      model: gpt-5.6-sol
+    omp/sol:
+      adapter: omp
+      model: agent-lb/gpt-5.6-sol
       limit_reset: recheck   # announced (по умолчанию): ждать названный сброс
   ```
 
@@ -266,9 +255,9 @@ Follow-up всегда идёт in_place. Если работа прошлой �
 - **Видно вызывающей модели.** MCP-инструмент `executors` отвечает в несколько строк:
 
   ```text
-  available: codex/luna, codex/sol, opencode/x5-code-large
+  available: omp/luna, omp/sol, omp/x5-code-large
   out until 2026-10-03T05:01+05:00 (quota): claude/opus, claude/sonnet, claude/haiku; You've hit your weekly limit · resets 5am (Asia/Yekaterinburg)
-  review only from codex (kind='review'): claude/opus, claude/sonnet, claude/haiku
+  review only from omp (kind='review'): claude/opus, claude/sonnet, claude/haiku
   ```
 
   Роутер такого исполнителя не предлагает, цепочка эскалации его пропускает, а `dispatch_to` к нему сразу получает отказ с временем окончания, не запуская CLI. В ответе на упавшую задачу есть строка `cooldown_until`.
@@ -281,22 +270,21 @@ Follow-up всегда идёт in_place. Если работа прошлой �
 ```yaml
 routing:
   review_only:
-    codex: [claude]    # по умолчанию: Codex не тратит токены Claude на работу, а просит ревью
+    omp: [claude]    # omp получает ревью от Claude, но не отдаёт Claude coding-задачи
 ```
 
-Для `source_agent: codex` и `kind: task` исполнители `claude/*` выпадают из кандидатов роутера и из цепочек эскалации, а `dispatch_to` к ним получает отказ `review_only` с подсказкой. С `kind: review` Codex может обратиться к Claude напрямую или через роутер. Выключить правило: `review_only: {codex: []}`.
+Для `source_agent: omp` и `kind: task` исполнители `claude/*` выпадают из кандидатов роутера и из цепочек эскалации, а `dispatch_to` к ним получает отказ `review_only` с подсказкой. С `kind: review` omp может обратиться к Claude напрямую или через роутер. Выключить правило: `review_only: {omp: []}`.
 
 Ревью идёт в режиме только чтения и всегда в самой рабочей копии, даже при `workspace_mode: worktree`: worktree от HEAD не увидел бы незакоммиченного диффа, который и просят проверить.
 
 | адаптер | режим ревью |
 |---|---|
 | `claude` | `--tools Read,Glob,Grep --strict-mcp-config --permission-mode dontAsk`: других встроенных инструментов и MCP-серверов в сессии нет |
-| `codex` | `--sandbox read-only` |
-| `opencode` | `--agent plan` (встроенный агент без права правки) |
+| `omp` | `--tools read,grep,glob` (только чтение; инструмента `find` нет) |
 
 Почему у Claude `--tools`, а не `--allowedTools`/`--disallowedTools`: правила `allow` из `~/.claude/settings.json` складываются с флагами, и живая проверка 2026-10-03 с `--disallowedTools Write` создала файл. `--tools` убирает инструменты из сессии целиком. Bash ревьюеру не нужен: `git status --short` и `git diff HEAD` (до 100 000 символов) приходят в Task Package.
 
-Конфликтующие флаги из `extra_args` (`--permission-mode`, `--allowedTools`, `--tools`, `--sandbox`, `--agent`) в режиме ревью убираются, а не перекрываются: codex повтор флага отвергает. OpenCode в ревью всегда получает `--agent plan`: включённые формы auto-approval (`--auto`, `--auto=true`) из `extra_args` убираются, явные отказы (`--no-auto`, `--auto=false`) сохраняются. Демон сравнивает содержимое рабочей копии до и после ревью; если оно изменилось, в результате `warning: review changed files: ...` или `warning: working copy changed during the review` (ревью идёт без lock, изменение мог внести и параллельный запуск). Правки не откатываются, решает вызывающий. Сверка содержимого не смотрит файлы из `.gitignore` (`.env`, `.venv`): хешировать их на каждое ревью дорого, от записи туда защищает режим CLI.
+Конфликтующие флаги ревью из `extra_args` убираются, чтобы read-only режим omp не был ослаблен. Демон сравнивает содержимое рабочей копии до и после ревью; если оно изменилось, в результате `warning: review changed files: ...` или `warning: working copy changed during the review` (ревью идёт без lock, изменение мог внести и параллельный запуск). Правки не откатываются, решает вызывающий. Сверка содержимого не смотрит файлы из `.gitignore` (`.env`, `.venv`): хешировать их на каждое ревью дорого, от записи туда защищает режим CLI.
 
 ```bash
 agent-dispatch dispatch --kind review "Проверь незакоммиченный дифф на ошибки"
@@ -304,19 +292,19 @@ agent-dispatch dispatch --kind review "Проверь незакоммиченн
 
 ## Конфигурация
 
-`~/.config/agent-dispatch/config.yaml` мержится с [`agent_dispatch/config_default.yaml`](agent_dispatch/config_default.yaml) по ключам. Пример полного файла: [`config.example.yaml`](config.example.yaml).
+`~/.config/agent-dispatch/config.yaml` мержится с [`agent_dispatch/config_default.yaml`](agent_dispatch/config_default.yaml) по ключам. Порядок исполнителей внутри тира задаёт пользовательский файл, а не `config_default.yaml`: `load_settings` сохраняет этот порядок. Старый конфиг с adapter codex/opencode не загружается и сообщает о необходимости `agent-dispatch migrate-config`. Пример полного файла: [`config.example.yaml`](config.example.yaml).
 
-Добавить новую модель OpenCode это только конфиг:
+Добавить новую модель omp это только конфиг:
 
 ```yaml
 executors:
-  opencode/deepseek:
-    adapter: opencode
+  omp/deepseek:
+    adapter: omp
     model: openrouter/deepseek-v3
     tier: fast
-    description: "OpenCode with DeepSeek: cheap, good for well-specified edits"
+    description: "omp with DeepSeek: cheap, good for well-specified edits"
 escalation:
-  opencode/deepseek: [codex, claude]
+  omp/deepseek: [omp/sol, claude]
 ```
 
 `tier` (`fast`, `balanced`, `strong`) это то, по чему исполнитель находится: Jev называет нужный уровень, код выбирает кандидата этого уровня. Внутри одного `tier` побеждает тот, кто идёт в конфиге выше, поэтому дешёвые варианты ставьте первыми.
@@ -340,7 +328,7 @@ routing:
   daily_cost_limit_usd: 20.0   # всё, что завершилось с местной полуночи, плюс решения роутера
 ```
 
-Дошла цепочка до `max_chain_cost_usd` — следующее звено не запускается, в ответе `budget: {...}`. Дошли сутки до `daily_cost_limit_usd` — новые задачи, подзадачи и звенья эскалации получают отказ `budget` ещё до роутера. Считается только цена, которую сообщает CLI: claude (`total_cost_usd`) и opencode; codex цену не сообщает, его запуски в сумму не входят.
+Дошла цепочка до `max_chain_cost_usd` — следующее звено не запускается, в ответе `budget: {...}`. Дошли сутки до `daily_cost_limit_usd` — новые задачи, подзадачи и звенья эскалации получают отказ `budget` ещё до роутера. Считаются `usage` и `cost_usd` всех ассистентских `message_end`, включая все ходы omp.
 
 `corporate: true` помечает исполнителя внутри периметра. Если Jev отвечает, что задача касается корпоративных данных, выбор сужается до таких исполнителей; если ни одного нет, это попадает в `meta.selection_notes` решения, а не замалчивается. Туда же попадает случай, когда внутри периметра нет исполнителя нужного уровня: задача уедет к соседнему тиру, но молча это не произойдёт.
 
@@ -361,11 +349,11 @@ routing:
 
 `description` больше не влияет на выбор Jev: он используется резервным роутером `claude_local` и выводится в `agent-dispatch executors`.
 
-Права исполнителей задаются `extra_args`. У `claude` по умолчанию `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,Read,Glob,Grep`, иначе он не сможет запустить тесты в headless-режиме. Кодекс идёт с `--sandbox workspace-write`.
+Права исполнителей задаются `extra_args`. У `claude` по умолчанию `--permission-mode acceptEdits --allowedTools Bash,Edit,Write,Read,Glob,Grep`, иначе он не сможет запустить тесты в headless-режиме. omp получает `--approval-mode yolo` для coding-задач и `--tools read,grep,glob` для ревью.
 
-OpenCode в headless-режиме `run` прерывает сессию, когда агент отклоняет запрос разрешения, — адаптер возвращает `failed` с `opencode permission rejected: ...`. Поэтому для неинтерактивных задач адаптер по умолчанию добавляет флаг `--auto` (auto-approve permissions that are not explicitly denied, помечен как dangerous): он подходит для доверенных задач без присмотра. Явный отказ приоритетнее дефолта: если в `extra_args` уже есть `--no-auto` или `--auto=false` (`--auto false`), флаг не добавляется, и каждое разрешение снова будет спрашивать человек или агент.
+omp получает разрешения через `--approval-mode yolo`; отклонённое разрешение адаптер сообщает как `failed`, а не как `partial`.
 
-Рабочий каталог OpenCode-адаптер задаёт переменной `PWD`, а не флагом: у CLI v2 (проверено на 2.0.26) флага `--dir` нет, и `run` выбирает каталог как `process.env.PWD ?? process.cwd()` (upstream `cli-run.ts`). Разбор ошибок рассчитан на обе наблюдаемые формы: v1-событие `{"error": {"data": {"message": ...}}}` и v2-ошибку `{"type": "error", "error": {"type": "provider.no-route" | "provider.auth", "message": ...}}`; использования (`tokens`, `cost`) парсятся из `step_finish`. Более широкая совместимость версий не заявляется.
+Корпоративные исполнители omp запускаются с `--profile x5` и `NODE_EXTRA_CA_CERTS=~/.omp/agent/x5-root.pem`: профиль x5 держит периметр и для сабагентов omp. Каждый запуск получает `--config ~/.omp/agent/dispatch-overlay.yml` с `retry.maxRetries: 1`; повторами занимается эскалация. Код выхода 3 (`--max-cost`) означает бюджет, а не сбой исполнителя.
 
 Правила валидации — кто и когда в задаче гоняет тесты и линт — собраны в [`docs/workflow.md`](docs/workflow.md): один владелец валидации на задачу, неизменённый код второй раз зелёным не прогоняется; обязательные pre-commit гейты (ruff, detect-secrets, pytest) сохраняются.
 
@@ -380,7 +368,7 @@ agent-dispatch feedback <task_id> --outcome user_accepted
 
 ## Evals
 
-Два платных прогона, см. [`evals/README.md`](evals/README.md): `routing` меряет accuracy на 20 размеченных задачах через живой демон (порог 0.8), `smoke` гоняет три реальные задачи на каждом исполнителе во временной репе. Рядом живут бесплатные детерминированные сьюты: `evals.executors` (argv и парсинг результатов OpenCode-адаптера на корпусе), `evals.scheduling` (инварианты ёмкости задач и ревью in-process) и `evals.workflow` (контракты в отрендеренном TaskPackage).
+Два платных прогона, см. [`evals/README.md`](evals/README.md): `routing` меряет accuracy на 20 размеченных задачах через живой демон (порог 0.8), `smoke` гоняет три реальные задачи на каждом исполнителе во временной репе. Рядом живут бесплатные детерминированные сьюты: `evals.executors` (argv и парсинг результатов omp-адаптера на корпусе), `evals.scheduling` (инварианты ёмкости задач и ревью in-process) и `evals.workflow` (контракты в отрендеренном TaskPackage).
 
 ## Разработка
 
@@ -392,3 +380,6 @@ uv run pre-commit install              # ruff, detect-secrets, pytest перед
 ```
 
 Структура: `agent_dispatch/routing` (guards, Jev, claude_local, decision), `dispatch` (dispatcher, task package, escalation), `executors` (адаптеры, process runner, registry), `telemetry` (SQLite), `api` (FastAPI), `mcp` (прокси, автостарт), `cli.py`, `doctor.py`. Подробности в [`docs/architecture.md`](docs/architecture.md), план и история решений в [`docs/plans/`](docs/plans/).
+
+
+Ключ балансера omp получает сам через `apiKey: "!…"`; `omp-setup/bin/lb-key` читает его из `~/.config/agent-lb/env`. Диспетчер вырезает `AGENT_LB_API_KEY` из env omp, потому что окружение запускающего процесса доходит до bash-агента. Конфиг omp поддерживается в `~/my_git_reps/omp-setup`; перенос старого конфига выполняется командой `agent-dispatch migrate-config`. Корпоративные исполнители используют профиль x5.
