@@ -142,12 +142,14 @@
 ## Implementation Steps
 
 ### Task 1: Установить omp и снять живые форматы
+**Depends on:** none
 **Files:**
-- Create: `tests/fixtures/omp/` (успех, сбой хода, 429 балансера, неверный ключ, недоступный copilot-x5, ход без ответа модели, `--max-cost`, ревью только на чтение, resume)
+- Create: `tests/fixtures/omp/`
 - Create: `docs/research/omp-cli-facts.md`
 
 - [ ] `bun install -g @oh-my-pi/pi-coding-agent`, записать версию
 - [ ] снять `omp -p --mode json` на тестовом репо: заголовок сессии, `message_end`, `usage`, стоимость, коды выхода
+- [ ] фикстуры: успех, сбой хода, 429 балансера, неверный ключ, недоступный copilot-x5, ход без ответа, `--max-cost`, ревью только на чтение, resume
 - [ ] снять ошибки: неверный ключ балансера, 429 или лимит аккаунта, недоступный copilot-x5, ход без ответа модели (какой код выхода), `--max-cost`
 - [ ] проверить `apiKey: "!команда"` и что `env | grep AGENT_LB` из bash агента пуст
 - [ ] выяснить: как выбирается профиль (флаг или `PI_CONFIG_DIR`), имена инструментов только на чтение, `--resume` в `-p`, API хуков (начало и конец хода, PreToolUse), проброс env в MCP
@@ -155,10 +157,10 @@
 - [ ] разложить фикстуры без секретов (`detect-secrets`), записать факты в `docs/research/omp-cli-facts.md`
 
 ### Task 2: Репозиторий omp-setup с конфигом и профилем x5
+**Depends on:** Task 1
+**Repo:** `~/my_git_reps/omp-setup` (cwd раздачи)
 **Files:**
-- Create: `~/my_git_reps/omp-setup/{models.yml,config.yml,mcp.yml,AGENTS.md,install.sh,Makefile,README.md}`
-- Create: `~/my_git_reps/omp-setup/profiles/x5/`
-- Create: `~/my_git_reps/omp-setup/tests/`
+- Create: `models.yml`, `config.yml`, `mcp.yml`, `AGENTS.md`, `install.sh`, `Makefile`, `README.md`, `profiles/x5/`, `tests/` (в omp-setup)
 
 - [ ] `models.yml`: провайдеры `agent-lb` и `copilot-x5`, модели и лимиты из opencode, `apiKey: "!…"` без значений в файле
 - [ ] `config.yml`: роли, `retry.fallbackChains` sol→terra, `approvalMode: yolo`, `enabledProviders` без Claude и Codex
@@ -171,6 +173,7 @@
 - [ ] `make test` зелёный, коммит omp-setup
 
 ### Task 3: Адаптер executors/omp.py
+**Depends on:** Task 1, Task 2
 **Files:**
 - Create: `agent_dispatch/executors/omp.py`
 - Modify: `agent_dispatch/executors/registry.py`, `agent_dispatch/executors/result_parser.py`, `agent_dispatch/schemas/__init__.py`
@@ -185,6 +188,7 @@
 - [ ] гейт зелёный
 
 ### Task 4: Распознавание сбоев omp в health.py
+**Depends on:** Task 1
 **Files:**
 - Modify: `agent_dispatch/executors/health.py`, `tests/test_health.py`
 
@@ -195,6 +199,7 @@
 - [ ] гейт зелёный
 
 ### Task 5: Конфиг, guards и источники
+**Depends on:** Task 3
 **Files:**
 - Modify: `agent_dispatch/config.py`, `agent_dispatch/config_default.yaml`, `config.example.yaml`, `agent_dispatch/models.py`, `agent_dispatch/routing/guards.py`, `evals/replay/harness.py`
 - Modify: `tests/test_config.py`, `tests/test_config_example.py`, `tests/test_guards.py`, `tests/test_models.py`, `tests/test_limits.py`, `tests/test_replay.py`, `tests/fixtures/config/{full,bad_escalation}.yaml`
@@ -207,20 +212,22 @@
 - [ ] гейт зелёный
 
 ### Task 6: Миграция пользовательского конфига и doctor
+**Depends on:** Task 5
 **Files:**
-- Create: команда `migrate-config` (`agent_dispatch/cli.py` или `scripts/`)
-- Modify: `agent_dispatch/config.py` (понятная ошибка на старом адаптере), `agent_dispatch/doctor.py`
+- Modify: `agent_dispatch/cli.py`, `agent_dispatch/config.py`, `agent_dispatch/doctor.py`
 - Modify: `tests/test_cli.py`, `tests/test_doctor.py`
 
-- [ ] `migrate-config`: `codex/*` и `opencode/*` → `omp/*`, бэкап рядом, идемпотентно, `--dry-run` печатает дифф
+- [ ] команда `agent-dispatch migrate-config` в `cli.py`: `codex/*` и `opencode/*` → `omp/*`, бэкап рядом, идемпотентно, `--dry-run` печатает дифф
 - [ ] старый конфиг без миграции даёт ошибку старта с именем команды миграции, а не трейсбек pydantic
 - [ ] doctor: `codex-env-vars` → `omp-mcp-env` (проброс `AGENT_DISPATCH_*`), версия omp не ниже зафиксированной, профиль x5 без внешних провайдеров
 - [ ] тесты: миграция полного конфига, повторная миграция, неизвестный исполнитель, ошибка старта, каждая проверка doctor в зелёном и красном случае
 - [ ] гейт зелёный
 
 ### Task 7: Перенос скилов в omp-setup
+**Depends on:** Task 2
+**Repo:** `~/my_git_reps/omp-setup` (cwd раздачи)
 **Files:**
-- Create: `~/my_git_reps/omp-setup/skills/<12 скилов>/SKILL.md`, `~/my_git_reps/omp-setup/bin/omp-setup`, `tests/test_drift.py`
+- Create: `skills/`, `bin/omp-setup`, `tests/test_drift.py` (в omp-setup)
 
 - [ ] переписать 12 скилов под `ask` и `task`; пути к скриптам (glflow, huddle.py, agterm) абсолютные, без копий
 - [ ] `source:` и `source_sha:` в шапке каждого
@@ -229,10 +236,11 @@
 - [ ] `make test` зелёный, коммит omp-setup
 
 ### Task 8: gpt-review вместо codex-review
+**Depends on:** Task 1
+**Repo:** `~/my_git_reps/gpt-review` (cwd раздачи)
 **Files:**
-- Create: `~/my_git_reps/gpt-review` (клон истории codex-review)
-- Modify: `bin/gpt-review`, `SKILL.md`, `README.md`, тесты раннера
-- Modify: `~/.claude/skills/plan-dispatch/SKILL.md`, `~/.claude/skills/review-refactor/SKILL.md`
+- Modify: `bin/gpt-review`, `SKILL.md`, `README.md`, `tests/` (в gpt-review, репо создаётся клоном codex-review до раздачи)
+- Ссылки в `~/.claude/skills/plan-dispatch` и `review-refactor` правит координатор: исполнитель вне репо не пишет
 
 - [ ] раннер вызывает `omp -p --mode json --model agent-lb/gpt-6.1-sol` с инструментами только на чтение и `--max-time`
 - [ ] бюджет команд считается по событиям tool-call из NDJSON; salvage через `--resume`
@@ -242,14 +250,17 @@
 - [ ] `make test` зелёный, коммит gpt-review
 
 ### Task 9: Интеграция с agterm
+**Depends on:** Task 1
+**Repo:** `~/my_git_reps/agterm-kit` (cwd раздачи)
 **Files:**
-- Modify: `~/my_git_reps/agterm-kit/ask/` (установка для omp), хук статуса агента для omp
+- Modify: `ask/`, `tests/` (в agterm-kit)
 
 - [ ] статус omp в сайдбаре agterm через хуки начала и конца хода (если Task 1 подтвердил API, иначе ⚠️)
 - [ ] `agterm-kit/ask`: установка рядом с конфигом omp
 - [ ] bats-тесты по правилам agterm-kit, `make test lint` зелёный, коммит agterm-kit
 
 ### Task 10: Удаление адаптеров codex и opencode (последняя кодовая задача)
+**Depends on:** Tasks 3-9
 **Files:**
 - Delete: `agent_dispatch/executors/codex.py`, `agent_dispatch/executors/opencode.py`, `scripts/codex-agent-lb`
 - Delete: `tests/test_adapter_codex.py`, `tests/test_adapter_opencode.py`, `tests/test_codex_agent_lb.py`, `tests/fakes/{codex_ok.sh,opencode_ok.sh,opencode_env_capture.sh,opencode_pwd.py}`, `tests/fixtures/agent_output/codex_exec_json.txt`, `tests/snapshots/prompt_codex_summary.md`
@@ -264,11 +275,13 @@
 - [ ] гейт зелёный, коммит agent-dispatch
 
 ### Task 11: Сервис opencode и ссылки на старые CLI
+**Depends on:** Task 10
 - [ ] остановить и выгрузить сервис opencode (`~/.config/opencode/service.json`), конфиг не удалять
 - [ ] заменить упоминания codex и opencode CLI на omp в `~/.claude/CLAUDE.md`, скилах и AGENTS.md
 - [ ] codex CLI не удалять (часть ChatGPT.app), `~/.codex/config.toml` оставить
 
 ### Task 12: Переключение одним шагом
+**Depends on:** Task 11
 - [ ] записать откат в `docs/research/omp-cli-facts.md`: путь к бэкапу конфига, команда установки прежней версии uv tool (коммит до Task 10), рестарт демона
 - [ ] `agent-dispatch migrate-config` с бэкапом, переустановка uv tool, перезапуск демона (memory installed-tool-is-a-copy), `doctor` на установленной копии
 - [ ] `uv run agent-dispatch doctor --online` зелёный
@@ -277,12 +290,14 @@
 - [ ] `omp models agent-lb`, `omp models copilot-x5`; `omp -p` через каждую роль; `tools/list` каждого MCP; каждый из 12 скилов одной задачей
 
 ### Task 13: Verify acceptance criteria
+**Depends on:** Task 12
 - [ ] все пункты Overview выполнены
 - [ ] граничные случаи: нет ключа, 429, недоступен copilot-x5, ход без ответа модели, таймаут с изменениями, follow-up, ревью только на чтение, старый конфиг без миграции
 - [ ] полный гейт: `uv run pytest tests -q`, ruff, `make test` в omp-setup и gpt-review, `make test lint` в agterm-kit
 - [ ] `evals.replay --json` без ошибок разбора на истории
 
 ### Task 14: [Final] Документация
+**Depends on:** Task 13
 - [ ] README и `docs/architecture.md` agent-dispatch: omp вместо codex и opencode
 - [ ] `CLAUDE.md` agent-dispatch: переписать codex-правила (`codex-agent-lb`, `codex-env-vars`, флаги до `resume`, `thread_id`, события переподключения, дефолт `review_only`, `opencode: no model response`) на omp
 - [ ] `agent_dispatch/executors/CLAUDE.md` и `tests/CLAUDE.md`
