@@ -10,7 +10,7 @@
     "constraints": [
       "do not change the public API"
     ],
-    "source_agent": "codex"
+    "source_agent": "omp"
   },
   "questions": {
     "capability": {

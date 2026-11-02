@@ -24,15 +24,15 @@ RESPONSE_OK = {
     "id": "test-id",
 }
 
-CANDIDATES = {"codex": ExecutorSettings(adapter="codex", tier="balanced")}
+CANDIDATES = {"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="balanced")}
 
 
 def settings():
     return Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }
     )
 
@@ -46,7 +46,7 @@ async def test_jev_ok():
     )
     async with httpx.AsyncClient() as client:
         result = await JevRouter(s, client).decide(DispatchRequest(task="x", cwd="."), CANDIDATES)
-    assert route.called and result.executor == "codex" and result.meta["jev_id"]
+    assert route.called and result.executor == "omp" and result.meta["jev_id"]
     assert result.capability == "balanced"
 
 
@@ -70,7 +70,7 @@ async def test_request_body_and_headers():
                 context=expected["state"]["context"],
                 files=expected["state"]["files"],
                 constraints=expected["state"]["constraints"],
-                source_agent="codex",
+                source_agent="omp",
             ),
             CANDIDATES,
         )
@@ -125,7 +125,7 @@ async def test_full_judgments_and_metadata():
         "decomposable",
     }
     assert (
-        result.executor == "codex"
+        result.executor == "omp"
         and result.router == "jev"
         and result.judgments["difficulty"].kind == "score"
     )
@@ -147,8 +147,8 @@ async def test_full_judgments_and_metadata():
 async def test_capability_maps_to_the_executor_of_that_tier():
     s = settings()
     candidates = {
-        "cheap": ExecutorSettings(adapter="opencode", model="m", tier="fast"),
-        "codex": ExecutorSettings(adapter="codex", tier="balanced"),
+        "cheap": ExecutorSettings(adapter="omp", model="m", tier="fast"),
+        "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="balanced"),
         "opus": ExecutorSettings(adapter="claude", tier="strong"),
     }
     payload = {
@@ -175,8 +175,8 @@ async def test_capability_maps_to_the_executor_of_that_tier():
 async def test_corporate_answer_keeps_the_task_inside_the_perimeter():
     s = settings()
     candidates = {
-        "external": ExecutorSettings(adapter="codex", tier="fast"),
-        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+        "external": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="fast"),
+        "internal": ExecutorSettings(adapter="omp", model="m", tier="fast", corporate=True),
     }
     payload = {
         "answers": {
@@ -204,13 +204,13 @@ async def test_unsure_corporate_answer_below_the_threshold_does_not_narrow_the_p
     s = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
-            "executors": {"codex": {"adapter": "codex"}},
-            "routing": {"fallback_executor": "codex", "corporate_min_confidence": 0.5},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
+            "routing": {"fallback_executor": "omp", "corporate_min_confidence": 0.5},
         }
     )
     candidates = {
         "external": ExecutorSettings(adapter="claude", tier="strong"),
-        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+        "internal": ExecutorSettings(adapter="omp", model="m", tier="fast", corporate=True),
     }
     payload = {
         "answers": {
@@ -237,13 +237,13 @@ async def test_confident_corporate_answer_still_narrows_the_perimeter_at_the_sam
     s = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
-            "executors": {"codex": {"adapter": "codex"}},
-            "routing": {"fallback_executor": "codex", "corporate_min_confidence": 0.5},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
+            "routing": {"fallback_executor": "omp", "corporate_min_confidence": 0.5},
         }
     )
     candidates = {
         "external": ExecutorSettings(adapter="claude", tier="strong"),
-        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+        "internal": ExecutorSettings(adapter="omp", model="m", tier="fast", corporate=True),
     }
     payload = {
         "answers": {
@@ -270,13 +270,13 @@ async def test_corporate_perimeter_off_does_not_ask_the_question():
     s = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
-            "executors": {"codex": {"adapter": "codex"}},
-            "routing": {"fallback_executor": "codex", "corporate_perimeter": False},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
+            "routing": {"fallback_executor": "omp", "corporate_perimeter": False},
         }
     )
     candidates = {
-        "external": ExecutorSettings(adapter="codex", tier="fast"),
-        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+        "external": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="fast"),
+        "internal": ExecutorSettings(adapter="omp", model="m", tier="fast", corporate=True),
     }
     route = respx.post(s.router.jev.base_url).mock(
         return_value=httpx.Response(
@@ -307,13 +307,13 @@ async def test_corporate_perimeter_off_ignores_the_answer():
     s = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
-            "executors": {"codex": {"adapter": "codex"}},
-            "routing": {"fallback_executor": "codex", "corporate_perimeter": False},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
+            "routing": {"fallback_executor": "omp", "corporate_perimeter": False},
         }
     )
     candidates = {
         "external": ExecutorSettings(adapter="claude", tier="strong"),
-        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+        "internal": ExecutorSettings(adapter="omp", model="m", tier="fast", corporate=True),
     }
     payload = {
         "answers": {
@@ -339,7 +339,7 @@ async def test_corporate_perimeter_off_ignores_the_answer():
 async def test_judgment_answer_sends_the_task_to_a_reasoning_agent():
     s = settings()
     candidates = {
-        "codex": ExecutorSettings(adapter="codex", tier="strong"),
+        "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="strong"),
         "claude": ExecutorSettings(adapter="claude", tier="strong"),
     }
     payload = {
@@ -466,8 +466,8 @@ async def test_missing_corporate_answer_is_router_error():
     # цепочка, где периметр всё равно применяется (fail closed).
     s = settings()
     candidates = {
-        "external": ExecutorSettings(adapter="codex", tier="fast"),
-        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+        "external": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="fast"),
+        "internal": ExecutorSettings(adapter="omp", model="m", tier="fast", corporate=True),
     }
     payload = {
         "answers": {
@@ -509,7 +509,10 @@ async def test_unknown_choice_sum_and_missing_key_errors():
 @respx.mock
 async def test_missing_api_key_does_not_call_network():
     s = Settings.model_validate(
-        {"routing": {"fallback_executor": "codex"}, "executors": {"codex": {"adapter": "codex"}}}
+        {
+            "routing": {"fallback_executor": "omp"},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
+        }
     )
     route = respx.post(s.router.jev.base_url).mock(
         return_value=httpx.Response(200, json=RESPONSE_OK)
@@ -540,8 +543,8 @@ async def test_corporate_answer_of_wrong_type_is_router_error():
     # `score` со значением 0 читался бы как уверенное «нет» и открывал периметр.
     s = settings()
     candidates = {
-        "external": ExecutorSettings(adapter="codex", tier="fast"),
-        "internal": ExecutorSettings(adapter="opencode", model="m", tier="fast", corporate=True),
+        "external": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="fast"),
+        "internal": ExecutorSettings(adapter="omp", model="m", tier="fast", corporate=True),
     }
     payload = _corporate_payload(
         {"type": "score", "score": 0, "confidence": 1, "probabilities": {"0": 1}}
@@ -557,7 +560,7 @@ async def test_corporate_answer_of_wrong_type_is_router_error():
 async def test_nan_capability_confidence_is_router_error():
     # NaN прошёл бы мимо порога low_confidence: сравнение с NaN всегда ложно.
     s = settings()
-    candidates = {"codex": ExecutorSettings(adapter="codex", tier="fast")}
+    candidates = {"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="fast")}
     payload = {
         "answers": {
             "capability": {
@@ -584,9 +587,9 @@ async def test_corporate_question_is_asked_when_corporate_executors_are_cooling(
             "secrets": {"OPENROUTER_API_KEY": "k"},
             "routing": {"fallback_executor": ["external"]},
             "executors": {
-                "external": {"adapter": "codex", "tier": "fast"},
+                "external": {"adapter": "omp", "model": "agent-lb/luna", "tier": "fast"},
                 "internal": {
-                    "adapter": "opencode",
+                    "adapter": "omp",
                     "model": "m",
                     "tier": "fast",
                     "corporate": True,

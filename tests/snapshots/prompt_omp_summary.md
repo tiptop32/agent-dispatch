@@ -23,4 +23,7 @@ You own the implementation, the regression tests and deterministic evals for the
 Do not commit or push: leave all changes in the working tree, the caller reviews and commits.
 
 # Result format
-Report the outcome using the structured output schema: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation.
+End your final message with a fenced block tagged `agent-dispatch-result` containing a JSON object with fields: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation. Example:
+```agent-dispatch-result
+{"status": "completed", "summary": "...", "changed_files": [], "tests": {"command": "pytest", "result": "passed"}, "confidence": 0.9, "needs_escalation": false}
+```

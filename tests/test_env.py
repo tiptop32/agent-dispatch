@@ -4,8 +4,8 @@ from agent_dispatch.executors.env import child_env
 
 def settings() -> Settings:
     return Settings(
-        executors={"codex": ExecutorSettings(adapter="codex")},
-        routing=RoutingSettings(fallback_executor="codex"),
+        executors={"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna")},
+        routing=RoutingSettings(fallback_executor="omp"),
     )
 
 

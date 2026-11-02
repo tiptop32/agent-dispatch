@@ -12,7 +12,7 @@ from agent_dispatch.config import Settings
 from agent_dispatch.executors.workspace import git_env
 from agent_dispatch.models import ContextMode, DispatchRequest
 
-AdapterKind = Literal["claude", "codex", "opencode"]
+AdapterKind = Literal["claude", "omp"]
 
 
 class Followup(BaseModel):
@@ -145,9 +145,7 @@ def _templates() -> Environment:
 
 
 def result_instructions(adapter_kind: AdapterKind) -> str:
-    """Как исполнитель отдаёт отчёт: codex схемой, остальные блоком в тексте."""
-    if adapter_kind == "codex":
-        return "Report the outcome using the structured output schema: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation."  # noqa: E501
+    """Как исполнитель отдаёт отчёт: блоком в тексте."""
     return 'End your final message with a fenced block tagged `agent-dispatch-result` containing a JSON object with fields: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation. Example:\n```agent-dispatch-result\n{"status": "completed", "summary": "...", "changed_files": [], "tests": {"command": "pytest", "result": "passed"}, "confidence": 0.9, "needs_escalation": false}\n```'  # noqa: E501
 
 
@@ -168,7 +166,7 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
     if worktree:
         # В worktree-режиме вызывающий мог написать абсолютные пути исходной
         # рабочей копии: переписываем их на пути worktree, иначе агент правит
-        # чужую рабочую копию мимо своего дерева (opencode --auto одобряет
+        # чужую рабочую копию мимо своего дерева (omp --auto одобряет
         # external_directory). Оба пути остаются в промпте.
         root = package.repo_root or req.cwd
         task = rewrite_repo_prefix(task, root, worktree)

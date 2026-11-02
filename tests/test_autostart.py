@@ -14,8 +14,8 @@ from agent_dispatch.serve_state import ServeState, write_state
 def make_settings(tmp_path):
     return Settings(
         server=ServerSettings(data_dir=tmp_path),
-        routing=RoutingSettings(fallback_executor="codex"),
-        executors={"codex": ExecutorSettings(adapter="codex")},
+        routing=RoutingSettings(fallback_executor="omp"),
+        executors={"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna")},
     )
 
 

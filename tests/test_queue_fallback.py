@@ -19,8 +19,8 @@ from agent_dispatch.models import DispatchRequest, Judgment, RouteDecision, Rout
 from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
 
-PREFERRED = "opencode/x5"
-BACKUP = "codex/sol"
+PREFERRED = "omp/x5"
+BACKUP = "omp/sol"
 WAIT = 3
 THRESHOLD = 0.03
 
@@ -36,8 +36,8 @@ async def lab(tmp_path, **routing):
         ),
         execution=ExecutionSettings(workspace_mode="in_place"),
         executors={
-            PREFERRED: ExecutorSettings(adapter="opencode", model="copilot/x5", corporate=True),
-            BACKUP: ExecutorSettings(adapter="codex"),
+            PREFERRED: ExecutorSettings(adapter="omp", model="copilot/x5", corporate=True),
+            BACKUP: ExecutorSettings(adapter="claude"),
         },
     )
     storage = Storage(tmp_path / "db.sqlite")
@@ -130,9 +130,9 @@ async def test_queue_fallback_never_bypasses_restrictions(tmp_path, git_repo, re
         if restriction == "tier":
             settings.executors[BACKUP].tier = "strong"
         elif restriction == "source":
-            kwargs["source_agent"] = "codex"
+            kwargs["source_agent"] = "omp"
         elif restriction == "review_only":
-            settings.routing.review_only = {"cli": ["codex"]}
+            settings.routing.review_only = {"cli": ["claude"]}
         elif restriction == "disabled":
             settings.executors[BACKUP].enabled = False
         elif restriction == "cooldown":
@@ -156,6 +156,16 @@ async def test_queue_fallback_never_bypasses_restrictions(tmp_path, git_repo, re
                 **kwargs,
             )
         )
+        if restriction == "source":
+            # Источник omp легальных исполнителей не имеет: пул omp закрыт
+            # само-делегированием, claude — правилом review_only по умолчанию.
+            # Задача падает закрыто сразу: queue-fallback мимо source-исключений
+            # невозможен.
+            done = await d.wait(task.task_id, WAIT)
+            assert done.status == "failed" and done.result.meta["guard"] == "unavailable"
+            assert len(adapters[BACKUP].calls) == 0
+            adapters[PREFERRED].gate.set()
+            return
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(d.wait(task.task_id, WAIT), THRESHOLD * 4)
         assert len(adapters[BACKUP].calls) == (1 if restriction == "busy" else 0)

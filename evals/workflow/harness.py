@@ -52,8 +52,8 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
 
 def _settings() -> Settings:
     return Settings(
-        executors={"codex": ExecutorSettings(adapter="codex")},
-        routing=RoutingSettings(fallback_executor="codex", max_hops=2, max_children=2),
+        executors={"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna")},
+        routing=RoutingSettings(fallback_executor="omp", max_hops=2, max_children=2),
     )
 
 
@@ -74,7 +74,7 @@ def _request(case: dict[str, Any], repo: Path) -> DispatchRequest:
         constraints=["Keep the public contract stable."],
         success_criteria=["The focused check passes."],
         context_mode=case["context_mode"],
-        source_agent=SourceAgent.codex,
+        source_agent=SourceAgent.omp,
         hop=case["hop"],
     )
 
@@ -130,10 +130,8 @@ def _check_prompt(case: dict[str, Any], prompt: str) -> list[str]:
 
 def _check_adapter(case: dict[str, Any], prompt: str, failures: list[str]) -> None:
     result_format = _section(prompt, "Result format") or ""
-    if case["adapter"] == "codex":
-        if "structured output schema" not in result_format:
-            failures.append("codex result format")
-    elif "```agent-dispatch-result" not in result_format:
+    # Все адаптеры теперь используют единый fenced-block формат результата.
+    if "```agent-dispatch-result" not in result_format:
         failures.append(f"{case['adapter']} result format")
 
 

@@ -8,15 +8,12 @@
 
 Классификация смотрит только на узнаваемые сообщения самих CLI. Поле `error` это
 stderr или ошибка из отчёта CLI, туда не попадает вывод инструментов агента.
-`summary` у упавшего запуска это хвост stdout, где лежит и работа агента, поэтому
-в нём ищется только событие переподключения codex, и только когда агент ничего
-не изменил. Ошибки MCP-серверов в stderr codex (например, протухший OAuth-токен
-mcphub) намеренно не считаются: исполнитель с ними продолжает работать.
+Ошибки MCP-серверов в stderr (например, протухший OAuth-токен mcphub) намеренно
+не считаются: исполнитель с ними продолжает работу.
 
 У omp (`-p --mode json`) поля `httpStatus` нет: адаптер извлекает `errorMessage`
 последнего ассистентского хода с ошибкой (`omp_error`) или берёт stderr, а ход
-без единого ответа модели помечает строкой `omp: no model response` по образцу
-opencode.
+без единого ответа модели помечает строкой `omp: no model response`.
 """
 
 from __future__ import annotations
@@ -38,7 +35,7 @@ _ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
         "quota",
         re.compile(
             # «hit your weekly limit», «hit your session limit», «hit your
-            # monthly spend limit», «hit your usage limit» у claude и codex.
+            # monthly spend limit», «hit your usage limit» у claude.
             r"spend limit|usage limit|hit your (?:[\w-]+ )*limit|insufficient_quota"
             r"|rate[ _]limit (?:exceeded|reached)|credit balance is too low|quota exceeded"
             # omp: живой формат 429 не снят (факты Task 1), поэтому и слово,
@@ -55,35 +52,29 @@ _ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
             r"no cookie auth credentials|invalid api key|invalid x-api-key|authentication_error"
             r"|401 unauthorized|not logged in|please run /login"
             # Ключ провайдера не дошёл до CLI: любая задача откажет так же.
-            # Так пишет codex про `env_key` провайдера, и так же пишет наш
-            # wrapper `scripts/codex-agent-lb` перед `exit 78`. Только с начала
-            # строки: `MCP server x failed: Missing environment variable: ...`
-            # это сбой MCP-сервера, и исполнитель с ним работает.
-            r"|(?m:^[ \t]*(?:codex-agent-lb: )?missing environment variable: [`\"]?\w*api_key)"
+            # Только с начала строки: `MCP server x failed: Missing environment
+            # variable: ...` это сбой MCP-сервера, и исполнитель с ним работает.
+            r"|(?m:^[ \t]*missing environment variable: [`\"]?\w*api_key)"
             # omp: команда `apiKey` упала до старта модели (nokey.stderr.txt),
             # стек в stderr начинается с этой строки.
             r"|(?m:^[ \t]*error: No API key found for .+\.)",
             re.IGNORECASE,
         ),
     ),
-    # Первые две строки пишут адаптеры opencode и omp, а не CLI: CLI молча
-    # выходит, когда запрос к модели не вернулся. Следующая задача ждала бы
-    # те же минуты. Дальше два формата omp из живых прогонов (down.ndjson и
-    # факты Task 1): провайдер недоступен и TLS без корпоративного CA.
+    # Первые две строки пишут адаптер omp, а не CLI: CLI молча выходит, когда
+    # запрос к модели не вернулся. Следующая задача ждала бы те же минуты.
+    # Дальше два формата omp из живых прогонов (down.ndjson и факты Task 1):
+    # провайдер недоступен и TLS без корпоративного CA.
     (
         "network",
         re.compile(
-            r"^opencode: no model response"
-            r"|^omp: no model response"
+            r"^omp: no model response"
             r"|couldn't connect to .+\(connection refused\)"
             r"|TLS certificate verification failed",
             re.IGNORECASE,
         ),
     ),
 )
-
-#: Событие codex при потере связи с API: `{"type":"error","message":"Reconnecting... 5/5 ..."}`.
-_RECONNECT = re.compile(r"Reconnecting\.\.\. \d+/\d+")
 
 
 def classify_failure(result: ExecutionResult) -> FailureKind | None:
@@ -95,11 +86,7 @@ def classify_failure(result: ExecutionResult) -> FailureKind | None:
         if pattern.search(error):
             return kind
     # Таймаут и сторож молчания сами по себе ничего не говорят об исполнителе:
-    # агент мог честно работать. Обрыв связи виден по событиям переподключения,
-    # а пустой changed_files значит, что до работы дело не дошло.
-    if error == "timeout" or error.startswith("stalled:"):
-        if not result.changed_files and _RECONNECT.search(result.summary):
-            return "network"
+    # агент мог честно работать и без единого узнаваемого сообщения CLI.
     return None
 
 
@@ -159,7 +146,7 @@ _DATE = (
 )
 _TIME = r"(?:at\s+)?(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)\b"
 #: claude: «resets 5am (Asia/Yekaterinburg)», «resets Sep 26 at 5am (…)»;
-#: codex: «Try again at 5:02 PM.», «Try again at Sep 27th, 2026 5:02 PM.».
+#: «Try again at 5:02 PM.», «Try again at Sep 27th, 2026 5:02 PM.».
 _RESET_AT = re.compile(
     r"(?:resets|try again at)\s+" + _DATE + _TIME + r"(?:\s*\((?P<tz>[^)]+)\))?",
     re.IGNORECASE,
@@ -256,7 +243,7 @@ def _instants(day: date, hour: int, minute: int, zone: tzinfo) -> list[datetime]
 def parse_reset(error: str, now: datetime, local_tz: tzinfo | None = None) -> datetime | None:
     """Момент сброса лимита из сообщения CLI, в UTC; None, если его там нет.
 
-    Время без часового пояса (codex пишет «Try again at 5:02 PM») это местное
+    Время без часового пояса («Try again at 5:02 PM») это местное
     время машины, где работает CLI, то есть демона. Из нескольких моментов берётся
     самый поздний: раньше него исполнитель всё равно откажет.
     """

@@ -110,7 +110,7 @@ class RoutingSettings(_ConfigModel):
     review_only: dict[str, list[str]] = Field(default_factory=lambda: {"omp": ["claude"]})
     #: Потолок расходов цепочки эскалации вместе с подзадачами её звеньев, в
     #: долларах. Дошла до него — следующее звено не запускается. Считаются только
-    #: расходы, о которых сообщил CLI (claude, opencode; codex цену не сообщает).
+    #: расходы, которые сообщает CLI (claude, omp).
     #: null выключает.
     max_chain_cost_usd: float | None = Field(None, gt=0)
     #: Потолок расходов за локальные сутки: исполнители и решения роутера. Дошли
@@ -129,7 +129,7 @@ class RoutingSettings(_ConfigModel):
         # codex и opencode остаются валидными источниками: старые строки БД,
         # follow-up и replay по историческим задачам их читают.
         sources = {"claude", "codex", "opencode", "omp", "cli", "unknown"}
-        adapters = {"claude", "codex", "opencode", "omp"}
+        adapters = {"claude", "omp"}
         for source, targets in self.review_only.items():
             if source not in sources:
                 raise ValueError(f"review_only.{source}: unknown source agent")
@@ -169,7 +169,7 @@ class ExecutionSettings(_ConfigModel):
 
 
 class ExecutorSettings(_ConfigModel):
-    adapter: Literal["claude", "codex", "opencode", "omp"]
+    adapter: Literal["claude", "omp"]
     command: str | None = None
     model: str | None = None
     extra_args: list[str] = Field(default_factory=list)
@@ -180,11 +180,11 @@ class ExecutorSettings(_ConfigModel):
     #: Исполнитель внутри корпоративного периметра: данные не уходят наружу.
     corporate: bool = False
     #: Исполнители с общим лимитом: исчерпанный лимит одного выводит из ротации
-    #: всю группу. По умолчанию у claude и codex это адаптер (один аккаунт на
-    #: все модели), у opencode провайдер из `model`.
+    #: всю группу. По умолчанию у claude это адаптер (один аккаунт на все
+    #: модели), у omp — провайдер из `model`.
     limit_group: str | None = None
     #: `announced` держит исполнителя до сброса, названного в сообщении CLI.
-    #: `recheck` для пула аккаунтов за балансировщиком (codex-lb): названный
+    #: `recheck` для пула аккаунтов за балансировщиком: названный
     #: сброс относится к одному аккаунту, следующий запрос уйдёт на другой,
     #: поэтому исполнитель перепроверяется через `routing.quota_cooldown_seconds`.
     limit_reset: Literal["announced", "recheck"] = "announced"
@@ -194,8 +194,8 @@ class ExecutorSettings(_ConfigModel):
 
     @model_validator(mode="after")
     def validate_adapter(self) -> ExecutorSettings:
-        # omp строит группу лимита и вызов из `model`, как opencode из провайдера.
-        if self.adapter in {"opencode", "omp"} and not self.model:
+        # omp строит группу лимита и вызов из `model`.
+        if self.adapter == "omp" and not self.model:
             raise ValueError(f"model is required for adapter {self.adapter}")
         return self
 
@@ -206,9 +206,9 @@ class ExecutorSettings(_ConfigModel):
     def resolved_limit_group(self, name: str) -> str:
         if self.limit_group:
             return self.limit_group
-        # У opencode и omp один аккаунт на провайдера из `model`
+        # У omp один аккаунт на провайдера из `model`
         # (agent-lb, copilot-x5), а не на все модели адаптера.
-        if self.adapter in {"opencode", "omp"}:
+        if self.adapter == "omp":
             provider = (self.model or "").split("/", 1)
             return f"{self.adapter}:{provider[0]}" if len(provider) == 2 else name
         return self.adapter

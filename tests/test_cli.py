@@ -38,9 +38,9 @@ def _daemon_port():
 
 def _route_payload() -> dict:
     return {
-        "executor": "codex",
+        "executor": "omp",
         "confidence": 0.84,
-        "scores": {"codex": 0.84},
+        "scores": {"omp": 0.84},
         "router": "jev",
     }
 
@@ -50,7 +50,7 @@ def _view(status: str = "completed", *, task_id: str = "t1", meta: dict | None =
     if status in {"completed", "partial", "failed", "needs_context", "needs_escalation"}:
         result = {
             "status": status,
-            "executor": "codex",
+            "executor": "omp",
             "model": None,
             "summary": "done",
             "changed_files": ["a.py"],
@@ -97,7 +97,7 @@ def test_route_prints_decision_and_sends_cli_source(tmp_config_dir, monkeypatch)
     result = runner.invoke(app, ["route", "fix tests"])
 
     assert result.exit_code == 0
-    assert "executor: codex" in result.stdout
+    assert "executor: omp" in result.stdout
     assert "confidence: 0.84" in result.stdout
     assert json.loads(request.calls[0].request.content)["source_agent"] == "cli"
 
@@ -109,9 +109,9 @@ def test_dispatch_sends_executor(tmp_config_dir, monkeypatch):
     request = respx.post(f"http://127.0.0.1:{state.port}/tasks").mock(
         return_value=httpx.Response(200, json=_view())
     )
-    result = runner.invoke(app, ["dispatch", "--executor", "opencode/kimi", "x"])
+    result = runner.invoke(app, ["dispatch", "--executor", "omp/kimi", "x"])
     assert result.exit_code == 0
-    assert json.loads(request.calls[0].request.content)["executor"] == "opencode/kimi"
+    assert json.loads(request.calls[0].request.content)["executor"] == "omp/kimi"
 
 
 @respx.mock
@@ -240,8 +240,8 @@ def test_executors_prints_names_and_availability(tmp_config_dir):
             200,
             json=[
                 {
-                    "name": "codex",
-                    "adapter": "codex",
+                    "name": "omp",
+                    "adapter": "omp",
                     "model": None,
                     "enabled": True,
                     "available": True,
@@ -253,7 +253,7 @@ def test_executors_prints_names_and_availability(tmp_config_dir):
     )
     result = runner.invoke(app, ["executors"])
     assert result.exit_code == 0
-    assert "codex" in result.stdout and "available" in result.stdout
+    assert "omp" in result.stdout and "available" in result.stdout
 
 
 @respx.mock

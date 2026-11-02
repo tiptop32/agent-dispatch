@@ -895,8 +895,8 @@ class Dispatcher:
             }
         )
         report = await self._call_adapter(adapter, report_ctx, decision)
-        # Дозапрос мог упасть на сбое самого исполнителя (лимит, пустой ответ
-        # opencode): итог задачи несёт ошибку первого запуска, а не его, и без
+        # Дозапрос мог упасть на сбое самого исполнителя (лимит, пустой ответ):
+        # итог задачи несёт ошибку первого запуска, а не его, и без
         # этого вызова исполнитель остался бы в ротации.
         await self._note_executor_failure(record, decision, report)
         merged = report_recovery.merge_report(result, report)
@@ -999,7 +999,7 @@ class Dispatcher:
                     "AGENT_DISPATCH_ROOT_AGENT": record.root_agent.value,
                     "AGENT_DISPATCH_HOP": str(req.hop + 1),
                     # Источник вложенного вызова это сам исполнитель. Без этого
-                    # MCP-прокси внутри codex унаследовал бы источник демона
+                    # MCP-прокси внутри CLI унаследовал бы источник демона
                     # (того, кто его поднял), и правило review_only не сработало бы.
                     "AGENT_DISPATCH_SOURCE_AGENT": self.settings.executors[
                         decision.executor
@@ -1146,7 +1146,7 @@ class Dispatcher:
         links = await self._escalation_links(record)
         tried = [executor for _, executor in links]
         # Цепочка эскалации подчиняется тому же правилу ревью, что и роутер:
-        # иначе задача Codex дошла бы до Claude через `codex/sol: [claude/opus]`.
+        # иначе задача от omp дошла бы до Claude через `omp/luna: [claude/opus]`.
         unavailable = self.availability.unavailable() | review_only_executors(
             record.request, self.settings
         )

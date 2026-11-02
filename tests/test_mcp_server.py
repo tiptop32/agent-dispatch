@@ -27,8 +27,8 @@ from agent_dispatch.serve_state import ServeState
 def settings(tmp_path):
     return Settings(
         server=ServerSettings(data_dir=tmp_path),
-        routing=RoutingSettings(fallback_executor="codex"),
-        executors={"codex": ExecutorSettings(adapter="codex")},
+        routing=RoutingSettings(fallback_executor="omp"),
+        executors={"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna")},
     )
 
 
@@ -37,11 +37,11 @@ def state():
 
 
 def view(status="completed", summary="done"):
-    request = {"task": "secret task text", "cwd": ".", "source_agent": "codex"}
+    request = {"task": "secret task text", "cwd": ".", "source_agent": "omp"}
     decision = RouteDecision(
-        executor="codex",
+        executor="omp",
         confidence=0.9,
-        scores={"codex": 0.9},
+        scores={"omp": 0.9},
         router=RouterKind.jev,
         capability="strong",
         confidence_tier="autonomous",
@@ -54,7 +54,7 @@ def view(status="completed", summary="done"):
     )
     result = ExecutionResult(
         status="completed",
-        executor="codex",
+        executor="omp",
         model=None,
         summary=summary,
         changed_files=["a.py", "b.py"],
@@ -107,7 +107,7 @@ async def test_tools_exact(tmp_path):
 @pytest.mark.asyncio
 @respx.mock
 async def test_dispatch_body_and_auth(tmp_path, monkeypatch):
-    monkeypatch.setenv("AGENT_DISPATCH_SOURCE_AGENT", "codex")
+    monkeypatch.setenv("AGENT_DISPATCH_SOURCE_AGENT", "omp")
     route = respx.post("http://127.0.0.1:7433/tasks").mock(
         return_value=httpx.Response(200, json=view("running").model_dump(mode="json"))
     )
@@ -133,7 +133,7 @@ async def test_dispatch_running_hint(tmp_path):
     text = r.content[0].text
     assert "task_id: t1" in text
     assert "status: running" in text
-    assert "executor: codex" in text
+    assert "executor: omp" in text
     assert "route: jev · strong · 0.9 autonomous" in text
     assert "wait_seconds (up to 600)" in text
     assert "secret task text" not in text
@@ -218,8 +218,8 @@ async def test_dispatch_to_executor(tmp_path):
     request = respx.post("http://127.0.0.1:7433/tasks").mock(
         return_value=httpx.Response(200, json=view().model_dump(mode="json"))
     )
-    await call(settings(tmp_path), "dispatch_to", {"executor": "codex", "task": "fix", "cwd": "."})
-    assert '"executor":"codex"' in request.calls[0].request.content.decode()
+    await call(settings(tmp_path), "dispatch_to", {"executor": "omp", "task": "fix", "cwd": "."})
+    assert '"executor":"omp"' in request.calls[0].request.content.decode()
 
 
 @pytest.mark.asyncio
@@ -246,7 +246,7 @@ async def test_status_wait_seconds_is_sent_to_daemon(tmp_path):
 @respx.mock
 async def test_route_output(tmp_path):
     payload = {
-        "executor": "codex",
+        "executor": "omp",
         "confidence": 0.9,
         "scores": {},
         "router": "fallback",
@@ -266,7 +266,7 @@ async def test_route_output(tmp_path):
     respx.post("http://127.0.0.1:7433/route").mock(return_value=httpx.Response(200, json=payload))
     r = await call(settings(tmp_path), "route", {"task": "fix", "cwd": "."})
     text = r.content[0].text
-    assert "executor: codex" in text
+    assert "executor: omp" in text
     assert "route: fallback · strong · 0.9 fallback (reason: router_unavailable)" in text
     assert "notes: fallback selected" in text
     assert '"judgments"' not in text
@@ -352,22 +352,22 @@ async def test_executors_tool_names_who_is_out_of_limits_and_review_only(tmp_pat
     rows = [
         _executor_row("claude/opus", "claude", cooldown=weekly, available=False),
         _executor_row("claude/haiku", "claude", cooldown=weekly, available=False),
-        _executor_row("codex/sol", "codex"),
-        _executor_row("opencode/kimi", "opencode", available=False, error="not installed"),
-        _executor_row("codex/off", "codex", enabled=False),
+        _executor_row("omp/sol", "omp"),
+        _executor_row("omp/kimi", "omp", available=False, error="not installed"),
+        _executor_row("omp/off", "omp", enabled=False),
     ]
     respx.get("http://127.0.0.1:7433/executors").mock(return_value=httpx.Response(200, json=rows))
     text = (await call(settings(tmp_path), "executors", {})).content[0].text
     lines = text.splitlines()
-    assert lines[0] == "available: codex/sol"
+    assert lines[0] == "available: omp/sol"
     assert (
         lines[1].startswith("out until 2026-10-03T")
         and "(quota): claude/opus, claude/haiku" in (lines[1])
     )
     assert "weekly limit" in lines[1]
-    assert lines[2] == "unavailable: opencode/kimi (not installed)"
+    assert lines[2] == "unavailable: omp/kimi (not installed)"
     assert lines[3] == "review only from omp (kind='review'): claude/opus, claude/haiku"
-    assert "codex/off" not in text
+    assert "omp/off" not in text
 
 
 @pytest.mark.asyncio

@@ -42,7 +42,7 @@ def make_task(
 
 
 def decision() -> RouteDecision:
-    return RouteDecision(executor="codex", confidence=0.9, scores={"codex": 0.9}, router="jev")
+    return RouteDecision(executor="omp", confidence=0.9, scores={"omp": 0.9}, router="jev")
 
 
 @pytest.fixture
@@ -74,9 +74,7 @@ async def test_insert_get_round_trip(storage: Storage):
     task = task.model_copy(
         update={
             "decision": decision(),
-            "result": ExecutionResult(
-                status="completed", executor="codex", model="m", summary="ok"
-            ),
+            "result": ExecutionResult(status="completed", executor="omp", model="m", summary="ok"),
         }
     )
     await storage.insert_task(task)
@@ -94,7 +92,7 @@ async def test_update_changes_status_result_and_duration(storage: Storage):
             # уедет сырая строка.
             "status": TaskStatus.completed,
             "result": ExecutionResult(
-                status="completed", executor="codex", model=None, summary="done"
+                status="completed", executor="omp", model=None, summary="done"
             ),
             "started_at": start,
             "finished_at": finish,
@@ -156,8 +154,8 @@ async def test_list_tasks_since_and_limit(storage: Storage):
 async def test_add_decision_addressed_and_unaddressed(storage: Storage):
     task = make_task()
     await storage.insert_task(task)
-    first = await storage.add_decision(None, decision(), ["codex"])
-    second = await storage.add_decision(task.task_id, decision(), ["codex", "claude"])
+    first = await storage.add_decision(None, decision(), ["omp"])
+    second = await storage.add_decision(task.task_id, decision(), ["omp", "claude"])
     assert first == 1 and second == 2
 
 
@@ -174,13 +172,13 @@ async def test_add_event_and_list_in_order(storage: Storage):
 async def test_export_includes_tasks_decisions_events_and_route_only(storage: Storage):
     task = make_task()
     await storage.insert_task(task)
-    await storage.add_decision(task.task_id, decision(), ["codex"])
+    await storage.add_decision(task.task_id, decision(), ["omp"])
     await storage.add_event(task.task_id, "spawn", {"ok": True})
     await storage.add_decision(None, decision(), ["claude"])
     rows = [row async for row in storage.export()]
     assert len(rows) == 2
     assert rows[0]["task"]["task_id"] == task.task_id
-    assert rows[0]["decision"]["executor"] == "codex"
+    assert rows[0]["decision"]["executor"] == "omp"
     assert rows[0]["events"][0]["kind"] == "spawn"
     assert rows[1]["task"] is None
 
@@ -234,7 +232,7 @@ async def test_cooldowns_survive_reopen_and_expire(tmp_path):
         until=now + timedelta(hours=5),
     )
     await first.save_cooldown(
-        "codex", kind="network", detail="x", origin="codex", until=now - timedelta(seconds=1)
+        "omp", kind="network", detail="x", origin="omp", until=now - timedelta(seconds=1)
     )
     await first.close()
 

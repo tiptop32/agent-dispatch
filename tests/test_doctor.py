@@ -574,7 +574,7 @@ async def test_jev_check_calls_router_online(tmp_config_dir):
 @pytest.mark.asyncio
 @respx.mock
 async def test_claude_local_backend_does_not_require_jev_or_call_it(tmp_config_dir):
-    # Фейковый роутер возвращает omp/sol: codex в дефолтных исполнителях больше не существует.
+    # Фейковый роутер возвращает omp/sol: старый исполнитель codex/sol из дефолтов удалён.
     claude = Path(__file__).parent / "fakes" / "claude_router_ok_omp.sh"
     settings = _configure(tmp_config_dir, backend="claude_local", claude_command=str(claude))
     _mock_health(settings, _state())

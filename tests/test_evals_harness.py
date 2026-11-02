@@ -20,8 +20,8 @@ def test_load_cases_has_twenty_rows_and_required_fields():
     assert len(cases) == 20
     assert {case["expected_executor"] for case in cases} == {
         "claude",
-        "codex",
-        "opencode/kimi",
+        "omp",
+        "omp/kimi",
     }
     assert all(case["task"] and case["rationale"] for case in cases)
 
@@ -72,9 +72,9 @@ def test_score_empty_is_zero():
 
 
 def test_render_contains_accuracy_and_matrix():
-    output = render(score([{"expected": "claude", "got": "codex", "latency_ms": 3}]))
+    output = render(score([{"expected": "claude", "got": "omp", "latency_ms": 3}]))
     assert "accuracy: 0.0%" in output
-    assert "claude" in output and "codex=1" in output
+    assert "claude" in output and "omp=1" in output
 
 
 def test_threshold_can_fail():
@@ -232,7 +232,7 @@ def test_routing_daemon_uses_client(tmp_path, tmp_config_dir, monkeypatch):
                 "context": "",
                 "files": [],
                 "constraints": [],
-                "expected_executor": "codex",
+                "expected_executor": "omp",
                 "rationale": "test",
             }
         )
@@ -252,7 +252,7 @@ def test_routing_daemon_uses_client(tmp_path, tmp_config_dir, monkeypatch):
 
         async def route(self, request):
             calls.append(("route", request.task))
-            return RouteDecision(executor="codex", confidence=1, scores={}, router=RouterKind.jev)
+            return RouteDecision(executor="omp", confidence=1, scores={}, router=RouterKind.jev)
 
     async def daemon(settings):
         calls.append(("daemon", None))

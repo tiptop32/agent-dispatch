@@ -1,7 +1,8 @@
-"""Codex не отдаёт Claude работу, только ревью; ревью идёт в режиме только чтения.
+"""omp не отдаёт Claude работу, только ревью; ревью идёт в режиме только чтения.
 
-Телеметрия 22 сентября - 2 октября: Codex отдал claude/opus 50 задач, 21 упала,
-в основном на лимитах. Цель правила `routing.review_only` в экономии токенов Claude.
+Телеметрия 22 сентября - 2 октября: задачи исполнителей уходили claude/opus
+50 раз, 21 упала, в основном на лимитах. Цель правила `routing.review_only`
+в экономии токенов Claude.
 """
 
 from __future__ import annotations
@@ -23,8 +24,6 @@ from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.dispatch.task_package import build_task_package, render_prompt
 from agent_dispatch.executors.base import RunContext, strip_flags
 from agent_dispatch.executors.claude import ClaudeAdapter
-from agent_dispatch.executors.codex import CodexAdapter
-from agent_dispatch.executors.opencode import OpenCodeAdapter
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import DispatchRequest, ExecutionResult, RouteDecision, RouterKind
 from agent_dispatch.telemetry.storage import Storage
@@ -53,15 +52,15 @@ class CapturingRouter(FakeRouter):
 def _settings(tmp_path: Path, **routing) -> Settings:
     return Settings(
         server=ServerSettings(data_dir=tmp_path),
-        routing=RoutingSettings(fallback_executor="codex/sol", **routing),
+        routing=RoutingSettings(fallback_executor="omp/kimi", **routing),
         execution=ExecutionSettings(workspace_mode="worktree"),
         executors={
             "claude/opus": ExecutorSettings(adapter="claude", model="opus"),
-            "codex/sol": ExecutorSettings(adapter="codex", model="sol"),
-            "opencode/a": ExecutorSettings(adapter="opencode", model="x5/a"),
-            "opencode/b": ExecutorSettings(adapter="opencode", model="x5/b"),
+            "omp/kimi": ExecutorSettings(adapter="omp", model="agent-lb/luna"),
+            "omp/a": ExecutorSettings(adapter="omp", model="x5/a"),
+            "omp/b": ExecutorSettings(adapter="omp", model="x5/b"),
         },
-        escalation={"opencode/a": ["claude/opus", "opencode/b"]},
+        escalation={"omp/a": ["claude/opus", "omp/b"]},
     )
 
 
@@ -133,9 +132,22 @@ def test_review_only_still_accepts_codex_as_a_source():
 async def test_router_never_offers_claude_for_omp_work(tmp_path, git_repo):
     _, adapters, router, dispatcher = await _make(tmp_path)
     done = await _run(dispatcher, _req(git_repo, source="omp"))
-    # claude/opus вне выбора по review_only, остальные доступны.
-    assert router.candidates == [["codex/sol", "opencode/a", "opencode/b"]]
-    assert done.status == "completed" and adapters["claude/opus"].calls == []
+    # claude/opus вне выбора по review_only, пул omp исключён как
+    # само-делегирование: кандидатов не остаётся, задача падает закрыто.
+    assert router.candidates == []
+    assert done.status == "failed" and done.result.meta["guard"] == "unavailable"
+    assert all(adapter.calls == [] for adapter in adapters.values())
+
+
+@pytest.mark.asyncio
+async def test_empty_review_only_sends_omp_work_to_claude(tmp_path, git_repo):
+    # Без правила review_only единственным кандидатом для omp-работы остаётся
+    # claude: пул omp всё ещё закрыт само-делегированием. Один кандидат —
+    # роутер не нужен, задача уходит на claude напрямую.
+    _, adapters, router, dispatcher = await _make(tmp_path, review_only={})
+    done = await _run(dispatcher, _req(git_repo, source="omp"))
+    assert router.candidates == []
+    assert done.status == "completed" and len(adapters["claude/opus"].calls) == 1
 
 
 @pytest.mark.asyncio
@@ -148,7 +160,7 @@ async def test_explicit_claude_for_omp_work_is_refused_without_a_run(tmp_path, g
 
 
 @pytest.mark.asyncio
-async def test_codex_may_ask_claude_for_a_read_only_review_of_the_working_copy(tmp_path, git_repo):
+async def test_omp_may_ask_claude_for_a_read_only_review_of_the_working_copy(tmp_path, git_repo):
     storage, adapters, _, dispatcher = await _make(tmp_path)
     done = await _run(dispatcher, _req(git_repo, executor="claude/opus", kind="review"))
 
@@ -166,18 +178,18 @@ async def test_codex_may_ask_claude_for_a_read_only_review_of_the_working_copy(t
 async def test_review_through_the_router_may_pick_claude(tmp_path, git_repo):
     _, _, router, dispatcher = await _make(tmp_path)
     await _run(dispatcher, _req(git_repo, kind="review"))
-    assert router.candidates == [["claude/opus", "opencode/a", "opencode/b"]]
+    assert router.candidates == [["claude/opus", "omp/a", "omp/b", "omp/kimi"]]
 
 
 @pytest.mark.asyncio
 async def test_escalation_of_omp_work_skips_claude(tmp_path, git_repo):
-    failed = ExecutionResult(status="failed", executor="opencode/a", model=None, summary="")
-    storage, adapters, _, dispatcher = await _make(tmp_path, {"opencode/a": failed})
-    first = await dispatcher.submit(_req(git_repo, source="omp", executor="opencode/a"))
+    failed = ExecutionResult(status="failed", executor="omp/a", model=None, summary="")
+    storage, adapters, _, dispatcher = await _make(tmp_path, {"omp/a": failed})
+    first = await dispatcher.submit(_req(git_repo, source="omp", executor="omp/a"))
     await dispatcher.wait(first.task_id, WAIT)
     events = await storage.list_events(first.task_id)
     escalate = next(event["payload"] for event in events if event["kind"] == "escalate")
-    assert escalate["to"] == "opencode/b"
+    assert escalate["to"] == "omp/b"
     assert adapters["claude/opus"].calls == []
 
 
@@ -189,7 +201,7 @@ async def test_other_sources_still_give_claude_work(tmp_path, git_repo):
 
 
 @pytest.mark.asyncio
-async def test_empty_rule_lets_codex_give_claude_work(tmp_path, git_repo):
+async def test_empty_rule_lets_any_source_give_claude_work(tmp_path, git_repo):
     _, adapters, _, dispatcher = await _make(tmp_path, review_only={})
     done = await _run(dispatcher, _req(git_repo, executor="claude/opus"))
     assert done.status == "completed" and len(adapters["claude/opus"].calls) == 1
@@ -216,12 +228,12 @@ async def test_review_that_edits_files_is_reported(tmp_path, git_repo):
 async def test_root_review_starts_while_coding_slots_are_saturated(tmp_path, git_repo):
     # Долгие корневые задачи (2 из 2 слотов) не должны оставлять ревью без слота.
     _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
-    coding = _blocked(adapters, "opencode/a")
+    coding = _blocked(adapters, "omp/a")
     # Ревьюер тоже держится гейтом: иначе он завершается до своего cancel и
     # тест зависит от того, сколько длится отмена задач перед ним.
     reviewer = _blocked(adapters, "claude/opus")
-    first = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
-    second = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
+    first = await dispatcher.submit(_req(git_repo, executor="omp/a"))
+    second = await dispatcher.submit(_req(git_repo, executor="omp/a"))
     review = await dispatcher.submit(_req(git_repo, executor="claude/opus", kind="review"))
     await _wait_started(coding)
     # Ревью стартует, пока оба задачных слота заняты заблокированными задачами.
@@ -235,9 +247,9 @@ async def test_excess_root_review_queues_in_its_own_capacity(tmp_path, git_repo)
     # Ёмкость ревью 1: второе ревью ждёт, даже когда свободен слот задачи.
     _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
     reviewer = _blocked(adapters, "claude/opus")
-    waiting = _blocked(adapters, "opencode/a")
+    waiting = _blocked(adapters, "omp/a")
     first = await dispatcher.submit(_req(git_repo, executor="claude/opus", kind="review"))
-    second = await dispatcher.submit(_req(git_repo, executor="opencode/a", kind="review"))
+    second = await dispatcher.submit(_req(git_repo, executor="omp/a", kind="review"))
     await _wait_started(reviewer)
     with pytest.raises(asyncio.TimeoutError):
         # Ревью не может стартовать при занятой ревью-ёмкости; короткий предел
@@ -255,11 +267,11 @@ async def test_excess_root_review_queues_in_its_own_capacity(tmp_path, git_repo)
 @pytest.mark.asyncio
 async def test_cancelled_coding_task_releases_its_slot(tmp_path, git_repo):
     _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
-    coding = _blocked(adapters, "opencode/a")
-    queued = _blocked(adapters, "opencode/b")
-    first = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
-    second = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
-    third = await dispatcher.submit(_req(git_repo, executor="opencode/b"))
+    coding = _blocked(adapters, "omp/a")
+    queued = _blocked(adapters, "omp/b")
+    first = await dispatcher.submit(_req(git_repo, executor="omp/a"))
+    second = await dispatcher.submit(_req(git_repo, executor="omp/a"))
+    third = await dispatcher.submit(_req(git_repo, executor="omp/b"))
     await _wait_started(coding)
     assert not queued.started.is_set()
     await dispatcher.cancel(first.task_id)
@@ -273,11 +285,11 @@ async def test_cancelled_coding_task_releases_its_slot(tmp_path, git_repo):
 async def test_cancelled_review_releases_review_capacity(tmp_path, git_repo):
     _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
     reviewer = _blocked(adapters, "claude/opus")
-    waiting = _blocked(adapters, "opencode/a")
+    waiting = _blocked(adapters, "omp/a")
     first = await dispatcher.submit(_req(git_repo, executor="claude/opus", kind="review"))
-    second = await dispatcher.submit(_req(git_repo, executor="opencode/a", kind="review"))
-    coding = _blocked(adapters, "codex/sol")
-    filler = await dispatcher.submit(_req(git_repo, executor="codex/sol"))
+    second = await dispatcher.submit(_req(git_repo, executor="omp/a", kind="review"))
+    coding = _blocked(adapters, "omp/kimi")
+    filler = await dispatcher.submit(_req(git_repo, executor="omp/kimi"))
     await _wait_started(reviewer)
     assert not waiting.started.is_set()
     await dispatcher.cancel(first.task_id)
@@ -295,16 +307,16 @@ async def test_nested_work_bypasses_both_capacities(tmp_path, git_repo):
     # Вложенная работа (hop > 0) не ждёт ни пул: иначе исполнитель в подзадаче
     # ждал бы слот, занятый его же родителем, — взаимная блокировка.
     _, adapters, _, dispatcher = await _capacity(tmp_path, tasks=2, reviews=1)
-    coding = _blocked(adapters, "opencode/a")
+    coding = _blocked(adapters, "omp/a")
     reviewer = _blocked(adapters, "claude/opus")
-    parent = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
-    filler = await dispatcher.submit(_req(git_repo, executor="opencode/a"))
+    parent = await dispatcher.submit(_req(git_repo, executor="omp/a"))
+    filler = await dispatcher.submit(_req(git_repo, executor="omp/a"))
     review = await dispatcher.submit(_req(git_repo, executor="claude/opus", kind="review"))
     await _wait_started(coding)
     await _wait_started(reviewer)
-    nested = _blocked(adapters, "opencode/b")
+    nested = _blocked(adapters, "omp/b")
     child = await dispatcher.submit(
-        _req(git_repo, executor="opencode/b", hop=1, parent_task_id=parent.task_id)
+        _req(git_repo, executor="omp/b", hop=1, parent_task_id=parent.task_id)
     )
     await _wait_started(nested)
     for task_id in (filler.task_id, review.task_id, child.task_id):
@@ -370,41 +382,6 @@ async def test_claude_review_runs_with_read_only_tools(git_repo, tmp_path):
     assert args[args.index("--effort") + 1] == "high"
 
 
-@pytest.mark.asyncio
-async def test_codex_review_runs_in_the_read_only_sandbox(git_repo, tmp_path):
-    cap = tmp_path / "cap"
-    adapter = CodexAdapter(
-        "codex/sol",
-        ExecutorSettings(
-            adapter="codex",
-            command=str(ROOT / "fakes/codex_ok.sh"),
-            extra_args=["--sandbox", "workspace-write"],
-        ),
-    )
-    await adapter.execute(_ctx(git_repo, tmp_path, cap))
-    args = (tmp_path / "cap.argv").read_text().splitlines()
-    # Codex отвергает повтор флага, поэтому из конфига он убран, а не перекрыт.
-    assert args.count("--sandbox") == 1
-    assert args[args.index("--sandbox") + 1] == "read-only"
-
-
-@pytest.mark.asyncio
-async def test_opencode_review_runs_with_the_plan_agent(git_repo, tmp_path):
-    cap = tmp_path / "cap"
-    adapter = OpenCodeAdapter(
-        "opencode/a",
-        ExecutorSettings(
-            adapter="opencode",
-            command=str(ROOT / "fakes/opencode_ok.sh"),
-            model="x5/a",
-            extra_args=["--agent", "build"],
-        ),
-    )
-    await adapter.execute(_ctx(git_repo, tmp_path, cap))
-    args = (tmp_path / "cap.argv").read_text().splitlines()
-    assert args.count("--agent") == 1 and args[args.index("--agent") + 1] == "plan"
-
-
 def test_review_prompt_forbids_edits_and_delegation(tmp_path, git_repo):
     settings = _settings(tmp_path)
     req = _req(git_repo, kind="review")
@@ -448,29 +425,29 @@ def test_review_diff_is_capped(tmp_path, git_repo, monkeypatch):
 
 
 def test_low_confidence_scores_cannot_smuggle_in_an_excluded_executor(tmp_path):
-    # Ревью Codex: claude_local отдаёт оценки и за пределами кандидатов. При
+    # Ревью omp: claude_local отдаёт оценки и за пределами кандидатов. При
     # низкой уверенности и fallback вне кандидатов победил бы claude/opus.
     from agent_dispatch.routing.guards import post_guards
 
     settings = _settings(tmp_path)
     decision = RouteDecision(
-        executor="opencode/a",
+        executor="omp/a",
         confidence=0.2,
-        scores={"opencode/a": 0.2, "claude/opus": 0.9},
+        scores={"omp/a": 0.2, "claude/opus": 0.9},
         router=RouterKind.claude_local,
     )
-    final, _ = post_guards(decision, settings, ["opencode/a", "opencode/b"])
-    assert final.executor == "opencode/a"
+    final, _ = post_guards(decision, settings, ["omp/a", "omp/b"])
+    assert final.executor == "omp/a"
 
     outside = decision.model_copy(update={"executor": "claude/opus", "confidence": 0.95})
-    final, events = post_guards(outside, settings, ["opencode/a", "opencode/b"])
-    assert final.executor == "opencode/a"
+    final, events = post_guards(outside, settings, ["omp/a", "omp/b"])
+    assert final.executor == "omp/a"
     assert any("non-candidate: claude/opus" in event.detail for event in events)
 
 
 @pytest.mark.asyncio
 async def test_review_that_rewrites_an_already_dirty_file_is_reported(tmp_path, git_repo):
-    # Ревью Codex: файл был грязным до ревью, набор грязных путей не изменился.
+    # Ревью omp: файл был грязным до ревью, набор грязных путей не изменился.
     dirty = next(path for path in git_repo.iterdir() if path.is_file() and path.suffix)
     dirty.write_text("caller's uncommitted edit\n")
 
@@ -493,21 +470,21 @@ async def test_clean_review_has_no_warning(tmp_path, git_repo):
 
 @pytest.mark.asyncio
 async def test_executor_child_reports_itself_as_the_source(tmp_path, git_repo):
-    # Ревью Codex: MCP-прокси внутри codex иначе унаследовал бы источник демона.
+    # Ревью omp: MCP-прокси внутри omp иначе унаследовал бы источник демона.
     _, adapters, _, dispatcher = await _make(tmp_path)
-    await _run(dispatcher, _req(git_repo, source="claude", executor="codex/sol"))
+    await _run(dispatcher, _req(git_repo, source="claude", executor="omp/kimi"))
     await _run(dispatcher, _req(git_repo, source="cli", executor="claude/opus"))
-    assert adapters["codex/sol"].calls[0].env["AGENT_DISPATCH_SOURCE_AGENT"] == "codex"
+    assert adapters["omp/kimi"].calls[0].env["AGENT_DISPATCH_SOURCE_AGENT"] == "omp"
     assert adapters["claude/opus"].calls[0].env["AGENT_DISPATCH_SOURCE_AGENT"] == "claude"
 
 
 @pytest.mark.asyncio
 async def test_review_that_changed_the_working_copy_is_not_escalated(tmp_path, git_repo):
     wrote = ExecutionResult(
-        status="failed", executor="opencode/a", model=None, summary="", changed_files=["a.py"]
+        status="failed", executor="omp/a", model=None, summary="", changed_files=["a.py"]
     )
-    storage, adapters, _, dispatcher = await _make(tmp_path, {"opencode/a": wrote})
-    done = await _run(dispatcher, _req(git_repo, executor="opencode/a", kind="review"))
+    storage, adapters, _, dispatcher = await _make(tmp_path, {"omp/a": wrote})
+    done = await _run(dispatcher, _req(git_repo, executor="omp/a", kind="review"))
     assert done.result.meta["warning"] == "review changed files: a.py"
     assert "escalated_to" not in done.result.meta
-    assert adapters["opencode/b"].calls == [] and len(await storage.list_tasks()) == 1
+    assert adapters["omp/b"].calls == [] and len(await storage.list_tasks()) == 1

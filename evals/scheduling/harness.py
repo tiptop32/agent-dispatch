@@ -52,9 +52,9 @@ from agent_dispatch.telemetry.storage import Storage
 
 WAIT = 10.0
 NEGATIVE_WAIT = 0.1
-CODEX = "codex/sol"
+OMP = "omp/sol"
 CLAUDE = "claude/opus"
-KIMI = "opencode/kimi"
+KIMI = "omp/kimi"
 
 
 @dataclass
@@ -92,12 +92,12 @@ class GatedAdapter:
 
 
 class RoleRouter:
-    """Детерминизм без решения модели: задачи — codex, ревью — claude."""
+    """Детерминизм без решения модели: задачи — omp, ревью — claude."""
 
     name = "role"
 
     async def decide(self, req: Any, candidates: list[str]) -> RouteDecision:
-        wanted = CLAUDE if req.kind == "review" else CODEX
+        wanted = CLAUDE if req.kind == "review" else OMP
         name = wanted if wanted in candidates else sorted(candidates)[0]
         return RouteDecision(
             executor=name, confidence=1.0, scores={name: 1.0}, router=RouterKind.jev
@@ -123,7 +123,7 @@ class SchedulingLab:
         self.max_per_group = max_per_group
         self.repos: list[Path] = []
         self.adapters: dict[str, GatedAdapter] = {
-            name: GatedAdapter(name) for name in (CODEX, CLAUDE, KIMI)
+            name: GatedAdapter(name) for name in (OMP, CLAUDE, KIMI)
         }
         self.settings = Settings(
             server=ServerSettings(
@@ -132,12 +132,13 @@ class SchedulingLab:
                 max_concurrent_reviews=max_reviews,
                 max_concurrent_per_group=max_per_group,
             ),
-            routing=RoutingSettings(fallback_executor=CODEX),
+            routing=RoutingSettings(fallback_executor=OMP),
             execution=ExecutionSettings(workspace_mode="in_place"),
             executors={
-                CODEX: ExecutorSettings(adapter="codex"),
+                OMP: ExecutorSettings(adapter="omp", model="x5/sol"),
                 CLAUDE: ExecutorSettings(adapter="claude"),
-                KIMI: ExecutorSettings(adapter="opencode", model="x5/kimi"),
+                # Другая группа лимитов: у omp группу задаёт провайдер модели.
+                KIMI: ExecutorSettings(adapter="omp", model="kimi/k2"),
             },
         )
 
@@ -287,15 +288,15 @@ async def scenario_review_unblocked(root: Path) -> Verdict:
     reasons: list[str] = []
     async with SchedulingLab(root, max_tasks=2, max_reviews=1) as lab:
         repo = lab.repo()
-        first = await lab.submit(lab.req(repo, executor=CODEX))
-        second = await lab.submit(lab.req(repo, executor=CODEX))
+        first = await lab.submit(lab.req(repo, executor=OMP))
+        second = await lab.submit(lab.req(repo, executor=OMP))
         review = await lab.submit(lab.req(repo, kind="review", executor=CLAUDE))
-        await lab.wait_started(CODEX)
+        await lab.wait_started(OMP)
         await asyncio.wait_for(lab.adapters[CLAUDE].started.wait(), WAIT)
         if lab.adapters[CLAUDE].inflight != 1:
             reasons.append("root review did not run while coding slots were saturated")
-        if lab.adapters[CODEX].peak > 2:
-            reasons.append(f"coding peak {lab.adapters[CODEX].peak} exceeded limit 2")
+        if lab.adapters[OMP].peak > 2:
+            reasons.append(f"coding peak {lab.adapters[OMP].peak} exceeded limit 2")
         await lab.drain()
         reasons.extend(await lab.leaks())
         del first, second, review
@@ -306,19 +307,19 @@ async def scenario_limit_groups_under_global_ceiling(root: Path) -> Verdict:
     """Свободная группа стартует, занятая ждёт, общий потолок не превышен."""
     reasons: list[str] = []
     async with SchedulingLab(root, max_tasks=3, max_per_group=2) as lab:
-        codex_a = await lab.submit(lab.req(lab.repo(), executor=CODEX))
-        codex_b = await lab.submit(lab.req(lab.repo(), executor=CODEX))
-        await lab.wait_calls(CODEX, 2)
+        omp_a = await lab.submit(lab.req(lab.repo(), executor=OMP))
+        omp_b = await lab.submit(lab.req(lab.repo(), executor=OMP))
+        await lab.wait_calls(OMP, 2)
 
-        waiting_group = await lab.submit(lab.req(lab.repo(), executor=CODEX))
+        waiting_group = await lab.submit(lab.req(lab.repo(), executor=OMP))
         async with asyncio.timeout(WAIT):
             while (await lab.storage.get_task(waiting_group)).decision is None:  # noqa: ASYNC110
                 await asyncio.sleep(0)
 
         kimi = await lab.submit(lab.req(lab.repo(), executor=KIMI))
         await lab.wait_started(KIMI)
-        if lab.adapters[CODEX].calls != 2 or lab.adapters[KIMI].calls != 1:
-            reasons.append("free limit group did not start beside saturated codex group")
+        if lab.adapters[OMP].calls != 2 or lab.adapters[KIMI].calls != 1:
+            reasons.append("free limit group did not start beside saturated omp group")
 
         waiting_global = await lab.submit(lab.req(lab.repo(), executor=CLAUDE))
         if not await lab.never_started(CLAUDE):
@@ -328,11 +329,11 @@ async def scenario_limit_groups_under_global_ceiling(root: Path) -> Verdict:
         if not await lab.never_started(CLAUDE):
             reasons.append("cancelled group waiter released a slot it did not hold")
 
-        await lab.dispatcher.cancel(codex_a)
+        await lab.dispatcher.cancel(omp_a)
         await lab.wait_started(CLAUDE)
         await lab.drain()
         reasons.extend(await lab.leaks())
-        del codex_b, kimi, waiting_global
+        del omp_b, kimi, waiting_global
     return Verdict("limit_groups_under_global_ceiling", not reasons, reasons)
 
 
@@ -360,10 +361,10 @@ async def scenario_cancellation_releases_capacity(root: Path) -> Verdict:
     reasons: list[str] = []
     async with SchedulingLab(root, max_tasks=2, max_reviews=1) as lab:
         repo = lab.repo()
-        a = await lab.submit(lab.req(repo, executor=CODEX))
-        b = await lab.submit(lab.req(repo, executor=CODEX))
+        a = await lab.submit(lab.req(repo, executor=OMP))
+        b = await lab.submit(lab.req(repo, executor=OMP))
         review = await lab.submit(lab.req(repo, kind="review", executor=CLAUDE))
-        await lab.wait_started(CODEX)
+        await lab.wait_started(OMP)
         await lab.wait_started(CLAUDE)
         queued_review = await lab.submit(lab.req(repo, kind="review", executor=KIMI))
         if not await lab.never_started(KIMI):
@@ -375,8 +376,8 @@ async def scenario_cancellation_releases_capacity(root: Path) -> Verdict:
             reasons.append("cancelled coding task wrongly released review capacity")
         await lab.dispatcher.cancel(review)
         await asyncio.wait_for(lab.adapters[KIMI].started.wait(), WAIT)
-        lab.adapters[CODEX].gate.set()
-        third = await lab.submit(lab.req(repo, executor=CODEX))
+        lab.adapters[OMP].gate.set()
+        third = await lab.submit(lab.req(repo, executor=OMP))
         await lab.dispatcher.wait(third, WAIT)
         record = await lab.storage.get_task(third)
         if not record or record.status != "completed":
@@ -393,17 +394,17 @@ async def scenario_nested_bypass(root: Path) -> Verdict:
     reasons: list[str] = []
     async with SchedulingLab(root, max_tasks=2, max_reviews=1) as lab:
         repo = lab.repo()
-        parent = await lab.submit(lab.req(repo, executor=CODEX))
-        await lab.submit(lab.req(repo, executor=CODEX))
+        parent = await lab.submit(lab.req(repo, executor=OMP))
+        await lab.submit(lab.req(repo, executor=OMP))
         await lab.submit(lab.req(repo, kind="review", executor=CLAUDE))
-        await lab.wait_started(CODEX)
+        await lab.wait_started(OMP)
         await lab.wait_started(CLAUDE)
         nested = await lab.submit(lab.req(repo, hop=1, parent=parent))
         deadline = WAIT
-        while lab.adapters[CODEX].calls < 2 and deadline > 0:
+        while lab.adapters[OMP].calls < 2 and deadline > 0:
             await asyncio.sleep(0.05)
             deadline -= 0.05
-        if lab.adapters[CODEX].calls < 2:
+        if lab.adapters[OMP].calls < 2:
             reasons.append("nested work was blocked by root pools")
         await lab.drain()
         reasons.extend(await lab.leaks())
@@ -441,8 +442,8 @@ async def scenario_stress(root: Path, seed: int, rounds: int = 12) -> Verdict:
             reasons.append(
                 f"starvation: {completed} completed, expected {len(submitted) - cancelled}"
             )
-        if lab.adapters[CODEX].peak > lab.max_tasks:
-            reasons.append(f"coding peak {lab.adapters[CODEX].peak} exceeded {lab.max_tasks}")
+        if lab.adapters[OMP].peak > lab.max_tasks:
+            reasons.append(f"coding peak {lab.adapters[OMP].peak} exceeded {lab.max_tasks}")
         if lab.adapters[CLAUDE].peak > lab.max_reviews:
             reasons.append(f"review peak {lab.adapters[CLAUDE].peak} exceeded {lab.max_reviews}")
     return Verdict(f"stress_race_seed_{seed}", not reasons, reasons)
@@ -456,13 +457,13 @@ async def scenario_queue_fallback(root: Path) -> Verdict:
         lab.settings.routing.corporate_perimeter = False
         lab.settings.executors[CLAUDE].tier = "strong"
         first = await lab.submit(lab.req(lab.repo()))
-        await lab.wait_started(CODEX)
+        await lab.wait_started(OMP)
         overflow = await lab.submit(lab.req(lab.repo()))
         await lab.wait_started(KIMI)
         record = await lab.storage.get_task(overflow)
         if record.decision.executor != KIMI:
             reasons.append("overflow did not persist the effective executor")
-        if lab.adapters[CODEX].calls != 1 or lab.adapters[KIMI].calls != 1:
+        if lab.adapters[OMP].calls != 1 or lab.adapters[KIMI].calls != 1:
             reasons.append("overflow executed more than once or displaced preferred")
         if lab.adapters[CLAUDE].calls:
             reasons.append("overflow changed capability tier")
@@ -475,9 +476,9 @@ async def scenario_queue_fallback(root: Path) -> Verdict:
         await lab.dispatcher.cancel(first)
         # Exercise the same pools again after cancellation, then drain them.
         next_task = await lab.submit(lab.req(lab.repo()))
-        await lab.wait_calls(CODEX, 2)
+        await lab.wait_calls(OMP, 2)
         await lab.drain()
-        if (await lab.storage.get_task(next_task)).result.executor != CODEX:
+        if (await lab.storage.get_task(next_task)).result.executor != OMP:
             reasons.append("preferred did not recover after cancellation")
         reasons.extend(await lab.leaks())
     return Verdict("queue_fallback_equivalent_capacity", not reasons, reasons)

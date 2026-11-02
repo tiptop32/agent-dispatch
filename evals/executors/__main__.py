@@ -8,7 +8,7 @@ from .harness import load_cases, render, replay
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Replay OpenCode headless adapter corpus")
+    parser = argparse.ArgumentParser(description="Replay omp adapter corpus")
     parser.add_argument(
         "--corpus",
         type=Path,

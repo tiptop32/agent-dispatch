@@ -22,8 +22,7 @@ from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.dispatch.followup import FollowupError, continued_link
 from agent_dispatch.executors.base import RunContext
 from agent_dispatch.executors.claude import ClaudeAdapter
-from agent_dispatch.executors.codex import CodexAdapter
-from agent_dispatch.executors.opencode import NO_RESPONSE, OpenCodeAdapter
+from agent_dispatch.executors.omp import OmpAdapter
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     DispatchRequest,
@@ -74,46 +73,6 @@ async def test_claude_resumes_the_given_session(git_repo, tmp_path):
     assert "--session-id" not in argv
 
 
-@pytest.mark.asyncio
-async def test_codex_reports_its_thread_and_resumes_after_exec_flags(git_repo, tmp_path):
-    adapter = CodexAdapter(
-        "codex",
-        ExecutorSettings(
-            adapter="codex", command=str(ROOT / "fakes/codex_ok.sh"), extra_args=["--foo"]
-        ),
-    )
-    first = await adapter.execute(_ctx(git_repo, tmp_path))
-    assert first.meta["session_id"] == "01a0c53c-3863-7162-8e11-6c44760a6e3c"
-    assert "resume" not in _argv(tmp_path)
-
-    await adapter.execute(_ctx(git_repo, tmp_path, resume_session="thread-1"))
-    argv = _argv(tmp_path)
-    # Флаги exec до подкоманды: `--output-schema` и `-o` разбирает сам exec.
-    assert argv[:3] == ["exec", "--json", "-C"]
-    assert argv[-4:] == ["--foo", "resume", "thread-1", "-"]
-
-
-@pytest.mark.asyncio
-async def test_opencode_reports_its_session_and_continues_it(git_repo, tmp_path):
-    adapter = OpenCodeAdapter(
-        "opencode/kimi",
-        ExecutorSettings(
-            adapter="opencode",
-            command=str(ROOT / "fakes/opencode_ok.sh"),
-            model="kimi",
-            extra_args=["--quiet"],
-        ),
-    )
-    first = await adapter.execute(_ctx(git_repo, tmp_path))
-    assert first.meta["session_id"] == "ses_f3ac28112ffeW8DLQORWJlNTsT"
-    assert "--session" not in _argv(tmp_path)
-
-    await adapter.execute(_ctx(git_repo, tmp_path, resume_session="ses_1"))
-    argv = _argv(tmp_path)
-    assert argv[5:7] == ["--session", "ses_1"]
-    assert argv[-3:] == ["--quiet", "--auto", "do task"]
-
-
 # --- диспетчер ---------------------------------------------------------------
 
 
@@ -153,13 +112,13 @@ def _ok(name: str, session: str | None = "s1", summary: str = "did it") -> Execu
 async def _make(tmp_path: Path, *, router: FakeRouter | None = None, **execution):
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path / "data"),
-        routing=RoutingSettings(fallback_executor="codex"),
+        routing=RoutingSettings(fallback_executor="omp"),
         execution=ExecutionSettings(**execution),
         executors={
-            "codex": ExecutorSettings(adapter="codex", description="codex"),
+            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp"),
             "claude": ExecutorSettings(adapter="claude", description="claude"),
         },
-        escalation={"codex": ["claude"]},
+        escalation={"omp": ["claude"]},
     )
     storage = Storage(tmp_path / "db.sqlite")
     await storage.open()
@@ -171,7 +130,7 @@ async def _make(tmp_path: Path, *, router: FakeRouter | None = None, **execution
 
 
 def _req(repo: Path, **kwargs) -> DispatchRequest:
-    return DispatchRequest(task="fix tests", cwd=str(repo), **{"executor": "codex", **kwargs})
+    return DispatchRequest(task="fix tests", cwd=str(repo), **{"executor": "omp", **kwargs})
 
 
 async def _done(dispatcher: Dispatcher, task_id: str):
@@ -181,7 +140,7 @@ async def _done(dispatcher: Dispatcher, task_id: str):
 @pytest.mark.asyncio
 async def test_followup_resumes_the_executor_session_in_place(tmp_path, git_repo):
     _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].results = [_ok("codex", "s1"), _ok("codex", "s1")]
+    adapters["omp"].results = [_ok("omp", "s1"), _ok("omp", "s1")]
     first = await _done(
         dispatcher,
         (
@@ -197,8 +156,8 @@ async def test_followup_resumes_the_executor_session_in_place(tmp_path, git_repo
     assert done.request.task == "also handle None"
     assert done.request.verify == ["true"]  # проверка наследуется
     assert done.request.max_capability == "balanced"
-    assert done.decision.executor == "codex"
-    ctx = adapters["codex"].calls[-1]
+    assert done.decision.executor == "omp"
+    ctx = adapters["omp"].calls[-1]
     assert ctx.resume_session == "s1"
     assert ctx.cwd == str(git_repo)
     assert ctx.prompt.startswith("# Follow-up")
@@ -210,12 +169,12 @@ async def test_followup_resumes_the_executor_session_in_place(tmp_path, git_repo
 @pytest.mark.asyncio
 async def test_followup_without_a_session_carries_the_previous_report(tmp_path, git_repo):
     _, adapters, dispatcher = await _make(tmp_path)
-    failed_check = _ok("codex", None, summary="changed the parser")
+    failed_check = _ok("omp", None, summary="changed the parser")
     failed_check.verification = VerificationInfo(
         result="failed",
         commands=[VerifyCommand(command="pytest -q", exit_code=1, output_tail="E assert 1 == 2")],
     )
-    adapters["codex"].results = [failed_check]
+    adapters["omp"].results = [failed_check]
     first = await _done(
         dispatcher, (await dispatcher.submit(_req(git_repo, allow_escalation=False))).task_id
     )
@@ -223,10 +182,10 @@ async def test_followup_without_a_session_carries_the_previous_report(tmp_path, 
     record = await dispatcher.followup(first.task_id, FollowupRequest(message="fix the test"))
     await _done(dispatcher, record.task_id)
 
-    ctx = adapters["codex"].calls[-1]
+    ctx = adapters["omp"].calls[-1]
     assert ctx.resume_session is None
     assert ctx.prompt.startswith("# Task\nfix the test")
-    assert f"This continues task {first.task_id}, done by codex" in ctx.prompt
+    assert f"This continues task {first.task_id}, done by omp" in ctx.prompt
     assert "Its request: fix tests" in ctx.prompt
     assert "Changed files: a.py" in ctx.prompt
     assert "changed the parser" in ctx.prompt
@@ -236,8 +195,8 @@ async def test_followup_without_a_session_carries_the_previous_report(tmp_path, 
 @pytest.mark.asyncio
 async def test_followup_continues_the_last_link_of_the_escalation_chain(tmp_path, git_repo):
     _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].results = [
-        ExecutionResult(status="failed", executor="codex", model=None, summary="")
+    adapters["omp"].results = [
+        ExecutionResult(status="failed", executor="omp", model=None, summary="")
     ]
     adapters["claude"].results = [_ok("claude", "c1"), _ok("claude", "c1")]
     submitted = await dispatcher.submit(_req(git_repo))
@@ -271,9 +230,9 @@ async def test_followup_refuses_running_unknown_and_never_run_tasks(tmp_path, gi
     async def wait_gate(ctx):
         await gate.wait()
 
-    adapters["codex"].on_execute = wait_gate
+    adapters["omp"].on_execute = wait_gate
     running = await dispatcher.submit(_req(git_repo))
-    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(adapters["omp"].started.wait(), WAIT)
     with pytest.raises(FollowupError, match="is still"):
         await dispatcher.followup(running.task_id, FollowupRequest(message="x"))
     gate.set()
@@ -286,7 +245,7 @@ async def test_followup_refuses_work_that_is_not_in_the_working_copy(tmp_path, g
         (Path(ctx.cwd) / "a.py").write_text("x = 2\n")
 
     _, adapters, dispatcher = await _make(tmp_path, workspace_mode="worktree", integrate="branch")
-    adapters["codex"].on_execute = edit
+    adapters["omp"].on_execute = edit
     first = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
     assert first.result.meta["integrated"] is False
 
@@ -300,11 +259,11 @@ async def test_followup_after_a_worktree_run_goes_in_place_without_resuming(tmp_
         (Path(ctx.cwd) / "a.py").write_text("x = 2\n")
 
     _, adapters, dispatcher = await _make(tmp_path, workspace_mode="worktree")
-    adapters["codex"].on_execute = edit
-    adapters["codex"].results = [_ok("codex", "s1")]
+    adapters["omp"].on_execute = edit
+    adapters["omp"].results = [_ok("omp", "s1")]
     first = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
     assert first.result.meta["integrated"] is True
-    adapters["codex"].on_execute = None
+    adapters["omp"].on_execute = None
 
     record = await dispatcher.followup(first.task_id, FollowupRequest(message="more"))
     done = await _done(dispatcher, record.task_id)
@@ -312,7 +271,7 @@ async def test_followup_after_a_worktree_run_goes_in_place_without_resuming(tmp_
     # Перенесённый, но не закоммиченный результат видно только в рабочей копии,
     # а сессия claude привязана к каталогу дерева, которого больше нет.
     assert done.request.workspace_mode == "in_place"
-    ctx = adapters["codex"].calls[-1]
+    ctx = adapters["omp"].calls[-1]
     assert ctx.cwd == str(git_repo) and ctx.resume_session is None
     assert "# Previous attempt" in ctx.prompt
 
@@ -320,16 +279,16 @@ async def test_followup_after_a_worktree_run_goes_in_place_without_resuming(tmp_
 @pytest.mark.asyncio
 async def test_failed_resume_is_retried_once_from_scratch(tmp_path, git_repo):
     storage, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].results = [
-        _ok("codex", "s1"),
+    adapters["omp"].results = [
+        _ok("omp", "s1"),
         ExecutionResult(
             status="failed",
-            executor="codex",
+            executor="omp",
             model=None,
             summary="",
             error="error: unexpected argument 'resume'",
         ),
-        _ok("codex", "s2"),
+        _ok("omp", "s2"),
     ]
     first = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
     record = await dispatcher.followup(first.task_id, FollowupRequest(message="more"))
@@ -337,7 +296,7 @@ async def test_failed_resume_is_retried_once_from_scratch(tmp_path, git_repo):
 
     assert done.status == TaskStatus.completed
     assert done.result.meta["resume_failed"] is True
-    resumed, fresh = adapters["codex"].calls[-2:]
+    resumed, fresh = adapters["omp"].calls[-2:]
     assert resumed.resume_session == "s1" and fresh.resume_session is None
     assert "# Previous attempt" in fresh.prompt
     events = await storage.list_events(record.task_id)
@@ -353,16 +312,16 @@ async def test_resume_is_not_retried_after_executor_failures_or_real_work(
     tmp_path, git_repo, error
 ):
     _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].results = [
-        _ok("codex", "s1"),
-        ExecutionResult(status="failed", executor="codex", model=None, summary="", error=error),
+    adapters["omp"].results = [
+        _ok("omp", "s1"),
+        ExecutionResult(status="failed", executor="omp", model=None, summary="", error=error),
     ]
     first = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
     record = await dispatcher.followup(
         first.task_id, FollowupRequest(message="more", allow_escalation=False)
     )
     await _done(dispatcher, record.task_id)
-    assert len(adapters["codex"].calls) == 2
+    assert len(adapters["omp"].calls) == 2
 
 
 def _no_block(name: str, session: str | None = "s1") -> ExecutionResult:
@@ -381,9 +340,9 @@ def _no_block(name: str, session: str | None = "s1") -> ExecutionResult:
 @pytest.mark.asyncio
 async def test_missing_report_is_asked_again_in_the_same_session(tmp_path, git_repo):
     storage, adapters, dispatcher = await _make(tmp_path)
-    report = _ok("codex", "s1", summary="added the endpoint")
+    report = _ok("omp", "s1", summary="added the endpoint")
     report.changed_files = []
-    adapters["codex"].results = [_no_block("codex"), report]
+    adapters["omp"].results = [_no_block("omp"), report]
 
     done = await _done(
         dispatcher, (await dispatcher.submit(_req(git_repo, verify=["true"]))).task_id
@@ -394,9 +353,9 @@ async def test_missing_report_is_asked_again_in_the_same_session(tmp_path, git_r
     assert done.result.changed_files == ["a.py"]
     assert done.result.meta["report_recovery"] == "recovered"
     assert done.result.verification.result == "passed"  # verify судит итог после отчёта
-    first, again = adapters["codex"].calls
+    first, again = adapters["omp"].calls
     assert first.resume_session is None and again.resume_session == "s1"
-    assert again.prompt.startswith("# Report") and "structured output schema" in again.prompt
+    assert again.prompt.startswith("# Report") and "```agent-dispatch-result" in again.prompt
     assert again.timeout_seconds == min(300, first.timeout_seconds)
     assert adapters["claude"].calls == []
     events = await storage.list_events(done.task_id)
@@ -414,14 +373,14 @@ async def test_report_recovery_runs_in_the_worktree_of_the_first_run(tmp_path, g
         if ctx.resume_session is None:
             (Path(ctx.cwd) / "a.py").write_text("work\n")
 
-    adapters["codex"].on_execute = touch
-    report = _ok("codex", "s1", summary="added the endpoint")
+    adapters["omp"].on_execute = touch
+    report = _ok("omp", "s1", summary="added the endpoint")
     report.changed_files = []
-    adapters["codex"].results = [_no_block("codex"), report]
+    adapters["omp"].results = [_no_block("omp"), report]
 
     done = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
 
-    first, again = adapters["codex"].calls
+    first, again = adapters["omp"].calls
     assert again.cwd == first.cwd != str(git_repo)
     assert done.status == TaskStatus.completed
     assert done.result.meta["report_recovery"] == "recovered"
@@ -431,13 +390,13 @@ async def test_report_recovery_runs_in_the_worktree_of_the_first_run(tmp_path, g
 @pytest.mark.asyncio
 async def test_failed_report_recovery_leaves_the_work_to_the_caller(tmp_path, git_repo):
     _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].results = [_no_block("codex"), _no_block("codex")]
+    adapters["omp"].results = [_no_block("omp"), _no_block("omp")]
 
     done = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
 
     assert done.status == TaskStatus.partial
     assert done.result.meta["report_recovery"] == "failed: no result block"
-    assert len(adapters["codex"].calls) == 2  # один дозапрос, без цикла
+    assert len(adapters["omp"].calls) == 2  # один дозапрос, без цикла
     assert adapters["claude"].calls == []  # работа есть: не эскалируется
 
 
@@ -445,16 +404,16 @@ async def test_failed_report_recovery_leaves_the_work_to_the_caller(tmp_path, gi
 async def test_executor_failure_in_the_report_recovery_cools_the_executor(tmp_path, git_repo):
     storage, adapters, dispatcher = await _make(tmp_path)
     empty = ExecutionResult(
-        status="failed", executor="codex", model=None, summary="", error=NO_RESPONSE
+        status="failed", executor="omp", model=None, summary="", error=OmpAdapter.NO_RESPONSE
     )
-    adapters["codex"].results = [_no_block("codex"), empty]
+    adapters["omp"].results = [_no_block("omp"), empty]
 
     done = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
 
     assert done.status == TaskStatus.partial
-    assert done.result.meta["report_recovery"] == f"failed: {NO_RESPONSE}"
+    assert done.result.meta["report_recovery"] == f"failed: {OmpAdapter.NO_RESPONSE}"
     assert done.result.meta["executor_failure"] == "network"
-    assert "codex" in dispatcher.availability.unavailable()
+    assert "omp" in dispatcher.availability.unavailable()
     events = await storage.list_events(done.task_id)
     assert any(e["kind"] == "cooldown" and e["payload"]["kind"] == "network" for e in events)
 
@@ -463,19 +422,19 @@ async def test_executor_failure_in_the_report_recovery_cools_the_executor(tmp_pa
 @pytest.mark.parametrize(
     ("first", "execution"),
     [
-        pytest.param(_no_block("codex"), {"report_recovery_timeout_seconds": 0}, id="disabled"),
-        pytest.param(_no_block("codex", session=None), {}, id="no-session"),
+        pytest.param(_no_block("omp"), {"report_recovery_timeout_seconds": 0}, id="disabled"),
+        pytest.param(_no_block("omp", session=None), {}, id="no-session"),
     ],
 )
 async def test_report_is_not_asked_again_when_it_cannot_be(tmp_path, git_repo, first, execution):
     _, adapters, dispatcher = await _make(tmp_path, **execution)
-    adapters["codex"].results = [first]
+    adapters["omp"].results = [first]
 
     done = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
 
     assert done.status == TaskStatus.partial
     assert "report_recovery" not in done.result.meta
-    assert len(adapters["codex"].calls) == 1
+    assert len(adapters["omp"].calls) == 1
 
 
 @pytest.mark.asyncio
@@ -484,9 +443,9 @@ async def test_followup_of_a_cooling_executor_goes_to_the_router(tmp_path, git_r
         RouteDecision(executor="claude", confidence=1, scores={"claude": 1}, router=RouterKind.jev)
     )
     _, adapters, dispatcher = await _make(tmp_path, router=router)
-    adapters["codex"].results = [_ok("codex", "s1")]
+    adapters["omp"].results = [_ok("omp", "s1")]
     first = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
-    dispatcher.availability.trip("codex", "quota", "hit your usage limit", 600, origin="codex")
+    dispatcher.availability.trip("omp", "quota", "hit your usage limit", 600, origin="omp")
 
     record = await dispatcher.followup(first.task_id, FollowupRequest(message="more"))
     done = await _done(dispatcher, record.task_id)
@@ -500,16 +459,16 @@ async def test_followup_of_a_cooling_executor_goes_to_the_router(tmp_path, git_r
 @pytest.mark.asyncio
 async def test_review_followup_stays_a_review(tmp_path, git_repo):
     _, adapters, dispatcher = await _make(tmp_path)
-    review = _ok("codex", "s1", summary="looks fine")
+    review = _ok("omp", "s1", summary="looks fine")
     review.changed_files = []
-    adapters["codex"].results = [review, review]
+    adapters["omp"].results = [review, review]
     first = await _done(
         dispatcher, (await dispatcher.submit(_req(git_repo, kind="review"))).task_id
     )
     record = await dispatcher.followup(first.task_id, FollowupRequest(message="and b.py?"))
     await _done(dispatcher, record.task_id)
 
-    ctx = adapters["codex"].calls[-1]
+    ctx = adapters["omp"].calls[-1]
     assert ctx.read_only and ctx.resume_session == "s1"
     assert "The working tree still has your changes" not in ctx.prompt
 
@@ -520,7 +479,7 @@ async def test_review_followup_stays_a_review(tmp_path, git_repo):
 @pytest.mark.asyncio
 async def test_followup_endpoint(tmp_path, git_repo):
     storage, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].results = [_ok("codex", "s1"), _ok("codex", "s1")]
+    adapters["omp"].results = [_ok("omp", "s1"), _ok("omp", "s1")]
     settings = dispatcher.settings
     app = create_app(settings, dispatcher, storage, dispatcher.availability, "secret")
     headers = {"host": "127.0.0.1:7433", "authorization": "Bearer secret"}
@@ -529,7 +488,7 @@ async def test_followup_endpoint(tmp_path, git_repo):
         first = await client.post(
             "/tasks",
             headers=headers,
-            json={"task": "fix", "cwd": str(git_repo), "executor": "codex", "wait_seconds": 5},
+            json={"task": "fix", "cwd": str(git_repo), "executor": "omp", "wait_seconds": 5},
         )
         task_id = first.json()["task_id"]
         ok = await client.post(
@@ -553,7 +512,7 @@ def _link(
     task_id: str,
     *,
     status: TaskStatus = TaskStatus.completed,
-    executor: str | None = "codex",
+    executor: str | None = "omp",
     meta: dict | None = None,
 ) -> TaskRecord:
     now = datetime.now(UTC)
@@ -637,13 +596,13 @@ async def test_followup_is_judged_by_the_current_caller(tmp_path, git_repo):
 @pytest.mark.asyncio
 async def test_escalated_followup_link_describes_the_failed_followup(tmp_path, git_repo):
     _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].results = [
-        _ok("codex", "s1", summary="first pass"),
+    adapters["omp"].results = [
+        _ok("omp", "s1", summary="first pass"),
         # Изменения есть: это провал работы, а не продолжения сессии, и он
         # эскалируется, а не повторяется с нуля.
         ExecutionResult(
             status="failed",
-            executor="codex",
+            executor="omp",
             model=None,
             summary="followup broke",
             changed_files=["a.py"],
@@ -663,7 +622,7 @@ async def test_escalated_followup_link_describes_the_failed_followup(tmp_path, g
 @pytest.mark.asyncio
 async def test_followup_chain_keeps_the_original_task_in_the_prompt(tmp_path, git_repo):
     _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].results = [_ok("codex", None)] * 3
+    adapters["omp"].results = [_ok("omp", None)] * 3
     first = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
     second = await _done(
         dispatcher,
@@ -674,6 +633,6 @@ async def test_followup_chain_keeps_the_original_task_in_the_prompt(tmp_path, gi
         (await dispatcher.followup(second.task_id, FollowupRequest(message="handle None"))).task_id,
     )
 
-    prompt = adapters["codex"].calls[-1].prompt
+    prompt = adapters["omp"].calls[-1].prompt
     assert "Original task: fix tests" in prompt
     assert "Its request: fix the test" in prompt

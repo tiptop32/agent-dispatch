@@ -1,4 +1,4 @@
-"""AgentDispatch: маршрутизация coding-задач между Claude Code, Codex и OpenCode."""
+"""AgentDispatch: маршрутизация coding-задач между Claude Code и omp."""
 
 from agent_dispatch.version import __version__
 

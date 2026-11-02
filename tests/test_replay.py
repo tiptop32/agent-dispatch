@@ -38,7 +38,12 @@ from evals.replay.harness import (
 )
 
 SCHEMA = Path(__file__).parent.parent / "agent_dispatch" / "telemetry" / "schema.sql"
-OFFLINE = '{"type":"error","message":"Reconnecting... 5/5 (request timed out)"}'
+# Исполнитель без сети: узнаваемая строка CLI в `error` (события переподключения
+# больше не классифицируются — таймаут сам по себе ничего не говорит).
+OFFLINE = (
+    "couldn't connect to 127.0.0.1:9 (connection refused). "
+    "Check that the server is running and reachable."
+)
 
 
 def _result(status, *, error=None, summary="", changed=(), meta=None):
@@ -168,7 +173,7 @@ def test_replay_counts_runs_sent_to_an_executor_that_was_down(tmp_path):
                 "10:30",
                 30,
                 None,
-                _result("failed", error="timeout", summary=OFFLINE),
+                _result("failed", error=OFFLINE),
             ),
             # Через 5 минут его же снова берут: этот запуск остывание сняло бы.
             (
@@ -178,7 +183,7 @@ def test_replay_counts_runs_sent_to_an_executor_that_was_down(tmp_path):
                 "11:05",
                 30,
                 None,
-                _result("failed", error="timeout", summary=OFFLINE),
+                _result("failed", error=OFFLINE),
             ),
             # Через час после последнего сбоя остывание уже кончилось.
             ("c" * 32, "codex/sol", "12:10", "12:20", 10, None, _result("completed")),
@@ -329,7 +334,7 @@ def test_replay_avoidable_uses_spawn_time_and_only_finished_cooldowns(tmp_path):
                 "10:30",
                 90,
                 None,
-                _result("failed", error="timeout", summary=OFFLINE),
+                _result("failed", error=OFFLINE),
             ),
             (
                 "b" * 32,
@@ -429,7 +434,7 @@ def test_replay_never_started_tasks_are_not_avoidable(tmp_path):
                 "10:30",
                 30,
                 None,
-                _result("failed", error="timeout", summary=OFFLINE),
+                _result("failed", error=OFFLINE),
             ),
             (
                 "b" * 32,
@@ -483,7 +488,7 @@ def test_replay_skips_guard_refusals(tmp_path):
                 "12:30",
                 30,
                 None,
-                _result("failed", error="timeout", summary=OFFLINE),
+                _result("failed", error=OFFLINE),
             ),
         ],
     )
@@ -507,7 +512,7 @@ def test_replay_reports_first_and_last_case_time_per_section(tmp_path):
                 "10:30",
                 30,
                 None,
-                _result("failed", error="timeout", summary=OFFLINE),
+                _result("failed", error=OFFLINE),
             ),
             (
                 "b" * 32,
@@ -562,7 +567,7 @@ def test_replay_since_keeps_only_later_tasks(tmp_path):
                 "10:30",
                 30,
                 None,
-                _result("failed", error="timeout", summary=OFFLINE),
+                _result("failed", error=OFFLINE),
             ),
             ("b" * 32, "codex/sol", "13:00", "13:01", 1, None, _result("completed"), "claude"),
             (
@@ -572,7 +577,7 @@ def test_replay_since_keeps_only_later_tasks(tmp_path):
                 "13:31",
                 1,
                 None,
-                _result("failed", error="timeout", summary=OFFLINE),
+                _result("failed", error=OFFLINE),
             ),
         ],
     )
@@ -965,14 +970,16 @@ def _settings(adapter, tier, *, corporate=False):
         adapter=adapter,
         tier=tier,
         corporate=corporate,
-        model="m" if adapter == "opencode" else None,
+        model="m" if adapter == "omp" else None,
     )
 
 
 EXECUTORS = {
-    "opencode/x5": _settings("opencode", "balanced", corporate=True),
-    "codex/luna": _settings("codex", "fast"),
-    "codex/sol": _settings("codex", "balanced"),
+    # Исторические имена исполнителей из replay-телеметрии (codex/*, opencode/*)
+    # остаются валидными ключами: адаптеры под ними теперь omp.
+    "opencode/x5": _settings("omp", "balanced", corporate=True),
+    "codex/luna": _settings("omp", "fast"),
+    "codex/sol": _settings("omp", "balanced"),
     "claude/opus": _settings("claude", "strong"),
 }
 

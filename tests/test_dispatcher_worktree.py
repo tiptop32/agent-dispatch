@@ -38,13 +38,15 @@ def _git(repo: Path, *args: str) -> str:
 async def _make(tmp_path: Path, *, max_tasks: int = 2, **execution):
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path, max_concurrent_tasks=max_tasks),
-        routing=RoutingSettings(fallback_executor="codex"),
+        routing=RoutingSettings(fallback_executor="omp"),
         execution=ExecutionSettings(workspace_mode="worktree", **execution),
-        executors={"codex": ExecutorSettings(adapter="codex", description="codex")},
+        executors={
+            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp")
+        },
     )
     storage = Storage(tmp_path / "db.sqlite")
     await storage.open()
-    adapters = {"codex": FakeAdapter("codex")}
+    adapters = {"omp": FakeAdapter("omp")}
     dispatcher = Dispatcher(
         settings, storage, adapters, AvailabilityCache(adapters, 60), [FakeRouter()]
     )
@@ -52,7 +54,7 @@ async def _make(tmp_path: Path, *, max_tasks: int = 2, **execution):
 
 
 def _req(repo: Path, **kwargs):
-    return DispatchRequest(task="fix tests", cwd=str(repo), executor="codex", **kwargs)
+    return DispatchRequest(task="fix tests", cwd=str(repo), executor="omp", **kwargs)
 
 
 def _writes(text: str, name: str = "a.py"):
@@ -78,12 +80,12 @@ def _fail_on_exit_event(monkeypatch, storage, exc: BaseException) -> None:
 @pytest.mark.asyncio
 async def test_executor_runs_in_a_worktree_not_in_the_working_copy(tmp_path, git_repo):
     _, storage, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
 
-    ctx = adapters["codex"].calls[0]
+    ctx = adapters["omp"].calls[0]
     assert ctx.cwd != str(git_repo) and "worktrees" in ctx.cwd
     assert done.status == "completed"
     # Патч вернулся в рабочую копию.
@@ -96,23 +98,23 @@ async def test_executor_runs_in_a_worktree_not_in_the_working_copy(tmp_path, git
 @pytest.mark.asyncio
 async def test_worktree_is_removed_after_a_successful_run(tmp_path, git_repo):
     _, _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
 
     record = await dispatcher.submit(_req(git_repo))
     await dispatcher.wait(record.task_id, WAIT)
 
-    assert not Path(adapters["codex"].calls[0].cwd).exists()  # noqa: ASYNC240
+    assert not Path(adapters["omp"].calls[0].cwd).exists()  # noqa: ASYNC240
 
 
 @pytest.mark.asyncio
 async def test_keep_worktrees_leaves_the_tree_for_inspection(tmp_path, git_repo):
     _, _, adapters, dispatcher = await _make(tmp_path, keep_worktrees=True)
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
 
-    assert Path(adapters["codex"].calls[0].cwd).exists()  # noqa: ASYNC240
+    assert Path(adapters["omp"].calls[0].cwd).exists()  # noqa: ASYNC240
     assert done.result.meta["worktree"] and done.result.meta["branch"]
 
 
@@ -121,7 +123,7 @@ async def test_manual_integration_leaves_the_patch_and_does_not_touch_the_workin
     tmp_path, git_repo
 ):
     _, _, adapters, dispatcher = await _make(tmp_path, integrate="manual")
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
@@ -137,7 +139,7 @@ async def test_manual_integration_leaves_the_patch_and_does_not_touch_the_workin
 @pytest.mark.asyncio
 async def test_result_is_committed_on_the_task_branch(tmp_path, git_repo):
     _, _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
@@ -150,7 +152,7 @@ async def test_result_is_committed_on_the_task_branch(tmp_path, git_repo):
 @pytest.mark.asyncio
 async def test_branch_mode_keeps_the_branch_and_leaves_the_working_copy_alone(tmp_path, git_repo):
     _, _, adapters, dispatcher = await _make(tmp_path, integrate="branch")
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
@@ -184,7 +186,7 @@ async def test_conflicting_edit_keeps_the_worktree_and_reports_the_failure(tmp_p
         (Path(ctx.cwd) / "a.py").write_text("from the worktree\n")
         (git_repo / "a.py").write_text("from the agent\n")
 
-    adapters["codex"].on_execute = on_execute
+    adapters["omp"].on_execute = on_execute
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
@@ -207,7 +209,7 @@ async def test_two_tasks_in_one_repository_do_not_wait_for_each_other(tmp_path, 
         running.release()
         await gate.wait()
 
-    adapters["codex"].on_execute = on_execute
+    adapters["omp"].on_execute = on_execute
 
     first = await dispatcher.submit(_req(git_repo))
     second = await dispatcher.submit(_req(git_repo))
@@ -218,7 +220,7 @@ async def test_two_tasks_in_one_repository_do_not_wait_for_each_other(tmp_path, 
 
     assert (await dispatcher.wait(first.task_id, WAIT)).status == "completed"
     assert (await dispatcher.wait(second.task_id, WAIT)).status == "completed"
-    trees = {call.cwd for call in adapters["codex"].calls}
+    trees = {call.cwd for call in adapters["omp"].calls}
     assert len(trees) == 2
 
 
@@ -229,7 +231,7 @@ async def test_task_package_tells_the_executor_it_is_in_a_worktree(tmp_path, git
     record = await dispatcher.submit(_req(git_repo))
     await dispatcher.wait(record.task_id, WAIT)
 
-    prompt = adapters["codex"].calls[0].prompt
+    prompt = adapters["omp"].calls[0].prompt
     assert "worktree created from HEAD" in prompt
     assert str(git_repo) in prompt
 
@@ -238,21 +240,23 @@ async def test_task_package_tells_the_executor_it_is_in_a_worktree(tmp_path, git
 async def test_in_place_mode_still_runs_in_the_working_copy(tmp_path, git_repo):
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path),
-        routing=RoutingSettings(fallback_executor="codex"),
-        executors={"codex": ExecutorSettings(adapter="codex", description="codex")},
+        routing=RoutingSettings(fallback_executor="omp"),
+        executors={
+            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp")
+        },
     )
     storage = Storage(tmp_path / "db.sqlite")
     await storage.open()
-    adapters = {"codex": FakeAdapter("codex")}
+    adapters = {"omp": FakeAdapter("omp")}
     dispatcher = Dispatcher(
         settings, storage, adapters, AvailabilityCache(adapters, 60), [FakeRouter()]
     )
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
 
-    assert adapters["codex"].calls[0].cwd == str(git_repo)
+    assert adapters["omp"].calls[0].cwd == str(git_repo)
     assert (git_repo / "a.py").read_text() == "x = 2\n"
     assert "worktree" not in done.result.meta
 
@@ -261,12 +265,14 @@ async def test_in_place_mode_still_runs_in_the_working_copy(tmp_path, git_repo):
 async def test_request_can_override_the_configured_mode(tmp_path, git_repo):
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path),
-        routing=RoutingSettings(fallback_executor="codex"),
-        executors={"codex": ExecutorSettings(adapter="codex", description="codex")},
+        routing=RoutingSettings(fallback_executor="omp"),
+        executors={
+            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp")
+        },
     )
     storage = Storage(tmp_path / "db.sqlite")
     await storage.open()
-    adapters = {"codex": FakeAdapter("codex")}
+    adapters = {"omp": FakeAdapter("omp")}
     dispatcher = Dispatcher(
         settings, storage, adapters, AvailabilityCache(adapters, 60), [FakeRouter()]
     )
@@ -274,7 +280,7 @@ async def test_request_can_override_the_configured_mode(tmp_path, git_repo):
     record = await dispatcher.submit(_req(git_repo, workspace_mode="worktree"))
     await dispatcher.wait(record.task_id, WAIT)
 
-    assert adapters["codex"].calls[0].cwd != str(git_repo)
+    assert adapters["omp"].calls[0].cwd != str(git_repo)
 
 
 def _holds(gate: asyncio.Event):
@@ -302,10 +308,10 @@ async def test_parent_worktree_is_kept_until_nested_child_finishes(tmp_path, git
         submitted.append(child)
         await child_started.wait()
 
-    adapters["codex"].on_execute = nested
+    adapters["omp"].on_execute = nested
     parent = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(parent.task_id, WAIT)
-    tree_path = Path(adapters["codex"].calls[0].cwd)
+    tree_path = Path(adapters["omp"].calls[0].cwd)
 
     assert done.status == "completed"
     assert tree_path.is_dir()  # noqa: ASYNC240
@@ -325,9 +331,9 @@ async def test_parent_worktree_is_kept_until_nested_child_finishes(tmp_path, git
 async def test_missing_queued_cwd_fails_cleanly_and_finalizes(tmp_path, git_repo):
     _, storage, adapters, dispatcher = await _make(tmp_path, max_tasks=1)
     gate = asyncio.Event()
-    adapters["codex"].on_execute = _holds(gate)
+    adapters["omp"].on_execute = _holds(gate)
     first = await dispatcher.submit(_req(git_repo))
-    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(adapters["omp"].started.wait(), WAIT)
 
     doomed = git_repo / "doomed"
     doomed.mkdir()
@@ -351,10 +357,10 @@ async def test_missing_queued_cwd_fails_cleanly_and_finalizes(tmp_path, git_repo
 async def test_hop_zero_request_inside_worktree_inherits_its_parent(tmp_path, git_repo):
     _, _, adapters, dispatcher = await _make(tmp_path, max_tasks=1)
     gate = asyncio.Event()
-    adapters["codex"].gate = gate
+    adapters["omp"].gate = gate
     parent = await dispatcher.submit(_req(git_repo, root_agent="claude"))
-    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
-    parent_tree = Path(adapters["codex"].calls[0].cwd)
+    await asyncio.wait_for(adapters["omp"].started.wait(), WAIT)
+    parent_tree = Path(adapters["omp"].calls[0].cwd)
 
     child = await dispatcher.submit(_req(parent_tree, hop=0))
 
@@ -370,10 +376,10 @@ async def test_hop_zero_request_inside_worktree_inherits_its_parent(tmp_path, gi
 @pytest.mark.asyncio
 async def test_cancelled_task_keeps_the_worktree_and_reports_it(tmp_path, git_repo):
     _, _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].on_execute = _holds(asyncio.Event())
+    adapters["omp"].on_execute = _holds(asyncio.Event())
 
     record = await dispatcher.submit(_req(git_repo))
-    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(adapters["omp"].started.wait(), WAIT)
     done = await dispatcher.cancel(record.task_id)
 
     assert done.status == "cancelled"
@@ -387,10 +393,10 @@ async def test_cancelled_task_keeps_the_worktree_and_reports_it(tmp_path, git_re
 @pytest.mark.asyncio
 async def test_shutdown_leaves_the_worktree_in_the_stored_record(tmp_path, git_repo):
     _, storage, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].on_execute = _holds(asyncio.Event())
+    adapters["omp"].on_execute = _holds(asyncio.Event())
 
     record = await dispatcher.submit(_req(git_repo))
-    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(adapters["omp"].started.wait(), WAIT)
     await dispatcher.shutdown()
 
     stored = await storage.get_task(record.task_id)
@@ -423,7 +429,7 @@ async def test_unwritable_patch_keeps_the_worktree_and_reports_the_failure(tmp_p
     # Файл на месте каталога патчей: mkdir упирается в него с OSError.
     (tmp_path / "patches").write_text("not a directory\n")
     _, _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
@@ -438,10 +444,10 @@ async def test_unwritable_patch_keeps_the_worktree_and_reports_the_failure(tmp_p
 @pytest.mark.asyncio
 async def test_recover_stale_restores_the_worktree_from_the_event(tmp_path, git_repo):
     settings, storage, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].on_execute = _holds(asyncio.Event())
+    adapters["omp"].on_execute = _holds(asyncio.Event())
 
     record = await dispatcher.submit(_req(git_repo))
-    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(adapters["omp"].started.wait(), WAIT)
     await dispatcher.shutdown()
     # Демон, убитый сигналом, оставляет задачу в running и ничего не дописывает.
     stale = await storage.get_task(record.task_id)
@@ -453,7 +459,7 @@ async def test_recover_stale_restores_the_worktree_from_the_event(tmp_path, git_
 
     done = await storage.get_task(record.task_id)
     assert done.result.error == "daemon restarted"
-    assert done.result.meta["worktree"] == adapters["codex"].calls[0].cwd
+    assert done.result.meta["worktree"] == adapters["omp"].calls[0].cwd
     assert done.result.meta["branch"]
 
 
@@ -462,7 +468,7 @@ async def test_failure_after_integration_does_not_report_a_removed_worktree(
     tmp_path, git_repo, monkeypatch
 ):
     _, storage, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
     _fail_on_exit_event(monkeypatch, storage, RuntimeError("finalize failed"))
 
     record = await dispatcher.submit(_req(git_repo))
@@ -503,7 +509,7 @@ async def test_cancel_after_integration_keeps_the_integrated_verdict(
     tmp_path, git_repo, monkeypatch
 ):
     _, storage, adapters, dispatcher = await _make(tmp_path, keep_worktrees=True)
-    adapters["codex"].on_execute = _writes("x = 2\n")
+    adapters["omp"].on_execute = _writes("x = 2\n")
     # Отмена приходит в `_finalize`, когда патч уже применён к рабочей копии.
     _fail_on_exit_event(monkeypatch, storage, asyncio.CancelledError())
 
@@ -522,25 +528,25 @@ async def test_cancel_after_integration_keeps_the_integrated_verdict(
 async def test_escalated_work_is_held_on_its_branch_and_the_next_executor_integrates(
     tmp_path, git_repo
 ):
-    # 09-23: недоделка codex/sol ложилась в рабочую копию, а готовый патч
+    # 09-23: недоделка исполнителя ложилась в рабочую копию, а готовый патч
     # claude/opus после эскалации не применялся (`does not match index`).
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path, max_concurrent_tasks=2),
-        routing=RoutingSettings(fallback_executor="codex"),
+        routing=RoutingSettings(fallback_executor="omp"),
         execution=ExecutionSettings(workspace_mode="worktree"),
         executors={
-            "codex": ExecutorSettings(adapter="codex", description="codex"),
+            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp"),
             "claude": ExecutorSettings(adapter="claude", description="claude"),
         },
-        escalation={"codex": ["claude"]},
+        escalation={"omp": ["claude"]},
     )
     storage = Storage(tmp_path / "db.sqlite")
     await storage.open()
     adapters = {
-        "codex": FakeAdapter(
-            "codex",
+        "omp": FakeAdapter(
+            "omp",
             result=ExecutionResult(
-                status="failed", executor="codex", model=None, summary="", error="timeout"
+                status="failed", executor="omp", model=None, summary="", error="timeout"
             ),
             on_execute=_writes("x = 'half'\n"),
         ),
@@ -572,21 +578,21 @@ async def test_timed_out_work_with_changed_files_is_partial_and_not_escalated(tm
     # настоящие адаптеры из ProcessOutcome и git-дифа.
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path, max_concurrent_tasks=2),
-        routing=RoutingSettings(fallback_executor="codex"),
+        routing=RoutingSettings(fallback_executor="omp"),
         execution=ExecutionSettings(workspace_mode="worktree"),
         executors={
-            "codex": ExecutorSettings(adapter="codex", description="codex"),
+            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp"),
             "claude": ExecutorSettings(adapter="claude", description="claude"),
         },
-        escalation={"codex": ["claude"]},
+        escalation={"omp": ["claude"]},
     )
     storage = Storage(tmp_path / "db.sqlite")
     await storage.open()
     outcome = ProcessOutcome(exit_code=0, stdout="out", stderr="", timed_out=True, duration_ms=12)
     adapters = {
-        "codex": FakeAdapter(
-            "codex",
-            result=normalize(None, outcome, ["a.py"], "codex", None),
+        "omp": FakeAdapter(
+            "omp",
+            result=normalize(None, outcome, ["a.py"], "omp", None),
             on_execute=_writes("x = 'half'\n"),
         ),
         "claude": FakeAdapter("claude", on_execute=_writes("x = 'done'\n")),
@@ -612,10 +618,10 @@ async def test_timed_out_work_with_changed_files_is_partial_and_not_escalated(tm
 @pytest.mark.asyncio
 async def test_failed_work_without_escalation_is_still_integrated(tmp_path, git_repo):
     _, _, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].result = ExecutionResult(
-        status="failed", executor="codex", model=None, summary="", error="timeout"
+    adapters["omp"].result = ExecutionResult(
+        status="failed", executor="omp", model=None, summary="", error="timeout"
     )
-    adapters["codex"].on_execute = _writes("x = 'half'\n")
+    adapters["omp"].on_execute = _writes("x = 'half'\n")
 
     record = await dispatcher.submit(_req(git_repo))
     done = await dispatcher.wait(record.task_id, WAIT)
@@ -631,11 +637,11 @@ async def test_recover_stale_does_not_point_to_a_removed_worktree(tmp_path, git_
     # Дерево убрано (удержание перед эскалацией, `integrate: branch`), а демон
     # умер до записи результата: ветка остаётся, пути в пустоту нет.
     settings, storage, adapters, dispatcher = await _make(tmp_path)
-    adapters["codex"].on_execute = _holds(asyncio.Event())
+    adapters["omp"].on_execute = _holds(asyncio.Event())
 
     record = await dispatcher.submit(_req(git_repo))
-    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
-    tree_path = adapters["codex"].calls[0].cwd
+    await asyncio.wait_for(adapters["omp"].started.wait(), WAIT)
+    tree_path = adapters["omp"].calls[0].cwd
     await dispatcher.shutdown()
     _git(git_repo, "worktree", "remove", "--force", tree_path)
     stale = await storage.get_task(record.task_id)

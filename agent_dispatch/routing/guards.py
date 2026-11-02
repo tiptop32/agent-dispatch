@@ -300,7 +300,7 @@ def post_guards(
 def review_only_executors(req: DispatchRequest, settings: Settings) -> set[str]:
     """Исполнители, которым этот источник может отдать только ревью, а не задачу.
 
-    Правило `routing.review_only` бережёт токены дорогого исполнителя: Codex
+    Правило `routing.review_only` бережёт токены дорогого исполнителя: omp
     делает работу сам или отдаёт её дешёвым, а у Claude просит только ревью.
     """
     if req.kind == "review":

@@ -15,8 +15,8 @@ from agent_dispatch.models import ContextMode, DispatchRequest, SourceAgent
 
 def settings(*, max_children: int = 2) -> Settings:
     return Settings(
-        executors={"codex": ExecutorSettings(adapter="codex")},
-        routing=RoutingSettings(fallback_executor="codex", max_children=max_children),
+        executors={"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna")},
+        routing=RoutingSettings(fallback_executor="omp", max_children=max_children),
     )
 
 
@@ -55,7 +55,7 @@ def test_build_task_package_full_collects_git_status_and_diff(git_repo):
         ("claude", ContextMode.prompt, "prompt_claude_prompt.md"),
         ("claude", ContextMode.prompt_summary, "prompt_claude_summary.md"),
         ("claude", ContextMode.full, "prompt_claude_full.md"),
-        ("codex", ContextMode.prompt_summary, "prompt_codex_summary.md"),
+        ("omp", ContextMode.prompt_summary, "prompt_omp_summary.md"),
     ],
 )
 def test_render_prompt_matches_snapshot(adapter, mode, snapshot):
@@ -97,13 +97,10 @@ def test_render_prompt_uses_configured_max_children():
     assert "at most 3 independent subtasks" in rendered
 
 
-def test_render_prompt_codex_and_claude_only_differ_in_result_format():
+def test_render_prompt_is_identical_for_claude_and_omp():
+    # Единый формат отчёта для всех адаптеров: промпт не зависит от адаптера.
     package = TaskPackage(request=request())
-    claude = render_prompt(package, "claude", settings())
-    codex = render_prompt(package, "codex", settings())
-    marker = "# Result format"
-    assert claude.split(marker, 1)[0] == codex.split(marker, 1)[0]
-    assert claude.split(marker, 1)[1] != codex.split(marker, 1)[1]
+    assert render_prompt(package, "claude", settings()) == render_prompt(package, "omp", settings())
 
 
 def test_render_prompt_full_contains_git_commands_and_fixed_state():
@@ -247,7 +244,7 @@ def test_render_prompt_in_place_mode_keeps_paths_verbatim():
 
 @pytest.mark.parametrize(
     ("adapter", "format_hint"),
-    [("codex", "structured output schema"), ("opencode", "```agent-dispatch-result")],
+    [("omp", "```agent-dispatch-result")],
 )
 def test_report_prompt_asks_only_for_the_report_in_the_adapter_format(adapter, format_hint):
     prompt = render_report_prompt(adapter)

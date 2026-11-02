@@ -48,7 +48,7 @@ def test_full_file_parses_into_settings(tmp_config_dir: Path) -> None:
     assert isinstance(settings, Settings)
     assert settings.server.host == "0.0.0.0"
     assert settings.router.backend == "claude_local"
-    assert settings.executors["local"].resolved_command == "codex-custom"
+    assert settings.executors["local"].resolved_command == "omp-custom"
 
 
 def test_fallback_executor_must_exist(tmp_config_dir: Path) -> None:
@@ -60,7 +60,7 @@ def test_fallback_executor_must_exist(tmp_config_dir: Path) -> None:
 
 @pytest.mark.parametrize(
     ("value", "chain"),
-    [("codex", ["codex"]), (["opencode/kimi", "codex"], ["opencode/kimi", "codex"])],
+    [("omp", ["omp"]), (["omp/kimi", "claude"], ["omp/kimi", "claude"])],
 )
 def test_fallback_executor_accepts_name_or_ordered_chain(
     tmp_config_dir: Path, value, chain
@@ -69,15 +69,16 @@ def test_fallback_executor_accepts_name_or_ordered_chain(
         {
             "routing": {"fallback_executor": value},
             "executors": {
-                "codex": {"adapter": "codex"},
-                "opencode/kimi": {"adapter": "opencode", "model": "kimi"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+                "omp/kimi": {"adapter": "omp", "model": "kimi"},
+                "claude": {"adapter": "claude"},
             },
         }
     )
     assert settings.routing.fallback_chain == chain
 
 
-@pytest.mark.parametrize("value", [["codex", "missing"], []])
+@pytest.mark.parametrize("value", [["ghost", "missing"], []])
 def test_fallback_chain_members_must_exist_and_chain_is_not_empty(
     tmp_config_dir: Path, value
 ) -> None:
@@ -418,19 +419,17 @@ def test_review_only_keeps_codex_as_a_source_for_old_tasks(tmp_config_dir: Path)
     ("adapter", "model", "explicit", "expected"),
     [
         ("claude", "opus", None, "claude"),
-        ("codex", "gpt-5.6-sol", None, "codex"),
-        ("opencode", "copilot/x5-airun-code-large", None, "opencode:copilot"),
-        ("opencode", "kimi", None, "opencode/kimi"),
         ("omp", "agent-lb/gpt-6.1-sol", None, "omp:agent-lb"),
         ("omp", "copilot-x5/x5-airun-code-large", None, "omp:copilot-x5"),
-        ("codex", "sol", "codex-lb", "codex-lb"),
+        ("omp", "kimi", None, "omp/kimi"),
+        ("omp", "sol", "custom-group", "custom-group"),
     ],
 )
 def test_limit_group_defaults_to_the_shared_account(adapter, model, explicit, expected) -> None:
     from agent_dispatch.config import ExecutorSettings
 
     item = ExecutorSettings(adapter=adapter, model=model, limit_group=explicit)
-    assert item.resolved_limit_group("opencode/kimi") == expected
+    assert item.resolved_limit_group("omp/kimi") == expected
 
 
 def test_config_accepts_the_omp_adapter() -> None:

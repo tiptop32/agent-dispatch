@@ -18,7 +18,7 @@ class OmpAdapter(BaseExecutorAdapter):
 
     omp пишет NDJSON-события по ходу работы (первая строка — заголовок сессии,
     итог — последний ассистентский `message_end`), поэтому сторож молчания
-    применим, как у codex и opencode. Формат снят живыми прогонами, факты в
+    применим. Формат снят живыми прогонами, факты в
     `docs/research/omp-cli-facts.md`.
     """
 
@@ -49,7 +49,7 @@ class OmpAdapter(BaseExecutorAdapter):
     DEFAULT_THINKING = "medium"
 
     #: Ошибка хода без единого ответа модели; по началу строки её узнаёт
-    #: `health.classify_failure` и остужает группу, как у opencode.
+    #: `health.classify_failure` и остужает группу.
     NO_RESPONSE = "omp: no model response (the run ended before the first model reply)"
 
     def __init__(

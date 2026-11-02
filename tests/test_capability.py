@@ -6,19 +6,19 @@ from agent_dispatch.routing.guards import classify_confidence
 from agent_dispatch.routing.questions import noul_certainty, noul_yes
 
 
-def ex(adapter="codex", tier="balanced", corporate=False):
+def ex(adapter="omp", tier="balanced", corporate=False):
     return ExecutorSettings(
         adapter=adapter,
-        model="m" if adapter in {"opencode", "omp"} else None,
+        model="m" if adapter == "omp" else None,
         tier=tier,
         corporate=corporate,
     )
 
 
 FULL = {
-    "cheap": ex("opencode", "fast"),
-    "internal": ex("opencode", "fast", corporate=True),
-    "codex": ex("codex", "balanced"),
+    "cheap": ex("omp", "fast"),
+    "internal": ex("omp", "fast", corporate=True),
+    "omp": ex("omp", "balanced"),
     "opus": ex("claude", "strong"),
 }
 
@@ -29,12 +29,12 @@ def test_tiers_present_lists_only_tiers_with_candidates_in_order():
 
 
 def test_has_corporate():
-    assert has_corporate(FULL) and not has_corporate({"codex": ex()})
+    assert has_corporate(FULL) and not has_corporate({"omp": ex()})
 
 
 @pytest.mark.parametrize(
     ("capability", "expected"),
-    [("fast", "cheap"), ("balanced", "codex"), ("strong", "opus")],
+    [("fast", "cheap"), ("balanced", "omp"), ("strong", "opus")],
 )
 def test_each_capability_picks_its_tier(capability, expected):
     assert select(capability, FULL).executor == expected
@@ -43,7 +43,7 @@ def test_each_capability_picks_its_tier(capability, expected):
 def test_max_capability_caps_the_tier_before_selection():
     selection = select("strong", FULL, max_capability="balanced")
 
-    assert selection.executor == "codex"
+    assert selection.executor == "omp"
     assert selection.capability == "balanced"
     assert selection.capability_uncapped == "strong"
     assert "capability capped: strong -> balanced (max_capability)" in selection.notes
@@ -54,7 +54,7 @@ def test_judgment_does_not_lift_a_task_over_the_ceiling():
     # должно молча обойти потолок вызывающего (живой случай 2026-10-15).
     selection = select("strong", FULL, max_capability="balanced", judgment=True)
 
-    assert selection.executor == "codex"
+    assert selection.executor == "omp"
     assert any("no reasoning agent within max_capability" in n for n in selection.notes)
 
 
@@ -65,16 +65,16 @@ def test_judgment_inside_the_ceiling_still_picks_a_reasoning_agent():
 
 
 def test_corporate_perimeter_stays_stronger_than_the_ceiling():
-    pool = {"codex": ex("codex", "balanced"), "secure": ex("opencode", "strong", corporate=True)}
+    pool = {"omp": ex("omp", "balanced"), "secure": ex("omp", "strong", corporate=True)}
 
     assert select("strong", pool, max_capability="balanced", corporate=True).executor == "secure"
 
 
 def test_missing_tier_falls_upward_then_downward():
-    only_strong_and_fast = {"cheap": ex("opencode", "fast"), "opus": ex("claude", "strong")}
+    only_strong_and_fast = {"cheap": ex("omp", "fast"), "opus": ex("claude", "strong")}
     # balanced нет: берём следующий вверх, а не вниз, чтобы задача не провалилась.
     assert select("balanced", only_strong_and_fast).executor == "opus"
-    only_fast = {"cheap": ex("opencode", "fast")}
+    only_fast = {"cheap": ex("omp", "fast")}
     assert select("strong", only_fast).executor == "cheap"
 
 
@@ -87,7 +87,7 @@ def test_corporate_note_carries_the_confidence_so_a_coin_flip_is_visible():
 def test_perimeter_without_the_requested_level_says_so_instead_of_silently_downgrading():
     # Внутри периметра только fast, а задача просит strong: раньше она молча
     # уезжала на соседний тир, и понять это по решению было нельзя.
-    pool = {"internal": ex("opencode", "fast", corporate=True), "opus": ex("claude", "strong")}
+    pool = {"internal": ex("omp", "fast", corporate=True), "opus": ex("claude", "strong")}
 
     selection = select("strong", pool, corporate=True)
 
@@ -111,9 +111,9 @@ def test_corporate_data_selects_only_omp_x5():
 
 
 def test_corporate_data_without_an_internal_executor_is_reported_not_silently_ignored():
-    external_only = {"codex": ex(), "opus": ex("claude", "strong")}
+    external_only = {"omp": ex(), "opus": ex("claude", "strong")}
     selection = select("balanced", external_only, corporate=True)
-    assert selection.executor == "codex"
+    assert selection.executor == "omp"
     assert any("no in-perimeter executor" in note for note in selection.notes)
 
 
@@ -129,7 +129,7 @@ def test_corporate_wins_over_judgment_because_the_perimeter_is_not_negotiable():
 
 
 def test_ties_are_broken_by_config_order():
-    ordered = {"first": ex("codex", "fast"), "second": ex("codex", "fast")}
+    ordered = {"first": ex("omp", "fast"), "second": ex("omp", "fast")}
     assert select("fast", ordered).executor == "first"
 
 
@@ -138,7 +138,7 @@ def test_scores_map_tier_probabilities_onto_representatives():
         "fast", FULL, probabilities={"fast": 0.7, "balanced": 0.2, "strong": 0.1}
     ).scores
     assert scores["cheap"] == pytest.approx(0.7)
-    assert scores["codex"] == pytest.approx(0.2)
+    assert scores["omp"] == pytest.approx(0.2)
     assert scores["opus"] == pytest.approx(0.1)
 
 
@@ -148,9 +148,9 @@ def test_select_without_candidates_is_an_error_not_a_silent_default():
 
 
 def settings(**routing):
-    routing.setdefault("fallback_executor", "codex")
+    routing.setdefault("fallback_executor", "omp")
     return Settings.model_validate(
-        {"executors": {"codex": {"adapter": "codex"}}, "routing": routing}
+        {"executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}}, "routing": routing}
     )
 
 

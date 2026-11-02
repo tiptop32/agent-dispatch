@@ -28,7 +28,7 @@ from agent_dispatch.telemetry.storage import Storage
 app = typer.Typer(
     name="agent-dispatch",
     help=(
-        "AgentDispatch: route coding tasks to Claude Code, Codex or OpenCode. "
+        "AgentDispatch: route coding tasks to Claude Code and omp. "
         "Start anywhere. Dispatch anywhere."
     ),
     no_args_is_help=True,

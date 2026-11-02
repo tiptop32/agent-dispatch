@@ -29,16 +29,16 @@ def _settings(tmp_path: Path) -> Settings:
         "claude/opus": ExecutorSettings(adapter="claude", model="opus"),
         "claude/haiku": ExecutorSettings(adapter="claude", model="haiku"),
         "claude/off": ExecutorSettings(adapter="claude", model="sonnet", enabled=False),
-        "codex/sol": ExecutorSettings(adapter="codex", model="sol"),
-        "opencode/a": ExecutorSettings(adapter="opencode", model="x5/a"),
-        "opencode/b": ExecutorSettings(adapter="opencode", model="x5/b"),
-        "omp/a": ExecutorSettings(adapter="omp", model="agent-lb/a"),
-        "omp/b": ExecutorSettings(adapter="omp", model="agent-lb/b"),
+        "omp/sol": ExecutorSettings(adapter="omp", model="sol"),
+        "omp/a": ExecutorSettings(adapter="omp", model="x5/a"),
+        "omp/b": ExecutorSettings(adapter="omp", model="x5/b"),
+        "omp/lb-a": ExecutorSettings(adapter="omp", model="agent-lb/a"),
+        "omp/lb-b": ExecutorSettings(adapter="omp", model="agent-lb/b"),
         "omp/x5": ExecutorSettings(adapter="omp", model="copilot-x5/c"),
     }
     return Settings(
         server=ServerSettings(data_dir=tmp_path),
-        routing=RoutingSettings(fallback_executor="codex/sol", review_only={}),
+        routing=RoutingSettings(fallback_executor="omp/sol", review_only={}),
         executors=executors,
     )
 
@@ -92,36 +92,37 @@ async def test_weekly_limit_takes_the_whole_claude_account_out_until_the_reset(t
     assert "cooldown until" in again.result.error and "weekly limit" in again.result.error
     assert adapters["claude/haiku"].calls == []
     # Другие аккаунты в ротации.
-    assert (await _run(dispatcher, git_repo, "codex/sol")).status == "completed"
+    assert (await _run(dispatcher, git_repo, "omp/sol")).status == "completed"
 
 
 @pytest.mark.asyncio
 async def test_model_overload_cools_only_that_model(tmp_path, git_repo):
     _, _, _, availability, dispatcher = await _make(
-        tmp_path, {"opencode/a": _failed("opencode/a", "Selected model is at capacity.")}
+        tmp_path, {"omp/a": _failed("omp/a", "Selected model is at capacity.")}
     )
-    await _run(dispatcher, git_repo, "opencode/a")
-    assert set(availability.cooldowns()) == {"opencode/a"}
-
-
-@pytest.mark.asyncio
-async def test_opencode_limit_group_is_the_provider(tmp_path, git_repo):
-    _, _, _, availability, dispatcher = await _make(
-        tmp_path, {"opencode/a": _failed("opencode/a", "insufficient_quota")}
-    )
-    await _run(dispatcher, git_repo, "opencode/a")
-    assert set(availability.cooldowns()) == {"opencode/a", "opencode/b"}
+    await _run(dispatcher, git_repo, "omp/a")
+    assert set(availability.cooldowns()) == {"omp/a"}
 
 
 @pytest.mark.asyncio
 async def test_omp_limit_group_is_the_provider(tmp_path, git_repo):
-    # agent-lb один на все роли omp, copilot-x5 — отдельный аккаунт: его лимит
-    # не выносится вместе с балансером.
+    # Группу лимита задаёт провайдер модели: x5/a и x5/b — один аккаунт.
     _, _, _, availability, dispatcher = await _make(
         tmp_path, {"omp/a": _failed("omp/a", "insufficient_quota")}
     )
     await _run(dispatcher, git_repo, "omp/a")
     assert set(availability.cooldowns()) == {"omp/a", "omp/b"}
+
+
+@pytest.mark.asyncio
+async def test_omp_limit_group_follows_the_model_provider(tmp_path, git_repo):
+    # agent-lb один на все роли omp, x5 и copilot-x5 — отдельные аккаунты: их
+    # лимит не выносится вместе с балансером.
+    _, _, _, availability, dispatcher = await _make(
+        tmp_path, {"omp/lb-a": _failed("omp/lb-a", "insufficient_quota")}
+    )
+    await _run(dispatcher, git_repo, "omp/lb-a")
+    assert set(availability.cooldowns()) == {"omp/lb-a", "omp/lb-b"}
 
 
 @pytest.mark.asyncio
@@ -172,7 +173,7 @@ async def test_api_shows_and_clears_cooldowns(tmp_path, git_repo):
         rows = {row["name"]: row for row in listed}
         assert rows["claude/haiku"]["cooldown"]["origin"] == "claude/opus"
         assert rows["claude/haiku"]["available"] is False
-        assert rows["codex/sol"]["cooldown"] is None
+        assert rows["omp/sol"]["cooldown"] is None
         response = await client.delete(
             "/executors/cooldowns", params={"name": ["claude/opus"]}, headers=headers
         )
@@ -185,9 +186,9 @@ async def test_api_shows_and_clears_cooldowns(tmp_path, git_repo):
 async def test_recheck_executor_comes_back_before_the_announced_reset(tmp_path, git_repo):
     _, _, _, availability, dispatcher = await _make(
         tmp_path,
-        {"codex/sol": _failed("codex/sol", "You've hit your usage limit. Try again in 5 hours")},
+        {"omp/sol": _failed("omp/sol", "You've hit your usage limit. Try again in 5 hours")},
     )
-    dispatcher.settings.executors["codex/sol"].limit_reset = "recheck"
-    await _run(dispatcher, git_repo, "codex/sol")
-    left = availability.cooldown("codex/sol").until_utc - datetime.now(UTC)
+    dispatcher.settings.executors["omp/sol"].limit_reset = "recheck"
+    await _run(dispatcher, git_repo, "omp/sol")
+    left = availability.cooldown("omp/sol").until_utc - datetime.now(UTC)
     assert timedelta(minutes=59) < left <= timedelta(hours=1)

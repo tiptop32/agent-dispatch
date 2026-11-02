@@ -42,13 +42,13 @@ def _git(repo: Path, *args: str) -> str:
 async def _make(tmp_path: Path, *, results: dict[str, ExecutionResult] | None = None, **execution):
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path / "data"),
-        routing=RoutingSettings(fallback_executor="codex"),
+        routing=RoutingSettings(fallback_executor="omp"),
         execution=ExecutionSettings(**execution),
         executors={
-            "codex": ExecutorSettings(adapter="codex", description="codex"),
+            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp"),
             "claude": ExecutorSettings(adapter="claude", description="claude"),
         },
-        escalation={"codex": ["claude"]},
+        escalation={"omp": ["claude"]},
     )
     storage = Storage(tmp_path / "db.sqlite")
     await storage.open()
@@ -62,9 +62,7 @@ async def _make(tmp_path: Path, *, results: dict[str, ExecutionResult] | None = 
 
 
 def _req(repo: Path, verify: list[str], **kwargs) -> DispatchRequest:
-    return DispatchRequest(
-        task="fix tests", cwd=str(repo), executor="codex", verify=verify, **kwargs
-    )
+    return DispatchRequest(task="fix tests", cwd=str(repo), executor="omp", verify=verify, **kwargs)
 
 
 async def _finish(dispatcher: Dispatcher, task_id: str):
@@ -92,7 +90,7 @@ def test_is_test_path(path, expected):
 def test_failed_verification_escalates_even_if_the_executor_reported_green_tests():
     result = ExecutionResult(
         status="partial",
-        executor="codex",
+        executor="omp",
         model=None,
         summary="done",
         changed_files=["a.py"],
@@ -105,7 +103,7 @@ def test_failed_verification_escalates_even_if_the_executor_reported_green_tests
 def test_passed_verification_does_not_escalate():
     result = ExecutionResult(
         status="completed",
-        executor="codex",
+        executor="omp",
         model=None,
         summary="done",
         verification=VerificationInfo(result="passed"),
@@ -133,12 +131,12 @@ async def test_passing_verification_keeps_the_result_completed(tmp_path, git_rep
 async def test_failed_verification_escalates_to_the_next_executor(tmp_path, git_repo):
     claimed = ExecutionResult(
         status="completed",
-        executor="codex",
+        executor="omp",
         model=None,
         summary="all green",
         tests=ResultTestsInfo(command="pytest", result="passed"),
     )
-    storage, adapters, dispatcher = await _make(tmp_path, results={"codex": claimed})
+    storage, adapters, dispatcher = await _make(tmp_path, results={"omp": claimed})
     # Первый прогон падает, второй (после эскалации) проходит.
     marker = tmp_path / "second"
     command = f"test -f {marker} || {{ touch {marker}; echo boom; exit 3; }}"
@@ -213,8 +211,8 @@ async def test_rate_limit_text_in_verification_output_does_not_cool_the_executor
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["failed", "needs_context"])
 async def test_verification_is_skipped_when_the_executor_did_not_finish(tmp_path, git_repo, status):
-    result = ExecutionResult(status=status, executor="codex", model=None, summary="")
-    _, _, dispatcher = await _make(tmp_path, results={"codex": result})
+    result = ExecutionResult(status=status, executor="omp", model=None, summary="")
+    _, _, dispatcher = await _make(tmp_path, results={"omp": result})
     marker = tmp_path / "ran"
     record = await dispatcher.submit(_req(git_repo, [f"touch {marker}"], allow_escalation=False))
     done = await _finish(dispatcher, record.task_id)
@@ -238,12 +236,12 @@ async def test_review_is_not_verified(tmp_path, git_repo):
 async def test_changed_test_files_are_reported(tmp_path, git_repo):
     result = ExecutionResult(
         status="completed",
-        executor="codex",
+        executor="omp",
         model=None,
         summary="done",
         changed_files=["a.py", "tests/test_a.py"],
     )
-    _, _, dispatcher = await _make(tmp_path, results={"codex": result})
+    _, _, dispatcher = await _make(tmp_path, results={"omp": result})
     record = await dispatcher.submit(_req(git_repo, ["true"]))
     done = await _finish(dispatcher, record.task_id)
 
@@ -262,7 +260,7 @@ async def test_worktree_verification_runs_in_the_tree_and_leaves_no_artifacts(tm
         (Path(ctx.cwd) / "sub" / "new.py").write_text("y = 1\n")
 
     _, adapters, dispatcher = await _make(tmp_path, workspace_mode="worktree")
-    adapters["codex"].on_execute = edit
+    adapters["omp"].on_execute = edit
     # Команда идёт в подкаталоге дерева (cwd запроса — sub), видит правку
     # исполнителя и оставляет артефакт, которого не должно быть в патче.
     record = await dispatcher.submit(
@@ -285,7 +283,7 @@ async def test_worktree_failed_verification_holds_the_work_on_the_branch(tmp_pat
         (Path(ctx.cwd) / "a.py").write_text("x = 'broken'\n")
 
     storage, adapters, dispatcher = await _make(tmp_path, workspace_mode="worktree")
-    adapters["codex"].on_execute = edit
+    adapters["omp"].on_execute = edit
     record = await dispatcher.submit(_req(git_repo, ["exit 1"]))
     await _finish(dispatcher, record.task_id)
     first = await storage.get_task(record.task_id)
@@ -315,20 +313,20 @@ def test_commit_without_work_still_returns_none(tmp_path, git_repo):
 def test_prompt_lists_verification_commands(tmp_path, git_repo):
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path),
-        routing=RoutingSettings(fallback_executor="codex"),
-        executors={"codex": ExecutorSettings(adapter="codex")},
+        routing=RoutingSettings(fallback_executor="omp"),
+        executors={"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna")},
     )
     req = _req(git_repo, [f"uv run pytest {git_repo}/tests -q"])
-    plain = render_prompt(build_task_package(req, settings), "codex", settings)
+    plain = render_prompt(build_task_package(req, settings), "omp", settings)
     assert "# Verification" in plain
     assert f"- uv run pytest {git_repo}/tests -q" in plain
 
     tree = str(tmp_path / "tree")
     package = build_task_package(req, settings, tree, "agent-dispatch/t")
-    in_tree = render_prompt(package, "codex", settings)
+    in_tree = render_prompt(package, "omp", settings)
     assert f"- uv run pytest {tree}/tests -q" in in_tree
 
-    without = render_prompt(build_task_package(_req(git_repo, []), settings), "codex", settings)
+    without = render_prompt(build_task_package(_req(git_repo, []), settings), "omp", settings)
     assert "# Verification" not in without
 
 
@@ -352,7 +350,7 @@ async def test_failed_rollback_after_verification_keeps_the_result(tmp_path, git
 
     monkeypatch.setattr(worktree, "discard_changes", broken_discard)
     _, adapters, dispatcher = await _make(tmp_path, workspace_mode="worktree")
-    adapters["codex"].on_execute = edit
+    adapters["omp"].on_execute = edit
     record = await dispatcher.submit(_req(git_repo, ["true"]))
     done = await _finish(dispatcher, record.task_id)
 

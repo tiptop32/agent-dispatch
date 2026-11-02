@@ -277,11 +277,11 @@
 - Modify (тесты с codex и opencode в данных): `test_api, test_autostart, test_budget, test_capability, test_claude_local_router, test_cli, test_decision, test_dispatcher, test_dispatcher_worktree, test_env, test_escalation, test_evals_harness, test_exploration, test_followup, test_jev_router, test_mcp_server, test_queue_fallback, test_registry, test_report_recovery, test_result_parser, test_review, test_storage, test_task_package, test_verify`; `tests/fakes/claude_router_{capture,ok}.sh`, `tests/fixtures/jev/request_{capability,executor}.json`, `tests/snapshots/prompt_claude_{full,prompt,summary}.md`
 - Modify: `evals/{executors,workflow,scheduling}/harness.py`, `evals/launcher/__main__.py`, `evals/routing/cases.jsonl`, `evals/workflow/cases.jsonl`, `evals/executors/corpus.jsonl`, `evals/README.md`, `evals/scheduling/README.md` (отчёты в `evals/reports/` остаются историей)
 
-- [ ] убрать ветки codex и opencode в health, task_package, report_recovery, dispatcher и schemas
-- [ ] перевести тестовые данные и фейки на `omp/*`; snapshots пересобрать и просмотреть дифф
-- [ ] evals переключить на `omp/*`
-- [ ] `grep -rn "codex\|opencode" agent_dispatch evals tests` чист, кроме истории в replay, `SourceAgent` и отчётов
-- [ ] гейт зелёный, коммит agent-dispatch
+- [x] убрать ветки codex и opencode в health, task_package, report_recovery, dispatcher и schemas
+- [x] перевести тестовые данные и фейки на `omp/*`; snapshots пересобрать и просмотреть дифф
+- [x] evals переключить на `omp/*`
+- [x] `grep -rn "codex\|opencode" agent_dispatch evals tests` чист, кроме истории в replay, `SourceAgent` и отчётов
+- [x] гейт зелёный, коммит agent-dispatch
 
 ### Task 11: Сервис opencode и ссылки на старые CLI
 **Depends on:** Task 10
@@ -293,6 +293,7 @@
 **Depends on:** Task 11
 - [ ] записать откат в `docs/research/omp-cli-facts.md`: путь к бэкапу конфига, команда установки прежней версии uv tool (коммит до Task 10), рестарт демона
 - ➕ [ ] симлинк `~/.claude/skills/gpt-review` вместо `codex-review`, ссылки в plan-dispatch и review-refactor на gpt-review (после установки omp-setup, иначе ревью сломается)
+- ➕ [ ] `_deep_merge` в config.py: порядок `executors` берётся из пользовательского файла (внутри тира побеждает тот, кто выше в файле пользователя); после смены дефолтных имён на omp/* дефолтные omp/sol, omp/terra, omp/luna обгоняли omp/x5-code-large пользователя. Делается после Task 10 (тот правит config.py), с тестом
 - ➕ [ ] пользовательский config.yaml переносить вручную по образцу `migrate-config --dry-run`: команда теряет комментарии (PyYAML) и оставляет старые description («Codex CLI…»), а Jev выбирает и по описаниям
 - [ ] `agent-dispatch migrate-config` с бэкапом, переустановка uv tool, перезапуск демона (memory installed-tool-is-a-copy), `doctor` на установленной копии
 - [ ] `uv run agent-dispatch doctor --online` зелёный

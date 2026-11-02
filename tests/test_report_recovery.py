@@ -13,7 +13,7 @@ def _missing(**update) -> ExecutionResult:
     """Запуск, у которого работа в дереве есть, а блока отчёта нет."""
     result = ExecutionResult(
         status="partial",
-        executor="opencode/x5",
+        executor="omp/x5",
         model="m",
         summary="stdout tail",
         changed_files=["a.py", "b.py"],
@@ -31,7 +31,7 @@ def _missing(**update) -> ExecutionResult:
 def _report(**update) -> ExecutionResult:
     result = ExecutionResult(
         status="completed",
-        executor="opencode/x5",
+        executor="omp/x5",
         model="m",
         summary="added the endpoint",
         changed_files=[],

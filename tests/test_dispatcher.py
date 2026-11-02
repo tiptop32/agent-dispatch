@@ -33,7 +33,7 @@ def _settings(
     max_hops: int = 2,
     escalation: dict[str, list[str]] | None = None,
 ) -> Settings:
-    names = {"codex": "codex", "claude": "claude", "opencode/kimi": "opencode"}
+    names = {"omp": "omp", "claude": "claude", "omp/kimi": "omp"}
     return Settings(
         server=ServerSettings(
             data_dir=tmp_path,
@@ -41,10 +41,10 @@ def _settings(
             max_concurrent_per_group=max_per_group,
         ),
         routing=RoutingSettings(
-            fallback_executor="codex", max_children=max_children, max_hops=max_hops
+            fallback_executor="omp", max_children=max_children, max_hops=max_hops
         ),
         executors={
-            n: ExecutorSettings(adapter=a, model="kimi" if a == "opencode" else None, description=n)
+            n: ExecutorSettings(adapter=a, model="kimi" if a == "omp" else None, description=n)
             for n, a in names.items()
         },
         escalation=escalation or {},
@@ -63,7 +63,7 @@ async def _make(tmp_path: Path, **kwargs):
 
 
 def _req(repo: Path, **kwargs):
-    values = {"executor": "codex", **kwargs}
+    values = {"executor": "omp", **kwargs}
     return DispatchRequest(task="fix tests", cwd=str(repo), **values)
 
 
@@ -79,24 +79,24 @@ async def test_happy_path_records_decision_result_events(tmp_path, git_repo):
 @pytest.mark.asyncio
 async def test_wait_zero_returns_immediately(tmp_path, git_repo):
     _, _, a, d = await _make(tmp_path)
-    a["codex"].gate = asyncio.Event()
+    a["omp"].gate = asyncio.Event()
     r = await d.submit(_req(git_repo))
     now = await d.wait(r.task_id, 0)
     assert now.status in {"queued", "routing", "running"}
-    a["codex"].gate.set()
+    a["omp"].gate.set()
     assert (await d.wait(r.task_id, WAIT)).status == "completed"
 
 
 @pytest.mark.asyncio
 async def test_semaphore_serializes_roots(tmp_path, git_repo):
     _, _, a, d = await _make(tmp_path, max_tasks=1)
-    a["codex"].gate = asyncio.Event()
-    started = a["codex"].started
+    a["omp"].gate = asyncio.Event()
+    started = a["omp"].started
     r1 = await d.submit(_req(git_repo))
     r2 = await d.submit(_req(git_repo))
     await asyncio.wait_for(started.wait(), WAIT)
-    assert len(a["codex"].calls) == 1
-    a["codex"].gate.set()
+    assert len(a["omp"].calls) == 1
+    a["omp"].gate.set()
     await d.wait(r1.task_id, WAIT)
     await d.wait(r2.task_id, WAIT)
 
@@ -110,50 +110,50 @@ async def test_root_task_capacity_is_per_group_under_global_ceiling(tmp_path, gi
         shutil.copytree(git_repo, repo)
         repos.append(repo)
 
-    codex = adapters["codex"]
-    opencode = adapters["opencode/kimi"]
-    codex.gate = asyncio.Event()
-    opencode.gate = asyncio.Event()
+    omp_one = adapters["omp"]
+    omp_two = adapters["omp/kimi"]
+    omp_one.gate = asyncio.Event()
+    omp_two.gate = asyncio.Event()
 
-    first = await dispatcher.submit(_req(repos[0], executor="codex"))
-    second = await dispatcher.submit(_req(repos[1], executor="codex"))
+    first = await dispatcher.submit(_req(repos[0], executor="omp"))
+    second = await dispatcher.submit(_req(repos[1], executor="omp"))
     async with asyncio.timeout(WAIT):
-        while len(codex.calls) < 2:  # noqa: ASYNC110
+        while len(omp_one.calls) < 2:  # noqa: ASYNC110
             await asyncio.sleep(0)
 
-    waiting_group = await dispatcher.submit(_req(repos[2], executor="codex"))
+    waiting_group = await dispatcher.submit(_req(repos[2], executor="omp"))
     async with asyncio.timeout(WAIT):
         while (await storage.get_task(waiting_group.task_id)).decision is None:  # noqa: ASYNC110
             await asyncio.sleep(0)
 
-    other_group = await dispatcher.submit(_req(repos[3], executor="opencode/kimi"))
-    await asyncio.wait_for(opencode.started.wait(), WAIT)
-    assert len(codex.calls) == 2
-    assert len(opencode.calls) == 1
+    other_group = await dispatcher.submit(_req(repos[3], executor="omp/kimi"))
+    await asyncio.wait_for(omp_two.started.wait(), WAIT)
+    assert len(omp_one.calls) == 2
+    assert len(omp_two.calls) == 1
 
-    # В группе opencode есть место, но общий предел уже занят двумя codex и
-    # первым opencode. Ожидающий group-slot codex общего слота не держит.
-    opencode.started = asyncio.Event()
-    waiting_global = await dispatcher.submit(_req(repos[4], executor="opencode/kimi"))
+    # В группе omp_two есть место, но общий предел уже занят двумя omp_one и
+    # первым omp_two. Ожидающий group-slot omp_one общего слота не держит.
+    omp_two.started = asyncio.Event()
+    waiting_global = await dispatcher.submit(_req(repos[4], executor="omp/kimi"))
     async with asyncio.timeout(WAIT):
         while (await storage.get_task(waiting_global.task_id)).decision is None:  # noqa: ASYNC110
             await asyncio.sleep(0)
     with pytest.raises(TimeoutError):
-        await asyncio.wait_for(opencode.started.wait(), 0.1)
+        await asyncio.wait_for(omp_two.started.wait(), 0.1)
 
     # Отмена задачи, которая не получила group-slot, не должна освободить
-    # чужой global-slot. Второй opencode по-прежнему ждёт.
+    # чужой global-slot. Второй omp_two по-прежнему ждёт.
     await dispatcher.cancel(waiting_group.task_id)
     with pytest.raises(TimeoutError):
-        await asyncio.wait_for(opencode.started.wait(), 0.1)
+        await asyncio.wait_for(omp_two.started.wait(), 0.1)
 
     await dispatcher.cancel(first.task_id)
-    await asyncio.wait_for(opencode.started.wait(), WAIT)
-    assert len(opencode.calls) == 2
+    await asyncio.wait_for(omp_two.started.wait(), WAIT)
+    assert len(omp_two.calls) == 2
 
     events = await storage.list_events(other_group.task_id)
     slot = next(event["payload"] for event in events if event["kind"] == "slot")
-    assert slot["limit_group"] == "opencode/kimi"
+    assert slot["limit_group"] == "omp/kimi"
     assert slot["wait_seconds"] >= 0
 
     for task_id in (second.task_id, other_group.task_id, waiting_global.task_id):
@@ -175,7 +175,7 @@ async def test_nested_hop_bypasses_semaphore(tmp_path, git_repo):
         assert (await d.wait(child.task_id, WAIT)).status == "completed"
         gate.set()
 
-    a["codex"].on_execute = nested
+    a["omp"].on_execute = nested
     r = await d.submit(_req(git_repo))
     assert (await asyncio.wait_for(d.wait(r.task_id, WAIT), WAIT)).status == "completed"
 
@@ -183,12 +183,12 @@ async def test_nested_hop_bypasses_semaphore(tmp_path, git_repo):
 @pytest.mark.asyncio
 async def test_per_cwd_lock_serializes_same_repo(tmp_path, git_repo):
     _, st, a, d = await _make(tmp_path)
-    a["codex"].gate = asyncio.Event()
+    a["omp"].gate = asyncio.Event()
     r1 = await d.submit(_req(git_repo))
     r2 = await d.submit(_req(git_repo))
-    await asyncio.wait_for(a["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(a["omp"].started.wait(), WAIT)
     assert not any(e["kind"] == "spawn" for e in await st.list_events(r2.task_id))
-    a["codex"].gate.set()
+    a["omp"].gate.set()
     await d.wait(r1.task_id, WAIT)
     await d.wait(r2.task_id, WAIT)
 
@@ -203,12 +203,12 @@ def _git(repo: Path, *args: str) -> None:
 async def test_per_cwd_lock_keys_working_copy_root(tmp_path, git_repo):
     """Корень и подкаталог одной рабочей копии стоят в одной очереди lock."""
     _, st, a, d = await _make(tmp_path)
-    a["codex"].gate = asyncio.Event()
+    a["omp"].gate = asyncio.Event()
     sub = git_repo / "sub"
     sub.mkdir()
     r1 = await d.submit(_req(git_repo))
     r2 = await d.submit(_req(sub))
-    await asyncio.wait_for(a["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(a["omp"].started.wait(), WAIT)
     # Ждём, пока r2 дойдёт до lock: slot выдан, дальше только ключ lock. Если бы
     # ключом был cwd, r2 стартовал бы за миллисекунды; окно ниже это ловит.
     async with asyncio.timeout(WAIT):
@@ -217,8 +217,8 @@ async def test_per_cwd_lock_keys_working_copy_root(tmp_path, git_repo):
         ):
             await asyncio.sleep(0.01)
     await asyncio.sleep(0.2)
-    assert len(a["codex"].calls) == 1
-    a["codex"].gate.set()
+    assert len(a["omp"].calls) == 1
+    a["omp"].gate.set()
     await d.wait(r1.task_id, WAIT)
     await d.wait(r2.task_id, WAIT)
 
@@ -230,13 +230,13 @@ async def test_per_cwd_lock_keeps_separate_worktrees_parallel(tmp_path, git_repo
     wt1, wt2 = tmp_path / "wt1", tmp_path / "wt2"
     _git(git_repo, "worktree", "add", str(wt1), "-b", "wt1")
     _git(git_repo, "worktree", "add", str(wt2), "-b", "wt2")
-    a["codex"].gate = asyncio.Event()
+    a["omp"].gate = asyncio.Event()
     r1 = await d.submit(_req(wt1))
     r2 = await d.submit(_req(wt2))
     async with asyncio.timeout(WAIT):
-        while len(a["codex"].calls) < 2:  # noqa: ASYNC110
+        while len(a["omp"].calls) < 2:  # noqa: ASYNC110
             await asyncio.sleep(0.01)
-    a["codex"].gate.set()
+    a["omp"].gate.set()
     await d.wait(r1.task_id, WAIT)
     await d.wait(r2.task_id, WAIT)
 
@@ -249,18 +249,18 @@ async def test_per_cwd_lock_keeps_separate_worktrees_parallel(tmp_path, git_repo
 @pytest.mark.asyncio
 async def test_cancel_running_marks_adapter_cancelled(tmp_path, git_repo):
     _, _, a, d = await _make(tmp_path)
-    a["codex"].gate = asyncio.Event()
+    a["omp"].gate = asyncio.Event()
     r = await d.submit(_req(git_repo))
-    await asyncio.wait_for(a["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(a["omp"].started.wait(), WAIT)
     out = await d.cancel(r.task_id)
-    assert out.status == "cancelled" and a["codex"].cancelled
+    assert out.status == "cancelled" and a["omp"].cancelled
 
 
 @pytest.mark.asyncio
 async def test_max_hops_guard(tmp_path, git_repo):
     _, _, a, d = await _make(tmp_path, max_hops=1)
     out = await d.wait((await d.submit(_req(git_repo, hop=1))).task_id, WAIT)
-    assert out.result and out.result.meta["guard"] == "max_hops" and not a["codex"].calls
+    assert out.result and out.result.meta["guard"] == "max_hops" and not a["omp"].calls
 
 
 @pytest.mark.asyncio
@@ -307,10 +307,10 @@ async def test_max_children_refusal_lists_running_siblings(tmp_path, git_repo):
     await d.wait(parent.task_id, WAIT)
     done = await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))
     await d.wait(done.task_id, WAIT)
-    a["codex"].gate = asyncio.Event()
-    a["codex"].started.clear()
+    a["omp"].gate = asyncio.Event()
+    a["omp"].started.clear()
     running = await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))
-    await asyncio.wait_for(a["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(a["omp"].started.wait(), WAIT)
     refused = await d.wait(
         (await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))).task_id, WAIT
     )
@@ -321,7 +321,7 @@ async def test_max_children_refusal_lists_running_siblings(tmp_path, git_repo):
     )
     # Слот освободился: работающих sibling'ов больше нет, и отказ снова
     # короткий — ждать нечего, но квота fan-out не растёт.
-    a["codex"].gate.set()
+    a["omp"].gate.set()
     await d.wait(running.task_id, WAIT)
     retried = await d.wait(
         (await d.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))).task_id, WAIT
@@ -333,35 +333,35 @@ async def test_max_children_refusal_lists_running_siblings(tmp_path, git_repo):
 @pytest.mark.asyncio
 async def test_queued_task_is_not_spawned_after_executor_enters_cooldown(tmp_path, git_repo):
     _, storage, adapters, dispatcher = await _make(
-        tmp_path, max_tasks=1, escalation={"codex": ["claude"]}
+        tmp_path, max_tasks=1, escalation={"omp": ["claude"]}
     )
     gate = asyncio.Event()
-    adapters["codex"].gate = gate
-    adapters["codex"].result = ExecutionResult(
+    adapters["omp"].gate = gate
+    adapters["omp"].result = ExecutionResult(
         status="failed",
-        executor="codex",
+        executor="omp",
         model=None,
         summary="",
         error="You've hit your monthly spend limit; try again tomorrow",
     )
 
     first = await dispatcher.submit(_req(git_repo))
-    await asyncio.wait_for(adapters["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(adapters["omp"].started.wait(), WAIT)
     second = await dispatcher.submit(_req(git_repo))
     for _ in range(100):
         if (await storage.get_task(second.task_id)).decision is not None:
             break
         await asyncio.sleep(0.01)
-    assert (await storage.get_task(second.task_id)).decision.executor == "codex"
+    assert (await storage.get_task(second.task_id)).decision.executor == "omp"
     gate.set()
 
     await dispatcher.wait(first.task_id, WAIT)
     final = await dispatcher.wait(second.task_id, WAIT)
     queued = await storage.get_task(second.task_id)
 
-    assert len(adapters["codex"].calls) == 1
+    assert len(adapters["omp"].calls) == 1
     assert queued.status == "failed"
-    assert queued.result.error == "executor became unavailable while waiting for a slot: codex"
+    assert queued.result.error == "executor became unavailable while waiting for a slot: omp"
     assert queued.result.meta["escalated_to"] == final.task_id
     assert final.status == "completed" and final.decision.executor == "claude"
 
@@ -369,10 +369,10 @@ async def test_queued_task_is_not_spawned_after_executor_enters_cooldown(tmp_pat
 @pytest.mark.asyncio
 async def test_adapter_exception_is_failed_and_worker_survives(tmp_path, git_repo):
     _, _, a, d = await _make(tmp_path)
-    a["codex"].raise_exc = ValueError("boom")
+    a["omp"].raise_exc = ValueError("boom")
     bad = await d.wait((await d.submit(_req(git_repo))).task_id, WAIT)
     assert bad.status == "failed" and "ValueError: boom" == bad.result.error
-    a["codex"].raise_exc = None
+    a["omp"].raise_exc = None
     assert (await d.wait((await d.submit(_req(git_repo))).task_id, WAIT)).status == "completed"
 
 
@@ -390,8 +390,8 @@ async def test_child_env_hop_and_secret_filter(tmp_path, git_repo, monkeypatch):
     r = await d.submit(_req(git_repo))
     await d.wait(r.task_id, WAIT)
     assert (
-        "OPENROUTER_API_KEY" not in a["codex"].calls[0].env
-        and a["codex"].calls[0].env["AGENT_DISPATCH_HOP"] == "1"
+        "OPENROUTER_API_KEY" not in a["omp"].calls[0].env
+        and a["omp"].calls[0].env["AGENT_DISPATCH_HOP"] == "1"
     )
 
 
@@ -407,7 +407,7 @@ async def test_route_only_writes_null_task_decision(tmp_path, git_repo):
 async def test_missing_adapter_after_routing_fails(tmp_path, git_repo):
     _, _, a, d = await _make(tmp_path)
     r = await d.submit(_req(git_repo))
-    a.pop("codex")
+    a.pop("omp")
     out = await d.wait(r.task_id, WAIT)
     assert out.result.meta["guard"] == "unavailable"
 
@@ -415,9 +415,9 @@ async def test_missing_adapter_after_routing_fails(tmp_path, git_repo):
 @pytest.mark.asyncio
 async def test_shutdown_cancels_running(tmp_path, git_repo):
     _, _, a, d = await _make(tmp_path)
-    a["codex"].gate = asyncio.Event()
+    a["omp"].gate = asyncio.Event()
     r = await d.submit(_req(git_repo))
-    await asyncio.wait_for(a["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(a["omp"].started.wait(), WAIT)
     await d.shutdown()
     assert (await d.get(r.task_id)).status == "cancelled"
 
@@ -522,9 +522,9 @@ async def test_shutdown_waits_for_cleanup_before_storage_close(tmp_path, git_rep
     # Cleanup-таск из done-колбэка не должен работать после shutdown:
     # иначе он обратится к закрытому storage.
     _, st, a, d = await _make(tmp_path)
-    a["codex"].gate = asyncio.Event()
+    a["omp"].gate = asyncio.Event()
     r = await d.submit(_req(git_repo))
-    await asyncio.wait_for(a["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(a["omp"].started.wait(), WAIT)
     await d.shutdown()
     assert not d._cleanup
     await st.close()
@@ -534,9 +534,9 @@ async def test_shutdown_waits_for_cleanup_before_storage_close(tmp_path, git_rep
 @pytest.mark.asyncio
 async def test_cancelled_root_task_releases_cwd_lock(tmp_path, git_repo):
     _, _, a, d = await _make(tmp_path)
-    a["codex"].gate = asyncio.Event()
+    a["omp"].gate = asyncio.Event()
     r = await d.submit(_req(git_repo))
-    await asyncio.wait_for(a["codex"].started.wait(), WAIT)
+    await asyncio.wait_for(a["omp"].started.wait(), WAIT)
     assert d._cwd_locks
     await d.cancel(r.task_id, wait_seconds=WAIT)
     await asyncio.sleep(0)
@@ -559,7 +559,7 @@ async def test_worker_cancelled_before_start_is_recorded_cancelled(tmp_path, git
 @pytest.mark.asyncio
 async def test_timeout_precedence_request_then_executor_then_routing(tmp_path, git_repo):
     settings, _, a, d = await _make(tmp_path)
-    settings.executors["codex"].timeout_seconds = 3600
+    settings.executors["omp"].timeout_seconds = 3600
     settings.routing.default_timeout_seconds = 1800
 
     for req, expected in (

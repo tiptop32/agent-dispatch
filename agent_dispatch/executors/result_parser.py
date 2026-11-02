@@ -142,8 +142,7 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
         if mapped_status is not None:
             raw = {**raw, "status": mapped_status}
             coerced.append(f"status: {status!r} -> {mapped_status}")
-    # Strict-схема codex требует `null` в необязательных полях, а обычная схема
-    # его не принимает. `null` значит «нет значения»: поле убирается, а не
+    # `null` в необязательных полях значит «нет значения»: поле убирается, а не
     # превращает готовую работу в `partial`.
     for key in _OPTIONAL_FIELDS:
         if key in raw and raw[key] is None:

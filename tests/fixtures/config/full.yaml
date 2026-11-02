@@ -29,7 +29,7 @@ executors:
     enabled: false
   local:
     adapter: omp
-    command: codex-custom
+    command: omp-custom
     model: gpt-example
     extra_args: ["--quiet"]
     enabled: true

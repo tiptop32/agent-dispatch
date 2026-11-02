@@ -271,9 +271,8 @@ def _omp_x5_profile_check() -> Check:
 def _trapped_secret_hint(settings: Settings, error: str) -> str:
     """Подсказка, если CLI не нашёл ключ, который лежит в env-файле agent-dispatch.
 
-    `child_env` не пускает секреты в env исполнителей, и CLI (например,
-    `scripts/codex-agent-lb` с `exit 78`) падает с именем ключа в stderr.
-    Значение ключа не печатается.
+    `child_env` не пускает секреты в env исполнителей, и CLI падает с именем
+    ключа в stderr. Значение ключа не печатается.
     """
     # Только env-файл agent-dispatch (`Settings.secrets`): ключ из окружения
     # процесса демона туда не относится, и совет переложить его был бы ложным.

@@ -26,12 +26,15 @@ class Good:
 async def test_fallback_chain():
     s = Settings.model_validate(
         {
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+            },
         }
     )
     d, events = await decide_with_fallback(
-        DispatchRequest(task="x", cwd="."), {"claude": "c", "codex": "d"}, s, [Bad(), Good()]
+        DispatchRequest(task="x", cwd="."), {"claude": "c", "omp": "d"}, s, [Bad(), Good()]
     )
     assert d.executor == "claude" and len(events) == 1
 
@@ -53,12 +56,15 @@ class Counting:
 async def test_jev_ok_has_no_events():
     s = Settings.model_validate(
         {
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+            },
         }
     )
     d, events = await decide_with_fallback(
-        DispatchRequest(task="x", cwd="."), {"claude": "c", "codex": "d"}, s, [Counting("jev")]
+        DispatchRequest(task="x", cwd="."), {"claude": "c", "omp": "d"}, s, [Counting("jev")]
     )
     assert d.router == "jev" and not events
 
@@ -79,7 +85,7 @@ async def test_capability_ceiling_caps_every_router_choice(router_kind):
             )
 
     candidates = {
-        "balanced": ExecutorSettings(adapter="codex", tier="balanced"),
+        "balanced": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="balanced"),
         "strong": ExecutorSettings(adapter="claude", tier="strong"),
     }
     settings = Settings.model_validate(
@@ -124,8 +130,8 @@ async def test_capability_ceiling_keeps_corporate_and_judgment_narrowing():
             )
 
     candidates = {
-        "internal": ExecutorSettings(adapter="opencode", model="x", tier="fast", corporate=True),
-        "balanced": ExecutorSettings(adapter="codex", tier="balanced"),
+        "internal": ExecutorSettings(adapter="omp", model="x", tier="fast", corporate=True),
+        "balanced": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="balanced"),
         "strong": ExecutorSettings(adapter="claude", tier="strong"),
     }
     settings = Settings.model_validate(
@@ -170,7 +176,7 @@ async def test_capped_decision_notes_describe_the_new_choice_not_the_old_one():
             )
 
     candidates = {
-        "x5": ExecutorSettings(adapter="opencode", model="x", tier="balanced"),
+        "x5": ExecutorSettings(adapter="omp", model="x", tier="balanced"),
         "opus": ExecutorSettings(adapter="claude", tier="strong"),
     }
     settings = Settings.model_validate(
@@ -195,14 +201,17 @@ async def test_capped_decision_notes_describe_the_new_choice_not_the_old_one():
 async def test_jev_error_then_claude_and_event():
     s = Settings.model_validate(
         {
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+            },
         }
     )
     good = Counting("claude_local")
     d, events = await decide_with_fallback(
         DispatchRequest(task="x", cwd="."),
-        {"claude": "c", "codex": "d"},
+        {"claude": "c", "omp": "d"},
         s,
         [Counting("jev", True), good],
     )
@@ -213,18 +222,21 @@ async def test_jev_error_then_claude_and_event():
 async def test_both_errors_fallback_confidence_zero():
     s = Settings.model_validate(
         {
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+            },
         }
     )
     d, events = await decide_with_fallback(
         DispatchRequest(task="x", cwd="."),
-        {"claude": "c", "codex": "d"},
+        {"claude": "c", "omp": "d"},
         s,
         [Counting("jev", True), Counting("claude_local", True)],
     )
     assert (
-        d.executor == "codex"
+        d.executor == "omp"
         and d.confidence == 0
         and d.reason == "router_unavailable"
         and len(events) == 2
@@ -235,8 +247,11 @@ async def test_both_errors_fallback_confidence_zero():
 async def test_fallback_unavailable_uses_first_candidate_and_event():
     s = Settings.model_validate(
         {
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+            },
         }
     )
     d, events = await decide_with_fallback(
@@ -252,8 +267,11 @@ async def test_fallback_unavailable_uses_first_candidate_and_event():
 async def test_single_candidate_skips_routers():
     s = Settings.model_validate(
         {
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+            },
         }
     )
     router = Counting("jev")
@@ -267,11 +285,11 @@ async def test_single_candidate_skips_routers():
 async def test_all_routers_failed_with_perimeter_picks_corporate_executor():
     """Оба роутера упали, периметр включён: fallback не выводит задачу за периметр."""
     candidates = {
-        "internal": ExecutorSettings(adapter="opencode", model="m", corporate=True),
-        "codex": ExecutorSettings(adapter="codex"),
+        "internal": ExecutorSettings(adapter="omp", model="m", corporate=True),
+        "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna"),
     }
     settings = Settings.model_validate(
-        {"routing": {"fallback_executor": "codex"}, "executors": candidates}
+        {"routing": {"fallback_executor": "omp"}, "executors": candidates}
     )
     d, events = await decide_with_fallback(
         DispatchRequest(task="x", cwd="."), candidates, settings, [Bad(), Bad()]
@@ -285,19 +303,19 @@ async def test_all_routers_failed_with_perimeter_picks_corporate_executor():
 async def test_all_routers_failed_without_perimeter_keeps_fallback_chain():
     """Периметр выключен: прежний fallback по всей цепочке без сужения."""
     candidates = {
-        "internal": ExecutorSettings(adapter="opencode", model="m", corporate=True),
-        "codex": ExecutorSettings(adapter="codex"),
+        "internal": ExecutorSettings(adapter="omp", model="m", corporate=True),
+        "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna"),
     }
     settings = Settings.model_validate(
         {
-            "routing": {"fallback_executor": "codex", "corporate_perimeter": False},
+            "routing": {"fallback_executor": "omp", "corporate_perimeter": False},
             "executors": candidates,
         }
     )
     d, _ = await decide_with_fallback(
         DispatchRequest(task="x", cwd="."), candidates, settings, [Bad(), Bad()]
     )
-    assert d.executor == "codex"
+    assert d.executor == "omp"
     assert "perimeter" not in d.meta
 
 
@@ -307,16 +325,16 @@ def test_build_routers_by_backend():
     s = Settings.model_validate(
         {
             "router": {"backend": "jev"},
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }
     )
     assert [r.name for r in build_routers(s, httpx.AsyncClient())] == ["jev", "claude_local"]
     s = Settings.model_validate(
         {
             "router": {"backend": "claude_local"},
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }
     )
     assert [r.name for r in build_routers(s, httpx.AsyncClient())] == ["claude_local"]
@@ -327,18 +345,18 @@ async def test_fallback_chain_skips_unavailable_head_without_warning():
     """Роутеры недоступны, голова цепочки остывает: берётся следующий из цепочки."""
     s = Settings.model_validate(
         {
-            "routing": {"fallback_executor": ["opencode/kimi", "codex"]},
+            "routing": {"fallback_executor": ["omp/kimi", "omp"]},
             "executors": {
                 "claude": {"adapter": "claude"},
-                "codex": {"adapter": "codex"},
-                "opencode/kimi": {"adapter": "opencode", "model": "kimi"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+                "omp/kimi": {"adapter": "omp", "model": "kimi"},
             },
         }
     )
     d, events = await decide_with_fallback(
-        DispatchRequest(task="x", cwd="."), {"claude": "c", "codex": "x"}, s, [Bad()]
+        DispatchRequest(task="x", cwd="."), {"claude": "c", "omp": "x"}, s, [Bad()]
     )
-    assert d.executor == "codex" and "warning" not in d.meta and len(events) == 1
+    assert d.executor == "omp" and "warning" not in d.meta and len(events) == 1
 
 
 def _perimeter_settings():
@@ -346,9 +364,9 @@ def _perimeter_settings():
         {
             "routing": {"fallback_executor": ["external"]},
             "executors": {
-                "external": {"adapter": "codex", "tier": "balanced"},
+                "external": {"adapter": "omp", "model": "agent-lb/luna", "tier": "balanced"},
                 "internal": {
-                    "adapter": "opencode",
+                    "adapter": "omp",
                     "model": "m",
                     "tier": "balanced",
                     "corporate": True,
@@ -411,7 +429,7 @@ async def test_all_routers_failed_fallback_respects_max_capability_without_perim
             "routing": {"fallback_executor": ["strong"]},
             "executors": {
                 "strong": {"adapter": "claude", "tier": "strong"},
-                "cheap": {"adapter": "codex", "tier": "fast"},
+                "cheap": {"adapter": "omp", "model": "agent-lb/luna", "tier": "fast"},
             },
         }
     )
@@ -431,7 +449,7 @@ async def test_all_routers_failed_and_nothing_within_ceiling_uses_the_fallback_c
             "routing": {"fallback_executor": ["second"]},
             "executors": {
                 "first": {"adapter": "claude", "tier": "strong"},
-                "second": {"adapter": "codex", "tier": "strong"},
+                "second": {"adapter": "omp", "model": "agent-lb/luna", "tier": "strong"},
             },
         }
     )

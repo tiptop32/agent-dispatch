@@ -8,11 +8,11 @@ from agent_dispatch.routing.guards import candidates, post_guards, pre_guards
 def settings():
     return Settings.model_validate(
         {
-            "routing": {"fallback_executor": "codex"},
+            "routing": {"fallback_executor": "omp"},
             "executors": {
                 "claude": {"adapter": "claude", "enabled": True},
-                "codex": {"adapter": "codex", "enabled": True},
-                "opencode/kimi": {"adapter": "opencode", "model": "kimi", "enabled": True},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna", "enabled": True},
+                "omp/kimi": {"adapter": "omp", "model": "kimi", "enabled": True},
             },
         }
     )
@@ -20,9 +20,9 @@ def settings():
 
 def test_pre_guards_and_candidates(git_repo):
     s = settings()
-    req = DispatchRequest(task="x", cwd=str(git_repo), source_agent=SourceAgent.opencode)
+    req = DispatchRequest(task="x", cwd=str(git_repo), source_agent=SourceAgent.omp)
     assert pre_guards(req, s, set(), True, 0) is None
-    assert candidates(s, set(), SourceAgent.opencode, 0) == ["claude", "codex"]
+    assert candidates(s, set(), SourceAgent.omp, 0) == ["claude"]
     assert (
         pre_guards(req.model_copy(update={"hop": 2}), s, set(), True, 0).reason
         == GuardReason.max_hops
@@ -31,12 +31,12 @@ def test_pre_guards_and_candidates(git_repo):
 
 def test_override_and_post_guard(git_repo):
     s = settings()
-    req = DispatchRequest(task="x", cwd=str(git_repo), executor="codex", max_capability="fast")
-    assert pre_guards(req, s, set(), True, 0).executor == "codex"
+    req = DispatchRequest(task="x", cwd=str(git_repo), executor="omp", max_capability="fast")
+    assert pre_guards(req, s, set(), True, 0).executor == "omp"
     d = __import__("agent_dispatch.models", fromlist=["RouteDecision"]).RouteDecision(
-        router="jev", executor="claude", confidence=0.5, scores={"claude": 0.5, "codex": 0.5}
+        router="jev", executor="claude", confidence=0.5, scores={"claude": 0.5, "omp": 0.5}
     )
-    out, events = post_guards(d, s, ["claude", "codex"])
+    out, events = post_guards(d, s, ["claude", "omp"])
     assert out.reason == GuardReason.low_confidence and events
 
 
@@ -128,8 +128,10 @@ def test_override_ok_same_source(git_repo):
     assert pre_guards(r, settings(), set(), True, 0).router == "override"
 
 
-def test_candidates_codex_excludes_only_codex():
-    assert candidates(settings(), set(), SourceAgent.codex, 0) == ["claude", "opencode/kimi"]
+def test_candidates_agent_source_excludes_only_its_pool():
+    assert candidates(settings(), set(), SourceAgent.omp, 0) == ["claude"]
+    # Источник codex остаётся валидным и не исключает omp-пул.
+    assert candidates(settings(), set(), SourceAgent.codex, 0) == ["claude", "omp", "omp/kimi"]
 
 
 def test_candidates_hop_one_and_flag_false_keep_source():
@@ -142,7 +144,7 @@ def test_candidates_hop_one_and_flag_false_keep_source():
 def test_candidates_unavailable_disabled_subtracted():
     s = settings()
     s.executors["claude"].enabled = False
-    assert candidates(s, {"codex"}, SourceAgent.unknown, 0) == ["opencode/kimi"]
+    assert candidates(s, {"omp"}, SourceAgent.unknown, 0) == ["omp/kimi"]
 
 
 @pytest.mark.parametrize("source", [SourceAgent.cli, SourceAgent.unknown])
@@ -158,10 +160,10 @@ def test_post_low_confidence():
             router=RouterKind.jev,
             executor="claude",
             confidence=0.5,
-            scores={"claude": 0.9, "codex": 0.1},
+            scores={"claude": 0.9, "omp": 0.1},
         ),
         settings(),
-        ["claude", "codex"],
+        ["claude", "omp"],
     )
     assert (
         out.reason == GuardReason.low_confidence and events[0].reason == GuardReason.low_confidence
@@ -175,9 +177,9 @@ def test_post_margin_boundary_passes():
         router=RouterKind.jev,
         executor="claude",
         confidence=1,
-        scores={"claude": 0.55, "codex": 0.45},
+        scores={"claude": 0.55, "omp": 0.45},
     )
-    assert not post_guards(d, settings(), ["claude", "codex"])[1]
+    assert not post_guards(d, settings(), ["claude", "omp"])[1]
 
 
 def test_post_margin_below_fails():
@@ -187,9 +189,9 @@ def test_post_margin_below_fails():
         router=RouterKind.jev,
         executor="claude",
         confidence=1,
-        scores={"claude": 0.54, "codex": 0.46},
+        scores={"claude": 0.54, "omp": 0.46},
     )
-    assert post_guards(d, settings(), ["claude", "codex"])[0].reason == GuardReason.low_margin
+    assert post_guards(d, settings(), ["claude", "omp"])[0].reason == GuardReason.low_margin
 
 
 def test_post_fallback_not_candidate_warning():
@@ -210,9 +212,9 @@ def test_post_ok_no_mutation_or_events():
     from agent_dispatch.models import RouteDecision, RouterKind
 
     d = RouteDecision(
-        router=RouterKind.jev, executor="claude", confidence=1, scores={"claude": 0.9, "codex": 0.1}
+        router=RouterKind.jev, executor="claude", confidence=1, scores={"claude": 0.9, "omp": 0.1}
     )
-    out, events = post_guards(d, settings(), ["claude", "codex"])
+    out, events = post_guards(d, settings(), ["claude", "omp"])
     assert out is not d and not events
     assert out.executor == d.executor and out.scores == d.scores
     # Уверенный выбор помечается как autonomous, но не подменяется.
@@ -226,8 +228,8 @@ def chain_settings(chain):
             "routing": {"fallback_executor": chain},
             "executors": {
                 "claude": {"adapter": "claude"},
-                "codex": {"adapter": "codex"},
-                "opencode/kimi": {"adapter": "opencode", "model": "kimi"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+                "omp/kimi": {"adapter": "omp", "model": "kimi"},
             },
         }
     )
@@ -240,8 +242,8 @@ def test_post_fallback_chain_takes_first_available_member():
     d = RouteDecision(
         router=RouterKind.jev, executor="claude", confidence=0.5, scores={"claude": 0.9}
     )
-    out, events = post_guards(d, chain_settings(["opencode/kimi", "codex"]), ["claude", "codex"])
-    assert out.executor == "codex"
+    out, events = post_guards(d, chain_settings(["omp/kimi", "omp"]), ["claude", "omp"])
+    assert out.executor == "omp"
     assert "warning" not in out.meta
     assert [e.reason for e in events] == [GuardReason.low_confidence]
 
@@ -252,9 +254,9 @@ def test_post_fallback_chain_prefers_head_when_available():
     d = RouteDecision(
         router=RouterKind.jev, executor="claude", confidence=0.5, scores={"claude": 0.9}
     )
-    candidates_ = ["claude", "codex", "opencode/kimi"]
-    out, _ = post_guards(d, chain_settings(["opencode/kimi", "codex"]), candidates_)
-    assert out.executor == "opencode/kimi"
+    candidates_ = ["claude", "omp", "omp/kimi"]
+    out, _ = post_guards(d, chain_settings(["omp/kimi", "omp"]), candidates_)
+    assert out.executor == "omp/kimi"
 
 
 def test_post_fallback_chain_exhausted_keeps_top1_with_warning():
@@ -263,9 +265,9 @@ def test_post_fallback_chain_exhausted_keeps_top1_with_warning():
     d = RouteDecision(
         router=RouterKind.jev, executor="claude", confidence=0.5, scores={"claude": 0.9}
     )
-    out, events = post_guards(d, chain_settings(["opencode/kimi", "codex"]), ["claude"])
+    out, events = post_guards(d, chain_settings(["omp/kimi", "omp"]), ["claude"])
     assert out.executor == "claude"
-    assert out.meta["warning"] == "fallback executor unavailable: opencode/kimi, codex"
+    assert out.meta["warning"] == "fallback executor unavailable: omp/kimi, omp"
     assert events[-1].reason == GuardReason.unavailable
 
 
@@ -274,8 +276,8 @@ def perimeter_settings(chain):
         {
             "routing": {"fallback_executor": chain},
             "executors": {
-                "internal": {"adapter": "opencode", "model": "m", "corporate": True},
-                "codex": {"adapter": "codex"},
+                "internal": {"adapter": "omp", "model": "m", "corporate": True},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
                 "claude": {"adapter": "claude"},
             },
         }
@@ -292,7 +294,7 @@ def test_post_low_confidence_keeps_fallback_inside_perimeter():
     """Слабое решение, суженное до периметра: fallback не выводит задачу наружу."""
     from agent_dispatch.models import RouteDecision, RouterKind
 
-    s = perimeter_settings(["codex"])
+    s = perimeter_settings(["omp"])
     d = RouteDecision(
         router=RouterKind.jev,
         executor="internal",
@@ -300,7 +302,7 @@ def test_post_low_confidence_keeps_fallback_inside_perimeter():
         scores={"internal": 0.9},
         judgments={"corporate_data": _corporate_judgment()},
     )
-    out, events = post_guards(d, s, ["internal", "codex"])
+    out, events = post_guards(d, s, ["internal", "omp"])
     assert out.executor == "internal"
     assert out.meta["perimeter"] == "answered"
     # Цепочка без исполнителя периметра: задача остаётся у внутреннего
@@ -316,7 +318,7 @@ def test_post_guards_narrows_unanswered_perimeter_to_corporate():
     d = RouteDecision(
         router=RouterKind.claude_local, executor="claude", confidence=0.99, scores={"claude": 0.99}
     )
-    out, _ = post_guards(d, perimeter_settings(["codex"]), ["internal", "codex", "claude"])
+    out, _ = post_guards(d, perimeter_settings(["omp"]), ["internal", "omp", "claude"])
     assert out.executor == "internal"
     assert out.meta["perimeter"] == "unknown"
     assert any("fail closed" in note for note in out.meta["selection_notes"])
@@ -326,7 +328,7 @@ def test_post_weak_without_corporate_in_chain_stays_inside_perimeter():
     """В цепочке нет исполнителя периметра: выбор остаётся в пуле, с предупреждением."""
     from agent_dispatch.models import RouteDecision, RouterKind
 
-    s = perimeter_settings(["codex"])
+    s = perimeter_settings(["omp"])
     d = RouteDecision(
         router=RouterKind.jev,
         executor="claude",
@@ -334,7 +336,7 @@ def test_post_weak_without_corporate_in_chain_stays_inside_perimeter():
         scores={"claude": 0.9, "internal": 0.1},
         judgments={"corporate_data": _corporate_judgment()},
     )
-    out, events = post_guards(d, s, ["internal", "claude", "codex"])
+    out, events = post_guards(d, s, ["internal", "claude", "omp"])
     assert out.executor == "internal"
     assert "corporate perimeter" in out.meta["warning"]
     assert events[-1].reason == GuardReason.unavailable
@@ -348,7 +350,7 @@ def test_post_fallback_respects_max_capability():
         {
             "routing": {"fallback_executor": ["strong"]},
             "executors": {
-                "cheap": {"adapter": "codex", "tier": "fast"},
+                "cheap": {"adapter": "omp", "model": "agent-lb/luna", "tier": "fast"},
                 "strong": {"adapter": "claude", "tier": "strong"},
             },
         }
@@ -375,12 +377,12 @@ def test_post_fallback_keeps_perimeter_over_ceiling():
             "routing": {"fallback_executor": ["external"]},
             "executors": {
                 "strong_internal": {
-                    "adapter": "opencode",
+                    "adapter": "omp",
                     "model": "m",
                     "tier": "strong",
                     "corporate": True,
                 },
-                "external": {"adapter": "codex", "tier": "fast"},
+                "external": {"adapter": "omp", "model": "agent-lb/luna", "tier": "fast"},
             },
         }
     )
@@ -404,9 +406,9 @@ def test_post_guards_keeps_perimeter_when_all_corporate_executors_are_cooling():
         {
             "routing": {"fallback_executor": ["external"]},
             "executors": {
-                "external": {"adapter": "codex", "tier": "balanced"},
+                "external": {"adapter": "omp", "model": "agent-lb/luna", "tier": "balanced"},
                 "internal": {
-                    "adapter": "opencode",
+                    "adapter": "omp",
                     "model": "m",
                     "tier": "balanced",
                     "corporate": True,

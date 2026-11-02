@@ -59,7 +59,7 @@ def test_normalize_valid_block_copies_all_fields():
         "confidence": 0.9,
         "needs_escalation": True,
     }
-    result = normalize(raw, outcome(), None, "codex", "m")
+    result = normalize(raw, outcome(), None, "omp", "m")
     assert result.status == "completed"
     assert result.summary == "ok"
     assert result.changed_files == ["raw.py"]
@@ -70,7 +70,7 @@ def test_normalize_valid_block_copies_all_fields():
 
 def test_normalize_no_block_exit_zero_is_partial_with_stdout_tail():
     stdout = "x" * 5000
-    result = normalize(None, outcome(stdout=stdout), None, "codex", None)
+    result = normalize(None, outcome(stdout=stdout), None, "omp", None)
     assert result.status == "partial"
     assert result.summary == stdout[-2000:]
     assert len(result.summary) == 2000
@@ -79,22 +79,20 @@ def test_normalize_no_block_exit_zero_is_partial_with_stdout_tail():
 
 def test_normalize_nonzero_exit_is_failed_with_error_and_stdout_tails():
     stdout, stderr = "o" * 5000, "e" * 5000
-    result = normalize(
-        None, outcome(exit_code=3, stdout=stdout, stderr=stderr), None, "codex", None
-    )
+    result = normalize(None, outcome(exit_code=3, stdout=stdout, stderr=stderr), None, "omp", None)
     assert result.status == "failed"
     assert result.error == stderr[-2000:]
     assert result.summary == stdout[-2000:]
 
 
 def test_normalize_timeout_is_failed_with_timeout_error():
-    result = normalize(None, outcome(timed_out=True), None, "codex", None)
+    result = normalize(None, outcome(timed_out=True), None, "omp", None)
     assert result.status == "failed"
     assert result.error == "timeout"
 
 
 def test_normalize_timeout_with_changed_files_is_partial():
-    result = normalize(None, outcome(timed_out=True), ["a.py"], "codex", None)
+    result = normalize(None, outcome(timed_out=True), ["a.py"], "omp", None)
     assert result.status == "partial"
     assert result.error == "timeout"
     assert result.changed_files == ["a.py"]
@@ -102,7 +100,7 @@ def test_normalize_timeout_with_changed_files_is_partial():
 
 
 def test_normalize_stalled_is_failed_with_idle_error():
-    result = normalize(None, outcome(stalled=True, idle_seconds=0.5), None, "codex", None)
+    result = normalize(None, outcome(stalled=True, idle_seconds=0.5), None, "omp", None)
     assert result.status == "failed"
     assert result.error.startswith("stalled: no output for")
     assert result.meta["idle_timeout_seconds"] == 0.5
@@ -110,22 +108,22 @@ def test_normalize_stalled_is_failed_with_idle_error():
 
 def test_normalize_git_changed_files_override_agent_files():
     raw = {"status": "completed", "summary": "ok", "changed_files": ["raw.py"]}
-    assert normalize(raw, outcome(), ["a.py"], "codex", None).changed_files == ["a.py"]
+    assert normalize(raw, outcome(), ["a.py"], "omp", None).changed_files == ["a.py"]
 
 
 def test_normalize_empty_git_changed_files_override_agent_files():
     raw = {"status": "completed", "summary": "ok", "changed_files": ["raw.py"]}
-    assert normalize(raw, outcome(), [], "codex", None).changed_files == []
+    assert normalize(raw, outcome(), [], "omp", None).changed_files == []
 
 
 def test_normalize_none_git_changed_files_uses_agent_files():
     raw = {"status": "completed", "summary": "ok", "changed_files": ["raw.py"]}
-    assert normalize(raw, outcome(), None, "codex", None).changed_files == ["raw.py"]
+    assert normalize(raw, outcome(), None, "omp", None).changed_files == ["raw.py"]
 
 
 def test_normalize_invalid_status_is_partial_with_parse_error():
     raw = {"status": "running", "summary": "still working"}
-    result = normalize(raw, outcome(), None, "codex", None)
+    result = normalize(raw, outcome(), None, "omp", None)
     assert result.status == "partial"
     assert result.meta["parse_error"]
 
@@ -135,7 +133,7 @@ def test_normalize_invalid_status_is_partial_with_parse_error():
     ["success", "SUCCEEDED", "successful", "done", "complete", "ok"],
 )
 def test_normalize_coerces_success_status_synonyms(status):
-    result = normalize({"status": status, "summary": "ok"}, outcome(), None, "codex", None)
+    result = normalize({"status": status, "summary": "ok"}, outcome(), None, "omp", None)
 
     assert result.status == "completed"
     assert result.meta["coerced"] == [f"status: {status!r} -> completed"]
@@ -143,14 +141,14 @@ def test_normalize_coerces_success_status_synonyms(status):
 
 @pytest.mark.parametrize("status", ["error", "FAILURE", "fail"])
 def test_normalize_coerces_failure_status_synonyms(status):
-    result = normalize({"status": status, "summary": "bad"}, outcome(), None, "codex", None)
+    result = normalize({"status": status, "summary": "bad"}, outcome(), None, "omp", None)
 
     assert result.status == "failed"
     assert result.meta["coerced"] == [f"status: {status!r} -> failed"]
 
 
 def test_normalize_unknown_status_still_is_partial_with_parse_error():
-    result = normalize({"status": "banana", "summary": "unknown"}, outcome(), None, "codex", None)
+    result = normalize({"status": "banana", "summary": "unknown"}, outcome(), None, "omp", None)
 
     assert result.status == "partial"
     assert result.meta["parse_error"]
@@ -158,20 +156,20 @@ def test_normalize_unknown_status_still_is_partial_with_parse_error():
 
 def test_normalize_extra_field_is_partial_with_parse_error():
     raw = {"status": "completed", "summary": "ok", "unexpected": True}
-    result = normalize(raw, outcome(), None, "codex", None)
+    result = normalize(raw, outcome(), None, "omp", None)
     assert result.status == "partial"
     assert result.meta["parse_error"]
 
 
 def test_normalize_meta_always_contains_exit_and_duration():
-    result = normalize(None, outcome(exit_code=3, duration_ms=44), None, "codex", None)
+    result = normalize(None, outcome(exit_code=3, duration_ms=44), None, "omp", None)
     assert result.meta["exit_code"] == 3
     assert result.meta["duration_ms"] == 44
 
 
 def test_normalize_missing_tests_is_none():
     raw = {"status": "completed", "summary": "ok"}
-    assert normalize(raw, outcome(), None, "codex", None).tests is None
+    assert normalize(raw, outcome(), None, "omp", None).tests is None
 
 
 def test_normalize_coerces_natural_language_tests_result():
@@ -225,15 +223,15 @@ def test_normalize_drops_unusable_confidence_and_keeps_the_report(confidence):
     assert result.meta["coerced"] == [f"confidence: {confidence!r} -> dropped"]
 
 
-def test_normalize_drops_nulls_the_codex_strict_schema_requires():
-    # 09-24: codex/luna по strict-схеме написал null, отчёт стал partial.
+def test_normalize_drops_nulls():
+    # 09-24: исполнитель написал null в необязательных полях, отчёт стал partial.
     raw = _block(
         changed_files=None,
         tests={"command": None, "result": "not_run"},
         confidence=None,
         needs_escalation=None,
     )
-    result = normalize(raw, outcome(), ["done.txt"], "codex/luna", None)
+    result = normalize(raw, outcome(), ["done.txt"], "omp/luna", None)
     assert result.status == "completed" and "parse_error" not in result.meta
     assert result.tests.result == "not_run" and result.tests.command is None
     assert result.needs_escalation is False

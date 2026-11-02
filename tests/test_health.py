@@ -5,17 +5,8 @@ from __future__ import annotations
 import pytest
 
 from agent_dispatch.executors.health import classify_failure
-from agent_dispatch.executors.opencode import NO_RESPONSE
+from agent_dispatch.executors.omp import OmpAdapter
 from agent_dispatch.models import ExecutionResult
-
-# Хвост stdout codex, у которого пропала связь с API (задачи 09-23, 30 минут до таймаута).
-CODEX_OFFLINE = (
-    '{"type":"turn.started"}\n'
-    '{"type":"error","message":"Reconnecting... 4/5 (request timed out)"}\n'
-    '{"type":"error","message":"Reconnecting... 5/5 (request timed out)"}\n'
-    '{"type":"item.completed","item":{"id":"item_2","type":"error",'
-    '"message":"Falling back from WebSockets to HTTPS transport. request timed out"}}\n'
-)
 
 
 def _failed(error: str, summary: str = "", changed_files: list[str] | None = None):
@@ -38,30 +29,17 @@ def _failed(error: str, summary: str = "", changed_files: list[str] | None = Non
             "quota",
             id="claude-spend-limit",
         ),
-        pytest.param("You've hit your usage limit. Try again later.", "quota", id="codex-usage"),
+        pytest.param("You've hit your usage limit. Try again later.", "quota", id="usage-limit"),
         pytest.param(
             "Selected model is at capacity. Please try a different model.",
             "capacity",
-            id="codex-capacity",
+            id="model-capacity",
         ),
-        pytest.param("No cookie auth credentials found", "auth", id="opencode-auth"),
         pytest.param("Invalid API key · Please run /login", "auth", id="claude-login"),
-        pytest.param(
-            "Missing environment variable: `AGENT_LB_API_KEY`.", "auth", id="codex-lb-agent-key"
-        ),
-        pytest.param(
-            "Missing environment variable: `CODEX_LB_API_KEY`.", "auth", id="codex-lb-codex-key"
-        ),
-        pytest.param(
-            "codex-agent-lb: Missing environment variable: `AGENT_LB_API_KEY` "
-            "(not in the environment or /Users/u/.config/agent-lb/env)",
-            "auth",
-            id="codex-lb-wrapper-exit-78",
-        ),
         pytest.param(
             "Missing environment variable: `OPENAI_API_KEY`.", "auth", id="any-provider-key"
         ),
-        pytest.param(NO_RESPONSE, "network", id="opencode-no-model-response"),
+        pytest.param(OmpAdapter.NO_RESPONSE, "network", id="no-model-response"),
     ],
 )
 def test_cli_messages_about_the_executor_are_classified(error, expected):
@@ -70,16 +48,8 @@ def test_cli_messages_about_the_executor_are_classified(error, expected):
 
 def test_no_response_phrase_inside_another_error_does_not_count():
     # Только строка адаптера с начала: тот же текст в ошибке MCP-сервера или в
-    # выводе теста про opencode о самом исполнителе ничего не говорит.
-    assert classify_failure(_failed(f"MCP server x failed: {NO_RESPONSE}")) is None
-
-
-def test_timeout_after_codex_lost_the_api_is_a_network_failure():
-    assert classify_failure(_failed("timeout", CODEX_OFFLINE)) == "network"
-
-
-def test_stall_after_codex_lost_the_api_is_a_network_failure():
-    assert classify_failure(_failed("stalled: no output for 900s", CODEX_OFFLINE)) == "network"
+    # выводе теста про исполнителя ничего не говорит.
+    assert classify_failure(_failed(f"MCP server x failed: {OmpAdapter.NO_RESPONSE}")) is None
 
 
 @pytest.mark.parametrize(
@@ -92,8 +62,12 @@ def test_stall_after_codex_lost_the_api_is_a_network_failure():
         ),
         pytest.param(
             # Связь терялась, но агент успел поработать: это задача, а не исполнитель.
-            _failed("timeout", CODEX_OFFLINE, changed_files=["src/app/main.py"]),
-            id="reconnects-but-changed-files",
+            _failed(
+                "timeout",
+                "ran the test suite, two modules updated",
+                changed_files=["src/app/main.py"],
+            ),
+            id="timeout-with-changed-files",
         ),
         pytest.param(
             # Таймаут с изменёнными файлами приходит как partial: исполнитель не виноват.
@@ -108,15 +82,15 @@ def test_stall_after_codex_lost_the_api_is_a_network_failure():
             id="partial-timeout",
         ),
         pytest.param(
-            # Протухший OAuth MCP-сервера в stderr codex: сам codex работает дальше.
+            # Протухший OAuth MCP-сервера в stderr: сам агент работает дальше.
             _failed(
-                "ERROR codex_rmcp_client::oauth::refresh_transaction: error=failed to refresh "
+                "ERROR mcp_client::oauth::refresh_transaction: error=failed to refresh "
                 "OAuth tokens for server mcphub: OAuth refresh token was rejected"
             ),
             id="mcp-server-oauth",
         ),
         pytest.param(
-            # Ключ MCP-сервера не задан: сервер не поднялся, сам codex работает.
+            # Ключ MCP-сервера не задан: сервер не поднялся, сам агент работает.
             _failed(
                 "exit 1\nMCP server github failed: Missing environment variable: GITHUB_API_KEY"
             ),
@@ -127,7 +101,7 @@ def test_stall_after_codex_lost_the_api_is_a_network_failure():
             _failed("exit 1", summary="implemented rate limit exceeded handler, spend limit"),
             id="words-in-agent-output",
         ),
-        pytest.param(_failed("opencode permission rejected: read: /tmp/x.log"), id="permission"),
+        pytest.param(_failed("permission denied: read: /tmp/x.log"), id="permission"),
         pytest.param(
             ExecutionResult(
                 status="completed", executor="x", model=None, summary="ok", error="spend limit"
@@ -168,7 +142,7 @@ NOW = datetime(2026, 10, 2, 9, 29, 48, tzinfo=UTC)
             "You've hit your session limit · resets 4am (Asia/Yekaterinburg)", id="claude-session"
         ),
         pytest.param("You've hit your Opus limit · resets 5am", id="claude-model-limit"),
-        pytest.param("You’ve hit your usage limit. Try again at 5:02 PM.", id="codex-curly"),
+        pytest.param("You’ve hit your usage limit. Try again at 5:02 PM.", id="curly-quote"),
     ],
 )
 def test_every_live_limit_message_is_a_quota_failure(error):
@@ -213,12 +187,12 @@ def test_lb_key_missing_in_agent_output_does_not_count():
         pytest.param(
             "You’ve hit your usage limit. Try again at 5:02 PM.",
             datetime(2026, 10, 2, 12, 2, tzinfo=UTC),
-            id="codex-local-time",
+            id="local-time",
         ),
         pytest.param(
             "You've hit your usage limit. Try again at Oct 4th, 2026 5:02 PM.",
             datetime(2026, 10, 4, 12, 2, tzinfo=UTC),
-            id="codex-other-day",
+            id="other-day",
         ),
         pytest.param(
             "your weekly limit resets Oct 6 at 5am (Asia/Yekaterinburg)",
@@ -319,7 +293,7 @@ def test_spend_limit_is_rechecked_within_the_quota_window_even_with_a_far_reset(
 
 
 def test_recheck_caps_an_announced_reset_for_a_pool_of_accounts():
-    # 2026-10-02: codex через codex-lb сказал «Try again at 5:02 PM» (12:02Z),
+    # 2026-10-02: исполнитель сказал «Try again at 5:02 PM» (12:02Z),
     # а в 11:21Z следующий запрос ушёл на свободный аккаунт и прошёл.
     error = "You’ve hit your usage limit. Try again at 5:02 PM."
     now = datetime(2026, 10, 2, 10, 2, 47, tzinfo=UTC)

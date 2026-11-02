@@ -105,12 +105,12 @@ async def test_cost_since_counts_finished_tasks_and_router_decisions(tmp_path):
 def _settings(tmp_path: Path, **routing) -> Settings:
     return Settings(
         server=ServerSettings(data_dir=tmp_path / "data"),
-        routing=RoutingSettings(fallback_executor="codex", **routing),
+        routing=RoutingSettings(fallback_executor="omp", **routing),
         executors={
-            "codex": ExecutorSettings(adapter="codex", description="codex"),
+            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp"),
             "claude": ExecutorSettings(adapter="claude", description="claude"),
         },
-        escalation={"codex": ["claude"]},
+        escalation={"omp": ["claude"]},
     )
 
 
@@ -124,23 +124,21 @@ async def _dispatcher(tmp_path: Path, settings: Settings, results: dict[str, Exe
 
 def _failed(cost: float) -> ExecutionResult:
     return ExecutionResult(
-        status="failed", executor="codex", model=None, summary="", usage=Usage(cost_usd=cost)
+        status="failed", executor="omp", model=None, summary="", usage=Usage(cost_usd=cost)
     )
 
 
 @pytest.mark.asyncio
 async def test_chain_cost_cap_stops_escalation(tmp_path, git_repo):
     settings = _settings(tmp_path, max_chain_cost_usd=0.5)
-    _, adapters, _, dispatcher = await _dispatcher(tmp_path, settings, {"codex": _failed(0.8)})
-    record = await dispatcher.submit(
-        DispatchRequest(task="fix", cwd=str(git_repo), executor="codex")
-    )
+    _, adapters, _, dispatcher = await _dispatcher(tmp_path, settings, {"omp": _failed(0.8)})
+    record = await dispatcher.submit(DispatchRequest(task="fix", cwd=str(git_repo), executor="omp"))
     done = await dispatcher.wait(record.task_id, WAIT)
 
     assert done.task_id == record.task_id
     assert done.status == TaskStatus.failed
     assert done.result.meta["budget"] == {"chain_cost_usd": 0.8, "limit_usd": 0.5}
-    assert done.result.meta["escalation_chain"] == ["codex"]
+    assert done.result.meta["escalation_chain"] == ["omp"]
     assert not adapters["claude"].calls
 
 
@@ -148,16 +146,14 @@ async def test_chain_cost_cap_stops_escalation(tmp_path, git_repo):
 async def test_chain_cost_cap_names_itself_when_the_result_was_not_failed(tmp_path, git_repo):
     asked = ExecutionResult(
         status="needs_escalation",
-        executor="codex",
+        executor="omp",
         model=None,
         summary="",
         usage=Usage(cost_usd=0.8),
     )
     settings = _settings(tmp_path, max_chain_cost_usd=0.5)
-    _, _, _, dispatcher = await _dispatcher(tmp_path, settings, {"codex": asked})
-    record = await dispatcher.submit(
-        DispatchRequest(task="fix", cwd=str(git_repo), executor="codex")
-    )
+    _, _, _, dispatcher = await _dispatcher(tmp_path, settings, {"omp": asked})
+    record = await dispatcher.submit(DispatchRequest(task="fix", cwd=str(git_repo), executor="omp"))
     done = await dispatcher.wait(record.task_id, WAIT)
 
     assert done.status == TaskStatus.failed
@@ -169,17 +165,13 @@ async def test_chain_cost_cap_names_itself_when_the_result_was_not_failed(tmp_pa
 @pytest.mark.asyncio
 async def test_chain_cost_counts_subtasks_of_the_link(tmp_path, git_repo):
     settings = _settings(tmp_path, max_chain_cost_usd=1.0)
-    storage, adapters, _, dispatcher = await _dispatcher(
-        tmp_path, settings, {"codex": _failed(0.2)}
-    )
+    storage, adapters, _, dispatcher = await _dispatcher(tmp_path, settings, {"omp": _failed(0.2)})
 
     async def spawn_priced_child(ctx):
         await storage.insert_task(_record("sub", 0.9, parent=ctx.task_id))
 
-    adapters["codex"].on_execute = spawn_priced_child
-    record = await dispatcher.submit(
-        DispatchRequest(task="fix", cwd=str(git_repo), executor="codex")
-    )
+    adapters["omp"].on_execute = spawn_priced_child
+    record = await dispatcher.submit(DispatchRequest(task="fix", cwd=str(git_repo), executor="omp"))
     done = await dispatcher.wait(record.task_id, WAIT)
 
     assert done.status == TaskStatus.failed
@@ -190,10 +182,8 @@ async def test_chain_cost_counts_subtasks_of_the_link(tmp_path, git_repo):
 @pytest.mark.asyncio
 async def test_chain_under_the_cap_escalates_as_before(tmp_path, git_repo):
     settings = _settings(tmp_path, max_chain_cost_usd=5.0)
-    _, adapters, _, dispatcher = await _dispatcher(tmp_path, settings, {"codex": _failed(0.8)})
-    record = await dispatcher.submit(
-        DispatchRequest(task="fix", cwd=str(git_repo), executor="codex")
-    )
+    _, adapters, _, dispatcher = await _dispatcher(tmp_path, settings, {"omp": _failed(0.8)})
+    record = await dispatcher.submit(DispatchRequest(task="fix", cwd=str(git_repo), executor="omp"))
     done = await dispatcher.wait(record.task_id, WAIT)
 
     assert done.task_id != record.task_id and done.status == TaskStatus.completed
@@ -212,7 +202,7 @@ async def test_daily_limit_refuses_new_tasks_before_routing(tmp_path, git_repo):
     assert done.result.meta["guard"] == GuardReason.budget.value
     assert done.result.error.startswith("daily cost limit reached: $1.20 of daily_cost_limit_usd")
     assert router.calls == 0
-    assert not adapters["codex"].calls and not adapters["claude"].calls
+    assert not adapters["omp"].calls and not adapters["claude"].calls
 
 
 @pytest.mark.asyncio
@@ -220,13 +210,11 @@ async def test_daily_limit_ignores_yesterday(tmp_path, git_repo):
     settings = _settings(tmp_path, daily_cost_limit_usd=1.0)
     storage, adapters, _, dispatcher = await _dispatcher(tmp_path, settings, {})
     await storage.insert_task(_record("old", 5.0, finished=datetime.now(UTC) - timedelta(days=2)))
-    record = await dispatcher.submit(
-        DispatchRequest(task="fix", cwd=str(git_repo), executor="codex")
-    )
+    record = await dispatcher.submit(DispatchRequest(task="fix", cwd=str(git_repo), executor="omp"))
     done = await dispatcher.wait(record.task_id, WAIT)
 
     assert done.status == TaskStatus.completed
-    assert adapters["codex"].calls
+    assert adapters["omp"].calls
 
 
 def test_budgets_are_off_by_default(tmp_config_dir):
@@ -245,12 +233,8 @@ async def test_daily_limit_stops_escalation_at_planning(tmp_path, git_repo):
     # Запуск сам доводит сутки до лимита: звено, которое бюджет всё равно не
     # пустит, не создаётся, и работа не удерживается ради него.
     settings = _settings(tmp_path, daily_cost_limit_usd=1.0)
-    storage, adapters, _, dispatcher = await _dispatcher(
-        tmp_path, settings, {"codex": _failed(1.5)}
-    )
-    record = await dispatcher.submit(
-        DispatchRequest(task="fix", cwd=str(git_repo), executor="codex")
-    )
+    storage, adapters, _, dispatcher = await _dispatcher(tmp_path, settings, {"omp": _failed(1.5)})
+    record = await dispatcher.submit(DispatchRequest(task="fix", cwd=str(git_repo), executor="omp"))
     done = await dispatcher.wait(record.task_id, WAIT)
 
     assert done.task_id == record.task_id and done.status == TaskStatus.failed

@@ -6,7 +6,7 @@ from agent_dispatch.routing.base import RouterError
 from agent_dispatch.routing.claude_local import ClaudeLocalRouter
 
 CANDIDATES = {
-    "codex": ExecutorSettings(adapter="codex", description="d"),
+    "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="d"),
     "claude": ExecutorSettings(adapter="claude", description="c"),
 }
 
@@ -16,16 +16,19 @@ async def test_claude_local_ok():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
-            "routing": {"fallback_executor": "codex"},
+            "routing": {"fallback_executor": "omp"},
             "router": {
                 "backend": "claude_local",
                 "claude_local": {"command": "tests/fakes/claude_router_ok.sh"},
             },
-            "executors": {"codex": {"adapter": "codex"}, "claude": {"adapter": "claude"}},
+            "executors": {
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+                "claude": {"adapter": "claude"},
+            },
         }
     )
     result = await ClaudeLocalRouter(s).decide(DispatchRequest(task="x", cwd="."), CANDIDATES)
-    assert result.executor == "codex"
+    assert result.executor == "omp"
 
 
 @pytest.mark.asyncio
@@ -33,15 +36,15 @@ async def test_claude_local_bad():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
-            "routing": {"fallback_executor": "codex"},
+            "routing": {"fallback_executor": "omp"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_bad.sh"}},
-            "executors": {"codex": {"adapter": "codex"}},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }
     )
     with pytest.raises(RouterError):
         await ClaudeLocalRouter(s).decide(
             DispatchRequest(task="x", cwd="."),
-            {"codex": ExecutorSettings(adapter="codex", description="d")},
+            {"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="d")},
         )
 
 
@@ -50,14 +53,14 @@ async def test_claude_local_confidence_and_router():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
-            "routing": {"fallback_executor": "codex"},
+            "routing": {"fallback_executor": "omp"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_ok.sh"}},
-            "executors": {"codex": {"adapter": "codex"}},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }
     )
     result = await ClaudeLocalRouter(s).decide(
         DispatchRequest(task="x", cwd="."),
-        {"codex": ExecutorSettings(adapter="codex", description="d")},
+        {"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="d")},
     )
     assert result.router == "claude_local" and result.confidence == 0.8
 
@@ -67,9 +70,12 @@ async def test_claude_local_unknown_executor():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
-            "routing": {"fallback_executor": "codex"},
+            "routing": {"fallback_executor": "omp"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_ok.sh"}},
-            "executors": {"claude": {"adapter": "claude"}, "codex": {"adapter": "codex"}},
+            "executors": {
+                "claude": {"adapter": "claude"},
+                "omp": {"adapter": "omp", "model": "agent-lb/luna"},
+            },
         }
     )
     with pytest.raises(RouterError, match="unknown executor"):
@@ -84,15 +90,15 @@ async def test_claude_local_invalid_json():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
-            "routing": {"fallback_executor": "codex"},
+            "routing": {"fallback_executor": "omp"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_bad.sh"}},
-            "executors": {"codex": {"adapter": "codex"}},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }
     )
     with pytest.raises(RouterError, match="invalid claude response"):
         await ClaudeLocalRouter(s).decide(
             DispatchRequest(task="x", cwd="."),
-            {"codex": ExecutorSettings(adapter="codex", description="d")},
+            {"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="d")},
         )
 
 
@@ -105,14 +111,14 @@ async def test_claude_local_env_keeps_home_and_removes_secret(tmp_path, monkeypa
     s = Settings.model_validate(
         {
             "server": {"data_dir": str(tmp_path / "data")},
-            "routing": {"fallback_executor": "codex"},
+            "routing": {"fallback_executor": "omp"},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_capture.sh"}},
-            "executors": {"codex": {"adapter": "codex"}},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }
     )
     await ClaudeLocalRouter(s).decide(
         DispatchRequest(task="x", cwd="."),
-        {"codex": ExecutorSettings(adapter="codex", description="d")},
+        {"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="d")},
     )
     env = capture.read_text()
     assert "HOME=" in env and "OPENROUTER_API_KEY=" not in env
@@ -128,14 +134,14 @@ async def test_claude_local_unwritable_log_dir_is_router_error(tmp_path):
         {
             "server": {"data_dir": str(blocker)},
             "router": {"claude_local": {"command": "tests/fakes/claude_router_ok.sh"}},
-            "routing": {"fallback_executor": "codex"},
-            "executors": {"codex": {"adapter": "codex"}},
+            "routing": {"fallback_executor": "omp"},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }
     )
     with pytest.raises(RouterError):
         await ClaudeLocalRouter(s).decide(
             DispatchRequest(task="x", cwd="."),
-            {"codex": ExecutorSettings(adapter="codex", description="d")},
+            {"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="d")},
         )
 
 
@@ -144,13 +150,13 @@ async def test_claude_local_missing_command_is_router_error():
     s = Settings.model_validate(
         {
             "server": {"data_dir": ".test-data"},
-            "routing": {"fallback_executor": "codex"},
+            "routing": {"fallback_executor": "omp"},
             "router": {"claude_local": {"command": "/nonexistent/claude"}},
-            "executors": {"codex": {"adapter": "codex"}},
+            "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }
     )
     with pytest.raises(RouterError, match="cannot start"):
         await ClaudeLocalRouter(s).decide(
             DispatchRequest(task="x", cwd="."),
-            {"codex": ExecutorSettings(adapter="codex", description="d")},
+            {"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="d")},
         )

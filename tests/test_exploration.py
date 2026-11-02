@@ -45,10 +45,10 @@ def _judgment(kind: str, value: str | bool, confidence: float = 0.95) -> Judgmen
 def _settings(tmp_path: Path | None = None, *, share: float = 1.0) -> Settings:
     return Settings(
         server=ServerSettings(data_dir=tmp_path or Path(".")),
-        routing=RoutingSettings(fallback_executor="codex/sol", explore_share=share, review_only={}),
+        routing=RoutingSettings(fallback_executor="omp/sol", explore_share=share, review_only={}),
         executors={
-            "codex/luna": ExecutorSettings(adapter="codex", tier="fast"),
-            "codex/sol": ExecutorSettings(adapter="codex", tier="balanced"),
+            "omp/luna": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="fast"),
+            "omp/sol": ExecutorSettings(adapter="omp", model="agent-lb/luna", tier="balanced"),
             "claude/opus": ExecutorSettings(adapter="claude", tier="strong"),
         },
     )
@@ -70,7 +70,7 @@ def _jev_decision(
     return RouteDecision(
         executor=executor,
         confidence=0.95,
-        scores={executor: 0.95, "codex/sol": 0.04},
+        scores={executor: 0.95, "omp/sol": 0.04},
         router=router,
         reason=reason,
         capability="strong",
@@ -86,12 +86,12 @@ def test_eligible_tasks_record_both_choices_and_only_selected_hash_uses_static()
     explored = apply_exploration("a" * 32, request, _jev_decision(), candidates, settings)
     jev = apply_exploration("b" * 32, request, _jev_decision(), candidates, settings)
 
-    assert explored.executor == "codex/sol" and explored.router == RouterKind.explore
+    assert explored.executor == "omp/sol" and explored.router == RouterKind.explore
     assert jev.executor == "claude/opus" and jev.router == RouterKind.jev
     for decision, arm in ((explored, "explore"), (jev, "jev")):
         assert decision.judgments["exploration_arm"].value == arm
         assert decision.judgments["exploration_jev_choice"].value == "claude/opus"
-        assert decision.judgments["exploration_static_choice"].value == "codex/sol"
+        assert decision.judgments["exploration_static_choice"].value == "omp/sol"
 
 
 @pytest.mark.asyncio
@@ -108,14 +108,14 @@ async def test_exploration_logs_the_capped_jev_choice_and_keeps_static_baseline(
     explored = apply_exploration("a" * 32, request, capped, settings.executors, settings)
 
     assert capped.meta["capability_uncapped"] == "strong"
-    assert explored.judgments["exploration_jev_choice"].value == "codex/sol"
-    assert explored.judgments["exploration_static_choice"].value == "codex/sol"
+    assert explored.judgments["exploration_jev_choice"].value == "omp/sol"
+    assert explored.judgments["exploration_static_choice"].value == "omp/sol"
 
 
 @pytest.mark.parametrize(
     ("dispatch_request", "decision", "is_escalation"),
     [
-        (DispatchRequest(task="x", cwd=".", executor="codex/sol"), _jev_decision(), False),
+        (DispatchRequest(task="x", cwd=".", executor="omp/sol"), _jev_decision(), False),
         (DispatchRequest(task="x", cwd=".", kind="review"), _jev_decision(), False),
         (DispatchRequest(task="x", cwd=".", followup_of="previous"), _jev_decision(), False),
         (DispatchRequest(task="x", cwd="."), _jev_decision(), True),
@@ -164,12 +164,12 @@ def test_overrides_special_links_reviews_and_fallbacks_are_not_explored(
 
 def test_corporate_and_availability_guards_still_win() -> None:
     settings = _settings()
-    settings.executors["codex/luna"].corporate = True
+    settings.executors["omp/luna"].corporate = True
     request = DispatchRequest(task="x", cwd=".")
     corporate = apply_exploration(
         "a" * 32,
         request,
-        _jev_decision(executor="codex/luna", corporate=True),
+        _jev_decision(executor="omp/luna", corporate=True),
         settings.executors,
         settings,
     )
@@ -177,18 +177,18 @@ def test_corporate_and_availability_guards_still_win() -> None:
         "a" * 32,
         request,
         # Ответ «нет» снял периметр: иначе fail closed сузил бы статический
-        # выбор до корпоративного codex/luna, и crossover остался бы непроверен.
+        # выбор до корпоративного omp-исполнителя, и crossover остался бы непроверен.
         _jev_decision(corporate=False),
         settings.executors,
         settings,
-        unavailable={"codex/sol"},
+        unavailable={"omp/sol"},
     )
 
-    assert corporate.executor == "codex/luna"
+    assert corporate.executor == "omp/luna"
     assert unavailable.executor == "claude/opus" and unavailable.router == RouterKind.jev
     # Назначение не меняется: crossover остаётся в arm `explore`.
     assert unavailable.judgments["exploration_arm"].value == "explore"
-    assert unavailable.judgments["exploration_crossover"].value == "codex/sol"
+    assert unavailable.judgments["exploration_crossover"].value == "omp/sol"
     assert "недоступен" in unavailable.meta["exploration_note"]
 
 
@@ -196,11 +196,11 @@ def test_exploration_without_corporate_answer_stays_inside_the_perimeter() -> No
     # Ответа о корп. данных нет, периметр включён, корпоративный исполнитель
     # в пуле есть: статический baseline тоже не выходит за периметр.
     settings = _settings()
-    settings.executors["codex/luna"].corporate = True
+    settings.executors["omp/luna"].corporate = True
     result = apply_exploration(
         "a" * 32, DispatchRequest(task="x", cwd="."), _jev_decision(), settings.executors, settings
     )
-    assert result.judgments["exploration_static_choice"].value == "codex/luna"
+    assert result.judgments["exploration_static_choice"].value == "omp/luna"
 
 
 @pytest.mark.asyncio
@@ -223,8 +223,8 @@ async def test_dispatch_persists_explore_arm_and_jev_choice(tmp_path: Path, git_
         await storage.close()
 
     judgments = json.loads(row["judgments_json"])
-    assert done.decision.executor == "codex/sol" and adapters["codex/sol"].calls
-    assert row["router"] == "explore" and row["choice"] == "codex/sol"
+    assert done.decision.executor == "omp/sol" and adapters["omp/sol"].calls
+    assert row["router"] == "explore" and row["choice"] == "omp/sol"
     assert judgments["exploration_arm"]["value"] == "explore"
     assert judgments["exploration_jev_choice"]["value"] == "claude/opus"
 

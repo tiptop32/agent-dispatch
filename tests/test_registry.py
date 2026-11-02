@@ -15,8 +15,8 @@ def settings():
     return Settings(
         executors={
             "a": ExecutorSettings(adapter="claude"),
-            "b": ExecutorSettings(adapter="codex", enabled=False),
-            "c": ExecutorSettings(adapter="opencode", model="m"),
+            "b": ExecutorSettings(adapter="omp", model="agent-lb/luna", enabled=False),
+            "c": ExecutorSettings(adapter="omp", model="m"),
         },
         routing=RoutingSettings(fallback_executor="a"),
     )

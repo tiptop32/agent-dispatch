@@ -11,7 +11,7 @@
       "не менять публичный API",
       "прогнать затронутые тесты"
     ],
-    "source_agent": "codex"
+    "source_agent": "omp"
   },
   "questions": {
     "executor": {
@@ -19,8 +19,8 @@
       "instructions": "Which coding agent should execute this task?",
       "criteria": {
         "claude": "Claude Code: strongest reasoning, multi-file refactors, ambiguous or design-heavy tasks; most expensive",
-        "codex": "OpenAI Codex CLI: solid autonomous bug fixing and test-driven fixes in a single repo; medium cost",
-        "opencode/kimi": "OpenCode with Kimi K2.5: cheap, good for small well-specified edits, docs, boilerplate"
+        "omp": "omp with agent-lb/luna: solid autonomous bug fixing and test-driven fixes in a single repo; medium cost",
+        "omp/kimi": "omp with Kimi K2.5: cheap, good for small well-specified edits, docs, boilerplate"
       }
     },
     "difficulty": {

@@ -30,9 +30,9 @@ from tests.fakes.adapters import FakeAdapter, FakeRouter
 async def api(tmp_path, git_repo):
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path, port=7433),
-        routing=RoutingSettings(fallback_executor="codex"),
+        routing=RoutingSettings(fallback_executor="omp"),
         executors={
-            "codex": ExecutorSettings(adapter="codex", description="Codex"),
+            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp"),
             "claude": ExecutorSettings(adapter="claude", description="Claude"),
         },
     )
@@ -47,7 +47,7 @@ async def api(tmp_path, git_repo):
         [
             FakeRouter(
                 RouteDecision(
-                    executor="codex", confidence=1, scores={"codex": 1}, router=RouterKind.fallback
+                    executor="omp", confidence=1, scores={"omp": 1}, router=RouterKind.fallback
                 )
             )
         ],
@@ -67,7 +67,7 @@ def headers(token="secret", host="127.0.0.1:7433"):
 
 
 def payload(repo, **extra):
-    return {"task": "fix tests", "cwd": str(repo), "executor": "codex", **extra}
+    return {"task": "fix tests", "cwd": str(repo), "executor": "omp", **extra}
 
 
 @pytest.mark.asyncio
@@ -99,7 +99,7 @@ async def test_localhost_accepted(api):
 @pytest.mark.asyncio
 async def test_executors(api):
     data = (await api[0].get("/executors", headers=headers())).json()
-    assert {x["name"] for x in data} == {"codex", "claude"}
+    assert {x["name"] for x in data} == {"omp", "claude"}
     fields = {
         "name",
         "adapter",
@@ -119,7 +119,7 @@ async def test_route_and_export_null_task(api):
     client, _, storage, _, repo, _ = api
     response = await client.post("/route", headers=headers(), json=payload(repo))
     assert response.status_code == 200
-    assert response.json()["executor"] == "codex"
+    assert response.json()["executor"] == "omp"
     RouteDecision.model_validate(response.json())
     rows = [x async for x in storage.export()]
     assert any(x["task"] is None for x in rows)
@@ -133,8 +133,8 @@ async def test_invalid_task_body(api):
 @pytest.mark.asyncio
 async def test_task_wait_zero_then_get_with_log(api):
     client, dispatcher, _, adapters, repo, _ = api
-    adapters["codex"].result = ExecutionResult(
-        status="completed", executor="codex", model=None, summary="ok"
+    adapters["omp"].result = ExecutionResult(
+        status="completed", executor="omp", model=None, summary="ok"
     )
     r = await client.post("/tasks", headers=headers(), json=payload(repo, wait_seconds=0))
     assert r.status_code == 202
@@ -160,7 +160,7 @@ async def test_task_wait_completed(api):
 @pytest.mark.asyncio
 async def test_task_wait_is_capped(api, monkeypatch):
     client, _, _, adapters, repo, _ = api
-    adapters["codex"].gate = asyncio.Event()
+    adapters["omp"].gate = asyncio.Event()
     monkeypatch.setattr(routes, "MAX_WAIT_SECONDS", 0.2)
     started = asyncio.get_running_loop().time()
     response = await client.post(
@@ -179,14 +179,14 @@ async def test_unknown_task_get(api):
 @pytest.mark.asyncio
 async def test_get_task_wait_returns_final_status(api):
     client, _, _, adapters, repo, _ = api
-    adapters["codex"].gate = asyncio.Event()
+    adapters["omp"].gate = asyncio.Event()
     response = await client.post("/tasks", headers=headers(), json=payload(repo, wait_seconds=0))
     task_id = response.json()["task_id"]
-    await adapters["codex"].started.wait()
+    await adapters["omp"].started.wait()
 
     async def finish():
         await asyncio.sleep(0.01)
-        adapters["codex"].gate.set()
+        adapters["omp"].gate.set()
 
     finisher = asyncio.create_task(finish())
     response = await client.get(f"/tasks/{task_id}?wait=1", headers=headers())
@@ -198,9 +198,9 @@ async def test_get_task_wait_returns_final_status(api):
 @pytest.mark.asyncio
 async def test_get_task_wait_follows_escalation_of_finished_parent(api):
     client, dispatcher, _, adapters, repo, settings = api
-    settings.escalation = {"codex": ["claude"]}
-    adapters["codex"].result = ExecutionResult(
-        status="failed", executor="codex", model=None, summary="", error="boom"
+    settings.escalation = {"omp": ["claude"]}
+    adapters["omp"].result = ExecutionResult(
+        status="failed", executor="omp", model=None, summary="", error="boom"
     )
     adapters["claude"].gate = asyncio.Event()
     response = await client.post("/tasks", headers=headers(), json=payload(repo, wait_seconds=0))
@@ -220,11 +220,11 @@ async def test_get_task_wait_follows_escalation_of_finished_parent(api):
 @pytest.mark.asyncio
 async def test_get_task_wait_timeout_returns_running(api, monkeypatch):
     client, _, _, adapters, repo, _ = api
-    adapters["codex"].gate = asyncio.Event()
+    adapters["omp"].gate = asyncio.Event()
     monkeypatch.setattr(routes, "MAX_WAIT_SECONDS", 0.05)
     response = await client.post("/tasks", headers=headers(), json=payload(repo, wait_seconds=0))
     task_id = response.json()["task_id"]
-    await adapters["codex"].started.wait()
+    await adapters["omp"].started.wait()
 
     started = asyncio.get_running_loop().time()
     response = await client.get(f"/tasks/{task_id}?wait=1", headers=headers())
@@ -237,10 +237,10 @@ async def test_get_task_wait_timeout_returns_running(api, monkeypatch):
 @pytest.mark.asyncio
 async def test_cancel_running(api):
     client, _, _, adapters, repo, _ = api
-    adapters["codex"].gate = asyncio.Event()
+    adapters["omp"].gate = asyncio.Event()
     r = await client.post("/tasks", headers=headers(), json=payload(repo, wait_seconds=0))
     task_id = r.json()["task_id"]
-    await adapters["codex"].started.wait()
+    await adapters["omp"].started.wait()
     cancelled = await client.delete(f"/tasks/{task_id}", headers=headers())
     assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelled"
 
@@ -306,8 +306,8 @@ def _state_settings(tmp_path, port: int):
     )
     return Settings(
         server=ServerSettings(data_dir=tmp_path, port=port),
-        executors={"codex": ExecutorSettings(adapter="codex")},
-        routing=RoutingSettings(fallback_executor="codex"),
+        executors={"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna")},
+        routing=RoutingSettings(fallback_executor="omp"),
     )
 
 
@@ -344,8 +344,8 @@ def test_run_server_detects_busy_port(tmp_path):
         port = occupied.getsockname()[1]
         settings = Settings(
             server=ServerSettings(data_dir=tmp_path, port=port),
-            executors={"codex": ExecutorSettings(adapter="codex")},
-            routing=RoutingSettings(fallback_executor="codex"),
+            executors={"omp": ExecutorSettings(adapter="omp", model="agent-lb/luna")},
+            routing=RoutingSettings(fallback_executor="omp"),
         )
         with pytest.raises(SystemExit, match="port .* is busy"):
             run_server(settings)
@@ -354,7 +354,7 @@ def test_run_server_detects_busy_port(tmp_path):
 @pytest.mark.asyncio
 async def test_lifespan_recovers_stale_task(api):
     client, dispatcher, storage, _, repo, _ = api
-    record = await dispatcher.submit(DispatchRequest(task="stale", cwd=str(repo), executor="codex"))
+    record = await dispatcher.submit(DispatchRequest(task="stale", cwd=str(repo), executor="omp"))
     worker = dispatcher._tasks.pop(record.task_id)
     worker.cancel()
     await asyncio.gather(worker, return_exceptions=True)

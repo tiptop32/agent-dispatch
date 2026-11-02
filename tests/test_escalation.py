@@ -10,7 +10,7 @@ from agent_dispatch.config import ExecutorSettings, RoutingSettings, ServerSetti
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.executors.base import RunContext
-from agent_dispatch.executors.codex import CodexAdapter
+from agent_dispatch.executors.omp import OmpAdapter
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     DispatchRequest,
@@ -31,22 +31,22 @@ WAIT = 2.0
 
 def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
     disabled = disabled or set()
-    names = {"codex": "codex", "claude": "claude", "opencode/kimi": "opencode"}
+    names = {"omp": "omp", "claude": "claude", "omp/kimi": "omp"}
     return Settings(
         server=ServerSettings(data_dir=tmp_path),
-        routing=RoutingSettings(fallback_executor="codex"),
+        routing=RoutingSettings(fallback_executor="omp"),
         executors={
             name: ExecutorSettings(
                 adapter=adapter,
-                model="kimi" if adapter == "opencode" else None,
+                model="kimi" if adapter == "omp" else None,
                 description=name,
                 enabled=name not in disabled,
             )
             for name, adapter in names.items()
         },
         escalation={
-            "opencode/kimi": ["codex", "claude"],
-            "codex": ["claude"],
+            "omp/kimi": ["omp", "claude"],
+            "omp": ["claude"],
         },
     )
 
@@ -55,14 +55,14 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
     ("result", "expected"),
     [
         pytest.param(
-            ExecutionResult(status="failed", executor="codex", model=None, summary="failed"),
+            ExecutionResult(status="failed", executor="omp", model=None, summary="failed"),
             "failed",
             id="failed-status",
         ),
         pytest.param(
             ExecutionResult(
                 status="completed",
-                executor="codex",
+                executor="omp",
                 model=None,
                 summary="retry elsewhere",
                 needs_escalation=True,
@@ -72,7 +72,7 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
         ),
         pytest.param(
             ExecutionResult(
-                status="needs_escalation", executor="codex", model=None, summary="retry elsewhere"
+                status="needs_escalation", executor="omp", model=None, summary="retry elsewhere"
             ),
             "needs_escalation",
             id="needs-escalation-status",
@@ -80,7 +80,7 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
         pytest.param(
             ExecutionResult(
                 status="completed",
-                executor="codex",
+                executor="omp",
                 model=None,
                 summary="tests failed",
                 tests=ResultTestsInfo(result="failed"),
@@ -94,7 +94,7 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
             # выбросили из-за `tests: failed` в отчёте.
             ExecutionResult(
                 status="completed",
-                executor="codex",
+                executor="omp",
                 model=None,
                 summary="tests failed",
                 tests=ResultTestsInfo(result="failed"),
@@ -104,7 +104,7 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
             id="failed-tests-but-verify-passed",
         ),
         pytest.param(
-            ExecutionResult(status="completed", executor="codex", model=None, summary="ok"),
+            ExecutionResult(status="completed", executor="omp", model=None, summary="ok"),
             None,
             id="completed",
         ),
@@ -113,7 +113,7 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
             # эскалации задача застревает навсегда.
             ExecutionResult(
                 status="partial",
-                executor="codex",
+                executor="omp",
                 model=None,
                 summary="raw stdout tail",
                 changed_files=[],
@@ -127,7 +127,7 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
             # по дифу, повторный запуск лёг бы поверх.
             ExecutionResult(
                 status="partial",
-                executor="codex",
+                executor="omp",
                 model=None,
                 summary="raw stdout tail",
                 changed_files=["src/a.py", "tests/test_a.py"],
@@ -138,9 +138,7 @@ def _settings(tmp_path: Path, *, disabled: set[str] | None = None) -> Settings:
         ),
         pytest.param(
             # Честный самоотчёт «сделал частично» это не потеря результата.
-            ExecutionResult(
-                status="partial", executor="codex", model=None, summary="did half of it"
-            ),
+            ExecutionResult(status="partial", executor="omp", model=None, summary="did half of it"),
             None,
             id="partial-self-reported",
         ),
@@ -157,7 +155,7 @@ async def test_partial_after_reediting_dirty_file_does_not_escalate(
     # Файл был грязным до запуска, исполнитель переписал его ещё раз и не отдал
     # отчёт. `changed_files` сравнивает отпечатки содержимого, поэтому правка
     # видна и эскалации `no_result` нет: иначе новый запуск лёг бы поверх работы.
-    from agent_dispatch.executors import codex as module
+    from agent_dispatch.executors import omp as module
 
     class Outcome:
         exit_code = 0
@@ -172,8 +170,8 @@ async def test_partial_after_reediting_dirty_file_does_not_escalate(
 
     (git_repo / "a.py").write_text("x = 2\n")
     monkeypatch.setattr(module, "run_cli", fake_run_cli)
-    result = await CodexAdapter(
-        "codex", ExecutorSettings(adapter="codex", command="codex")
+    result = await OmpAdapter(
+        "omp", ExecutorSettings(adapter="omp", model="kimi", command="omp")
     ).execute(
         RunContext(
             cwd=str(git_repo),
@@ -193,13 +191,13 @@ async def test_partial_after_reediting_dirty_file_does_not_escalate(
 @pytest.mark.parametrize(
     ("current", "tried", "disabled", "expected"),
     [
-        pytest.param("opencode/kimi", ["opencode/kimi"], set(), "codex", id="first"),
-        pytest.param("opencode/kimi", ["opencode/kimi", "codex"], set(), "claude", id="skip-tried"),
-        pytest.param("opencode/kimi", ["opencode/kimi"], {"codex"}, "claude", id="skip-disabled"),
+        pytest.param("omp/kimi", ["omp/kimi"], set(), "omp", id="first"),
+        pytest.param("omp/kimi", ["omp/kimi", "omp"], set(), "claude", id="skip-tried"),
+        pytest.param("omp/kimi", ["omp/kimi"], {"omp"}, "claude", id="skip-disabled"),
         pytest.param("claude", ["claude"], set(), None, id="no-chain"),
         pytest.param(
-            "opencode/kimi",
-            ["opencode/kimi", "codex", "claude"],
+            "omp/kimi",
+            ["omp/kimi", "omp", "claude"],
             set(),
             None,
             id="exhausted",
@@ -212,8 +210,8 @@ def test_next_executor_returns_first_enabled_untried(tmp_path, current, tried, d
 
 def test_next_executor_skips_missing_configuration(tmp_path):
     settings = _settings(tmp_path)
-    settings.escalation["codex"] = ["missing", "claude"]
-    assert next_executor("codex", settings, ["codex"]) == "claude"
+    settings.escalation["omp"] = ["missing", "claude"]
+    assert next_executor("omp", settings, ["omp"]) == "claude"
 
 
 def _result(
@@ -255,7 +253,7 @@ async def _make_dispatcher(
 
 def _request(repo: Path, **updates) -> DispatchRequest:
     return DispatchRequest(
-        task="fix tests", cwd=str(repo), hop=0, **{"executor": "opencode/kimi", **updates}
+        task="fix tests", cwd=str(repo), hop=0, **{"executor": "omp/kimi", **updates}
     )
 
 
@@ -275,8 +273,8 @@ async def test_failed_result_escalates_to_next_executor(tmp_path, git_repo):
     storage, adapters, _, dispatcher = await _make_dispatcher(
         tmp_path,
         results={
-            "opencode/kimi": _result("opencode/kimi", "failed"),
-            "codex": _result("codex"),
+            "omp/kimi": _result("omp/kimi", "failed"),
+            "omp": _result("omp"),
         },
     )
     first = await dispatcher.submit(_request(git_repo))
@@ -288,11 +286,11 @@ async def test_failed_result_escalates_to_next_executor(tmp_path, git_repo):
     assert child.parent_task_id == parent.parent_task_id and child.hop == parent.hop
     assert child.decision.reason == GuardReason.escalated
     assert child.decision.router == RouterKind.fallback
-    assert adapters["codex"].calls
+    assert adapters["omp"].calls
     events = await storage.list_events(parent.task_id)
     assert any(
         event["kind"] == "escalate"
-        and event["payload"] == {"from": "opencode/kimi", "to": "codex", "reason": "failed"}
+        and event["payload"] == {"from": "omp/kimi", "to": "omp", "reason": "failed"}
         for event in events
     )
 
@@ -302,12 +300,12 @@ async def test_capability_ceiling_does_not_limit_explicit_escalation(tmp_path, g
     storage, adapters, _, dispatcher = await _make_dispatcher(
         tmp_path,
         results={
-            "opencode/kimi": _result("opencode/kimi", "failed"),
+            "omp/kimi": _result("omp/kimi", "failed"),
             "claude": _result("claude"),
         },
-        escalation={"opencode/kimi": ["claude"]},
+        escalation={"omp/kimi": ["claude"]},
     )
-    dispatcher.settings.executors["opencode/kimi"].tier = "balanced"
+    dispatcher.settings.executors["omp/kimi"].tier = "balanced"
     dispatcher.settings.executors["claude"].tier = "strong"
 
     first = await dispatcher.submit(_request(git_repo, max_capability="balanced"))
@@ -324,14 +322,14 @@ async def test_completed_result_requesting_escalation_escalates(tmp_path, git_re
     storage, _, _, dispatcher = await _make_dispatcher(
         tmp_path,
         results={
-            "opencode/kimi": _result("opencode/kimi", needs_escalation=True),
-            "codex": _result("codex"),
+            "omp/kimi": _result("omp/kimi", needs_escalation=True),
+            "omp": _result("omp"),
         },
     )
     await dispatcher.submit(_request(git_repo))
 
     records = await _wait_for_records(dispatcher, storage, 2)
-    assert {record.decision.executor for record in records} == {"opencode/kimi", "codex"}
+    assert {record.decision.executor for record in records} == {"omp/kimi", "omp"}
 
 
 @pytest.mark.asyncio
@@ -339,8 +337,8 @@ async def test_failed_tests_escalate_completed_result(tmp_path, git_repo):
     storage, _, _, dispatcher = await _make_dispatcher(
         tmp_path,
         results={
-            "opencode/kimi": _result("opencode/kimi", tests_failed=True),
-            "codex": _result("codex"),
+            "omp/kimi": _result("omp/kimi", tests_failed=True),
+            "omp": _result("omp"),
         },
     )
     await dispatcher.submit(_request(git_repo))
@@ -352,7 +350,7 @@ async def test_failed_tests_escalate_completed_result(tmp_path, git_repo):
 @pytest.mark.asyncio
 async def test_disallowed_escalation_keeps_single_record_and_no_event(tmp_path, git_repo):
     storage, _, _, dispatcher = await _make_dispatcher(
-        tmp_path, results={"opencode/kimi": _result("opencode/kimi", "failed")}
+        tmp_path, results={"omp/kimi": _result("omp/kimi", "failed")}
     )
     first = await dispatcher.submit(_request(git_repo, allow_escalation=False))
     done = await dispatcher.wait(first.task_id, WAIT)
@@ -375,7 +373,7 @@ async def test_exhausted_chain_records_full_chain_on_final_failure(tmp_path, git
     records = await _wait_for_records(dispatcher, storage, 3)
     final = next(record for record in records if record.decision.executor == "claude")
     assert len(records) == 3 and final.status == "failed"
-    assert final.result.meta["escalation_chain"] == ["opencode/kimi", "codex", "claude"]
+    assert final.result.meta["escalation_chain"] == ["omp/kimi", "omp", "claude"]
 
 
 @pytest.mark.asyncio
@@ -395,8 +393,8 @@ async def test_escalation_children_do_not_call_router(tmp_path, git_repo):
     storage, _, router, dispatcher = await _make_dispatcher(
         tmp_path,
         results={
-            "opencode/kimi": _result("opencode/kimi", "failed"),
-            "codex": _result("codex", "failed"),
+            "omp/kimi": _result("omp/kimi", "failed"),
+            "omp": _result("omp", "failed"),
             "claude": _result("claude"),
         },
     )
@@ -411,26 +409,26 @@ async def test_escalation_cycle_does_not_retry_ancestor(tmp_path, git_repo):
     storage, adapters, _, dispatcher = await _make_dispatcher(
         tmp_path,
         results={
-            "codex": _result("codex", "failed"),
+            "omp": _result("omp", "failed"),
             "claude": _result("claude", "failed"),
         },
-        escalation={"codex": ["claude"], "claude": ["codex"]},
+        escalation={"omp": ["claude"], "claude": ["omp"]},
     )
-    task = await dispatcher.submit(_request(git_repo).model_copy(update={"executor": "codex"}))
+    task = await dispatcher.submit(_request(git_repo).model_copy(update={"executor": "omp"}))
     await dispatcher.wait(task.task_id, WAIT)
 
     records = await _wait_for_records(dispatcher, storage, 2)
     assert len(records) == 2
-    assert len(adapters["codex"].calls) == 1 and len(adapters["claude"].calls) == 1
+    assert len(adapters["omp"].calls) == 1 and len(adapters["claude"].calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_disabled_executor_in_chain_is_skipped(tmp_path, git_repo):
     storage, adapters, _, dispatcher = await _make_dispatcher(
         tmp_path,
-        disabled={"codex"},
+        disabled={"omp"},
         results={
-            "opencode/kimi": _result("opencode/kimi", "failed"),
+            "omp/kimi": _result("omp/kimi", "failed"),
             "claude": _result("claude"),
         },
     )
@@ -439,7 +437,7 @@ async def test_disabled_executor_in_chain_is_skipped(tmp_path, git_repo):
     records = await _wait_for_records(dispatcher, storage, 2)
     child = next(record for record in records if record.escalated_from is not None)
     assert child.decision.executor == "claude"
-    assert not adapters["codex"].calls
+    assert not adapters["omp"].calls
 
 
 @pytest.mark.asyncio
@@ -447,13 +445,13 @@ async def test_wait_follows_escalation_chain_and_returns_child(tmp_path, git_rep
     storage, _, _, dispatcher = await _make_dispatcher(
         tmp_path,
         results={
-            "opencode/kimi": _result("opencode/kimi", "failed"),
-            "codex": _result("codex"),
+            "omp/kimi": _result("omp/kimi", "failed"),
+            "omp": _result("omp"),
         },
     )
     parent = await dispatcher.submit(_request(git_repo))
     done = await dispatcher.wait(parent.task_id, WAIT)
-    assert done.decision.executor == "codex"
+    assert done.decision.executor == "omp"
     assert done.escalated_from == parent.task_id
     assert done.status == "completed"
 
@@ -462,10 +460,10 @@ async def test_wait_follows_escalation_chain_and_returns_child(tmp_path, git_rep
 async def test_wait_timeout_returns_running_escalated_child(tmp_path, git_repo):
     storage, adapters, _, dispatcher = await _make_dispatcher(
         tmp_path,
-        results={"opencode/kimi": _result("opencode/kimi", "failed"), "codex": _result("codex")},
+        results={"omp/kimi": _result("omp/kimi", "failed"), "omp": _result("omp")},
     )
     gate = asyncio.Event()
-    adapters["codex"].gate = gate
+    adapters["omp"].gate = gate
     parent = await dispatcher.submit(_request(git_repo))
     # Звено держит `gate`, поэтому окно не ослабляет проверку: оно нужно лишь
     # на провал родителя и создание звена (с записью события `git`).
@@ -495,7 +493,7 @@ async def test_escalation_children_do_not_consume_max_children_quota(tmp_path, g
         if record.decision and record.decision.executor == "claude" and record.escalated_from
     )
     assert len(chain) >= 3
-    assert final.result.meta["escalation_chain"] == ["opencode/kimi", "codex", "claude"]
+    assert final.result.meta["escalation_chain"] == ["omp/kimi", "omp", "claude"]
 
 
 @pytest.mark.asyncio
@@ -512,7 +510,7 @@ async def test_exhausted_escalation_marks_completed_result_failed(tmp_path, git_
 @pytest.mark.asyncio
 async def test_wait_zero_returns_parent_not_escalation_child(tmp_path, git_repo):
     storage, _, _, dispatcher = await _make_dispatcher(
-        tmp_path, results={"opencode/kimi": _result("opencode/kimi", status="failed")}
+        tmp_path, results={"omp/kimi": _result("omp/kimi", status="failed")}
     )
     parent = await dispatcher.submit(_request(git_repo))
     final = await dispatcher.wait(parent.task_id, WAIT)
@@ -536,15 +534,15 @@ def _quota(executor: str) -> ExecutionResult:
 async def test_perimeter_chain_skips_external_links_and_stops_when_none_left(tmp_path, git_repo):
     """Периметр корневого решения действует на всей цепочке: внешние звенья пропущены."""
     storage, adapters, _, dispatcher = await _make_dispatcher(
-        tmp_path, results={"opencode/kimi": _result("opencode/kimi", "failed")}
+        tmp_path, results={"omp/kimi": _result("omp/kimi", "failed")}
     )
-    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.settings.executors["omp/kimi"].corporate = True
     # Роутер выбрал внешнего исполнителя, не спросив о корп. данных: post_guards
     # сужает решение до периметра, и корневое звено помечено `perimeter: unknown`.
     dispatcher.routers = [
         FakeRouter(
             RouteDecision(
-                router=RouterKind.jev, executor="codex", confidence=0.99, scores={"codex": 0.99}
+                router=RouterKind.jev, executor="omp", confidence=0.99, scores={"omp": 0.99}
             )
         )
     ]
@@ -552,12 +550,12 @@ async def test_perimeter_chain_skips_external_links_and_stops_when_none_left(tmp
     records = await _wait_for_records(dispatcher, storage, 1)
     parent = next(record for record in records if record.task_id == first.task_id)
 
-    assert parent.decision.executor == "opencode/kimi"
+    assert parent.decision.executor == "omp/kimi"
     assert parent.decision.meta["perimeter"] == "unknown"
     assert len(records) == 1
     assert records[0].status == "failed"
     assert records[0].result.meta["escalation_stopped"] == "perimeter"
-    assert not adapters["codex"].calls and not adapters["claude"].calls
+    assert not adapters["omp"].calls and not adapters["claude"].calls
     assert not any(
         event["kind"] == "escalate" for event in await storage.list_events(first.task_id)
     )
@@ -569,19 +567,19 @@ async def test_perimeter_chain_escalates_to_the_corporate_link(tmp_path, git_rep
     storage, adapters, _, dispatcher = await _make_dispatcher(
         tmp_path,
         results={
-            "opencode/kimi": _result("opencode/kimi", "failed"),
+            "omp/kimi": _result("omp/kimi", "failed"),
             "claude": _result("claude"),
         },
     )
-    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.settings.executors["omp/kimi"].corporate = True
     dispatcher.settings.executors["claude"].corporate = True
     dispatcher.routers = [
         FakeRouter(
             RouteDecision(
                 router=RouterKind.jev,
-                executor="opencode/kimi",
+                executor="omp/kimi",
                 confidence=0.99,
-                scores={"opencode/kimi": 0.99},
+                scores={"omp/kimi": 0.99},
             )
         )
     ]
@@ -591,7 +589,7 @@ async def test_perimeter_chain_escalates_to_the_corporate_link(tmp_path, git_rep
 
     assert child.decision.executor == "claude"
     assert "escalation_stopped" not in child.result.meta
-    assert not adapters["codex"].calls
+    assert not adapters["omp"].calls
 
 
 class _SequenceRouter:
@@ -634,19 +632,19 @@ async def test_perimeter_survives_reroute_after_executor_failure(tmp_path, git_r
     «корпоративное», по которому корень сузил пул.
     """
     storage, adapters, _, dispatcher = await _make_dispatcher(
-        tmp_path, results={"opencode/kimi": _quota("opencode/kimi")}, escalation={}
+        tmp_path, results={"omp/kimi": _quota("omp/kimi")}, escalation={}
     )
-    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.settings.executors["omp/kimi"].corporate = True
     dispatcher.settings.executors["claude"].corporate = True
     dispatcher.routers = [
-        _SequenceRouter([_jev("opencode/kimi", corporate=True), _jev("codex", corporate=False)])
+        _SequenceRouter([_jev("omp/kimi", corporate=True), _jev("omp", corporate=False)])
     ]
     first = await dispatcher.submit(_request(git_repo, executor=None))
     records = await _wait_for_records(dispatcher, storage, 2)
     child = next(record for record in records if record.escalated_from == first.task_id)
 
     assert child.decision.executor == "claude"
-    assert not adapters["codex"].calls
+    assert not adapters["omp"].calls
     assert adapters["claude"].calls
 
 
@@ -654,20 +652,20 @@ async def test_perimeter_survives_reroute_after_executor_failure(tmp_path, git_r
 async def test_perimeter_survives_followup_to_router(tmp_path, git_repo):
     """Follow-up при остывшем исполнителе идёт роутеру, но в периметре исходной задачи."""
     storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
-    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.settings.executors["omp/kimi"].corporate = True
     dispatcher.settings.executors["claude"].corporate = True
     dispatcher.routers = [
-        _SequenceRouter([_jev("opencode/kimi", corporate=True), _jev("codex", corporate=False)])
+        _SequenceRouter([_jev("omp/kimi", corporate=True), _jev("omp", corporate=False)])
     ]
     first = await dispatcher.submit(_request(git_repo, executor=None))
     assert (await dispatcher.wait(first.task_id, WAIT)).status == "completed"
-    dispatcher.availability.trip("opencode/kimi", "rate_limit", "test", 600)
+    dispatcher.availability.trip("omp/kimi", "rate_limit", "test", 600)
 
     record = await dispatcher.followup(first.task_id, FollowupRequest(message="more"))
     done = await dispatcher.wait(record.task_id, WAIT)
 
     assert done.decision.executor == "claude"
-    assert not adapters["codex"].calls
+    assert not adapters["omp"].calls
     await storage.close()
 
 
@@ -677,15 +675,15 @@ async def test_nested_task_with_external_executor_is_refused_under_parent_perime
 ):
     """Вложенный dispatch из корпоративной задачи не уходит к внешнему исполнителю."""
     storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
-    dispatcher.settings.executors["opencode/kimi"].corporate = True
-    dispatcher.routers = [_SequenceRouter([_jev("opencode/kimi", corporate=True)])]
+    dispatcher.settings.executors["omp/kimi"].corporate = True
+    dispatcher.routers = [_SequenceRouter([_jev("omp/kimi", corporate=True)])]
     gate = asyncio.Event()
-    adapters["opencode/kimi"].gate = gate
+    adapters["omp/kimi"].gate = gate
     parent = await dispatcher.submit(_request(git_repo, executor=None))
-    await asyncio.wait_for(adapters["opencode/kimi"].started.wait(), WAIT)
+    await asyncio.wait_for(adapters["omp/kimi"].started.wait(), WAIT)
 
     child = await dispatcher.submit(
-        _request(git_repo, executor="codex", parent_task_id=parent.task_id).model_copy(
+        _request(git_repo, executor="omp", parent_task_id=parent.task_id).model_copy(
             update={"hop": 1}
         )
     )
@@ -696,7 +694,7 @@ async def test_nested_task_with_external_executor_is_refused_under_parent_perime
     assert done.status == "failed"
     assert done.result.meta["guard"] == "perimeter"
     assert "corporate perimeter" in done.result.error
-    assert not adapters["codex"].calls
+    assert not adapters["omp"].calls
     await storage.close()
 
 
@@ -704,16 +702,16 @@ async def test_nested_task_with_external_executor_is_refused_under_parent_perime
 async def test_task_is_refused_when_every_corporate_executor_is_cooling(tmp_path, git_repo):
     """Ответ «корпоративное» при остывших корпоративных исполнителях даёт отказ."""
     storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
-    dispatcher.settings.executors["opencode/kimi"].corporate = True
-    dispatcher.availability.trip("opencode/kimi", "rate_limit", "test", 600)
-    dispatcher.routers = [_SequenceRouter([_jev("codex", corporate=True)])]
+    dispatcher.settings.executors["omp/kimi"].corporate = True
+    dispatcher.availability.trip("omp/kimi", "rate_limit", "test", 600)
+    dispatcher.routers = [_SequenceRouter([_jev("omp", corporate=True)])]
 
     first = await dispatcher.submit(_request(git_repo, executor=None))
     done = await dispatcher.wait(first.task_id, WAIT)
 
     assert done.status == "failed"
     assert done.result.meta["guard"] == "perimeter"
-    assert not adapters["codex"].calls and not adapters["claude"].calls
+    assert not adapters["omp"].calls and not adapters["claude"].calls
     await storage.close()
 
 
@@ -721,18 +719,18 @@ async def test_task_is_refused_when_every_corporate_executor_is_cooling(tmp_path
 async def test_single_corporate_candidate_escalation_stays_inside(tmp_path, git_repo):
     """Звено, выбранное коротким путём «один кандидат», эскалирует только в периметре."""
     storage, adapters, _, dispatcher = await _make_dispatcher(
-        tmp_path, results={"opencode/kimi": _result("opencode/kimi", "failed")}
+        tmp_path, results={"omp/kimi": _result("omp/kimi", "failed")}
     )
-    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.settings.executors["omp/kimi"].corporate = True
     dispatcher.availability.trip("claude", "rate_limit", "test", 600)
-    dispatcher.availability.trip("codex", "rate_limit", "test", 600)
+    dispatcher.availability.trip("omp", "rate_limit", "test", 600)
     first = await dispatcher.submit(_request(git_repo, executor=None))
     done = await dispatcher.wait(first.task_id, WAIT)
     dispatcher.availability.clear()
 
     assert done.task_id == first.task_id
     assert done.decision.meta["perimeter"] == "unknown"
-    assert not adapters["codex"].calls and not adapters["claude"].calls
+    assert not adapters["omp"].calls and not adapters["claude"].calls
     await storage.close()
 
 
@@ -742,11 +740,11 @@ async def test_root_explicit_external_executor_is_not_refused_under_perimeter_co
 ):
     """Явный `executor` корневой задачи это решение владельца данных: отказа нет."""
     storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
-    dispatcher.settings.executors["opencode/kimi"].corporate = True
+    dispatcher.settings.executors["omp/kimi"].corporate = True
     done = await dispatcher.wait(
-        (await dispatcher.submit(_request(git_repo, executor="codex"))).task_id, WAIT
+        (await dispatcher.submit(_request(git_repo, executor="omp"))).task_id, WAIT
     )
-    assert done.status == "completed" and adapters["codex"].calls
+    assert done.status == "completed" and adapters["omp"].calls
     await storage.close()
 
 
@@ -755,15 +753,15 @@ async def test_perimeter_off_lets_nested_task_use_external_executor(tmp_path, gi
     """`corporate_perimeter: false`: наследования и отказа нет, как до исправления."""
     storage, adapters, _, dispatcher = await _make_dispatcher(tmp_path)
     dispatcher.settings.routing.corporate_perimeter = False
-    dispatcher.settings.executors["opencode/kimi"].corporate = True
-    dispatcher.routers = [_SequenceRouter([_jev("opencode/kimi", corporate=True)])]
+    dispatcher.settings.executors["omp/kimi"].corporate = True
+    dispatcher.routers = [_SequenceRouter([_jev("omp/kimi", corporate=True)])]
     gate = asyncio.Event()
-    adapters["opencode/kimi"].gate = gate
+    adapters["omp/kimi"].gate = gate
     parent = await dispatcher.submit(_request(git_repo, executor=None))
-    await asyncio.wait_for(adapters["opencode/kimi"].started.wait(), WAIT)
+    await asyncio.wait_for(adapters["omp/kimi"].started.wait(), WAIT)
 
     child = await dispatcher.submit(
-        _request(git_repo, executor="codex", parent_task_id=parent.task_id).model_copy(
+        _request(git_repo, executor="omp", parent_task_id=parent.task_id).model_copy(
             update={"hop": 1}
         )
     )
@@ -771,20 +769,20 @@ async def test_perimeter_off_lets_nested_task_use_external_executor(tmp_path, gi
     gate.set()
     finished = await dispatcher.wait(parent.task_id, WAIT)
 
-    assert done.status == "completed" and adapters["codex"].calls
+    assert done.status == "completed" and adapters["omp"].calls
     assert "perimeter" not in finished.decision.meta
     await storage.close()
 
 
 def test_next_executor_skips_unavailable_link(tmp_path):
     settings = _settings(tmp_path)
-    assert next_executor("opencode/kimi", settings, ["opencode/kimi"], {"codex"}) == "claude"
+    assert next_executor("omp/kimi", settings, ["omp/kimi"], {"omp"}) == "claude"
 
 
 @pytest.mark.asyncio
 async def test_executor_failure_takes_it_out_of_rotation(tmp_path, git_repo):
     storage, adapters, _, dispatcher = await _make_dispatcher(
-        tmp_path, results={"opencode/kimi": _quota("opencode/kimi")}
+        tmp_path, results={"omp/kimi": _quota("omp/kimi")}
     )
     first = await dispatcher.submit(_request(git_repo))
     records = await _wait_for_records(dispatcher, storage, 2)
@@ -793,16 +791,16 @@ async def test_executor_failure_takes_it_out_of_rotation(tmp_path, git_repo):
     assert parent.result.meta["executor_failure"] == "quota"
     events = await storage.list_events(first.task_id)
     cooldown = next(event["payload"] for event in events if event["kind"] == "cooldown")
-    assert cooldown["executor"] == "opencode/kimi" and cooldown["kind"] == "quota"
+    assert cooldown["executor"] == "omp/kimi" and cooldown["kind"] == "quota"
     escalate = next(event["payload"] for event in events if event["kind"] == "escalate")
-    assert escalate == {"from": "opencode/kimi", "to": "codex", "reason": "executor_quota"}
+    assert escalate == {"from": "omp/kimi", "to": "omp", "reason": "executor_quota"}
 
     # Следующая задача к остывающему исполнителю не уходит и не жжёт попытку.
     again = await dispatcher.submit(_request(git_repo))
     done = await dispatcher.wait(again.task_id, WAIT)
     assert done.status == "failed" and done.result.meta["guard"] == "unavailable"
     assert "cooldown until" in done.result.error and "spend limit" in done.result.error
-    assert len(adapters["opencode/kimi"].calls) == 1
+    assert len(adapters["omp/kimi"].calls) == 1
 
 
 @pytest.mark.asyncio
@@ -810,25 +808,25 @@ async def test_escalation_chain_skips_a_cooling_link(tmp_path, git_repo):
     storage, adapters, _, dispatcher = await _make_dispatcher(
         tmp_path,
         results={
-            "codex": _quota("codex"),
-            "opencode/kimi": _result("opencode/kimi", "failed"),
+            "omp": _quota("omp"),
+            "omp/kimi": _result("omp/kimi", "failed"),
         },
     )
-    # codex падает на лимите и остывает.
+    # omp падает на лимите и остывает.
     await dispatcher.wait(
-        (await dispatcher.submit(_request(git_repo, executor="codex"))).task_id, WAIT
+        (await dispatcher.submit(_request(git_repo, executor="omp"))).task_id, WAIT
     )
     await _wait_for_records(dispatcher, storage, 2)
-    calls_before = len(adapters["codex"].calls)
+    calls_before = len(adapters["omp"].calls)
 
-    # Цепочка kimi -> codex -> claude обходит остывающий codex.
+    # Цепочка kimi -> omp -> claude обходит остывающий omp.
     first = await dispatcher.submit(_request(git_repo))
     await dispatcher.wait(first.task_id, WAIT)
     await _wait_for_records(dispatcher, storage, 4)
     events = await storage.list_events(first.task_id)
     escalate = next(event["payload"] for event in events if event["kind"] == "escalate")
     assert escalate["to"] == "claude"
-    assert len(adapters["codex"].calls) == calls_before
+    assert len(adapters["omp"].calls) == calls_before
 
 
 @pytest.mark.asyncio
@@ -872,11 +870,14 @@ async def test_rerouting_stops_when_every_executor_is_down(tmp_path, git_repo):
 async def test_rerouting_terminates_with_more_than_ten_executors(tmp_path, git_repo):
     # Цепочка предков раньше обрезалась на 10: ранние исполнители возвращались
     # в выбор, и при выключенном остывании переадресация шла бы без конца.
-    names = [f"codex/{index}" for index in range(12)]
+    names = [f"omp/{index}" for index in range(12)]
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path),
         routing=RoutingSettings(fallback_executor=names[0], failure_cooldown_seconds=0),
-        executors={name: ExecutorSettings(adapter="codex", description=name) for name in names},
+        executors={
+            name: ExecutorSettings(adapter="omp", model="agent-lb/luna", description=name)
+            for name in names
+        },
     )
     storage = Storage(tmp_path / "db.sqlite")
     await storage.open()
