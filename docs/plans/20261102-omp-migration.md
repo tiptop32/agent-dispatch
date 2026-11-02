@@ -163,19 +163,19 @@
 **Files:**
 - Create: `models.yml`, `config.yml`, `mcp.yml`, `AGENTS.md`, `install.sh`, `Makefile`, `README.md`, `profiles/x5/`, `tests/` (в omp-setup)
 
-- [ ] `models.yml`: провайдеры `agent-lb` и `copilot-x5`, модели и лимиты из opencode, `apiKey: "!…"` без значений в файле
-- [ ] `config.yml`: роли, `retry.fallbackChains` sol→terra, `approvalMode: yolo`, `enabledProviders` без Claude и Codex
-- [ ] профиль x5: только `copilot-x5`, все роли на x5-моделях
+- [x] `models.yml`: провайдеры `agent-lb` и `copilot-x5`, модели и лимиты из opencode, `apiKey: "!…"` без значений в файле
+- [x] `config.yml`: роли, `retry.fallbackChains` sol→terra, `approvalMode: yolo`, `enabledProviders` без Claude и Codex
+- [x] профиль x5: только `copilot-x5`, все роли на x5-моделях
 - ➕ профиль x5: `enabledModels: [copilot-x5/*]`, `retry.maxRetries: 1` не нужен интерактиву, только оверлею диспетчера
 - ➕ `bin/x5-key` и `bin/lb-key`: команды для `apiKey: "!…"` (ключ x5 из Keychain `copilot-x5`, ключ балансера из `~/.config/agent-lb/env`); перенос ключа x5 в Keychain делает координатор в Task 12
 - ➕ выгрузка корпоративного `CN=RootCA` (System.keychain, SHA-1 F75DAB43…) в `~/.omp/agent/x5-root.pem` в `install.sh`; `NODE_EXTRA_CA_CERTS` для интерактивного запуска
 - ➕ `dispatch-overlay.yml` для `--config`: `retry: {maxRetries: 1}`
-- [ ] MCP: mcphub, agent-dispatch (`AGENT_DISPATCH_SOURCE_AGENT=omp`, проброс `AGENT_DISPATCH_*`), context7
-- [ ] `AGENTS.md` из `~/.codex/AGENTS.md` и `~/.config/opencode/AGENTS.md`; `salt-qa-agent-kit/AGENTS.md` только для `~/x5`
-- [ ] `install.sh`: симлинки в `~/.omp/agent` с бэкапом существующих файлов, идемпотентно
-- [ ] dcg как хук omp, если API хуков позволяет, иначе ⚠️ с причиной
-- [ ] тесты: YAML валиден, роли ссылаются на объявленные модели, в профиле x5 нет моделей и провайдеров вне copilot-x5, в репо нет секретов, `install.sh` идемпотентен на временном HOME
-- [ ] `make test` зелёный, коммит omp-setup
+- [x] MCP: mcphub, agent-dispatch (`AGENT_DISPATCH_SOURCE_AGENT=omp`, проброс `AGENT_DISPATCH_*`), context7
+- [x] `AGENTS.md` из `~/.codex/AGENTS.md` и `~/.config/opencode/AGENTS.md`; `salt-qa-agent-kit/AGENTS.md` только для `~/x5`
+- [x] `install.sh`: симлинки в `~/.omp/agent` с бэкапом существующих файлов, идемпотентно
+- [x] dcg как хук omp, если API хуков позволяет, иначе ⚠️ с причиной
+- [x] тесты: YAML валиден, роли ссылаются на объявленные модели, в профиле x5 нет моделей и провайдеров вне copilot-x5, в репо нет секретов, `install.sh` идемпотентен на временном HOME
+- [x] `make test` зелёный, коммит omp-setup
 
 ### Task 3: Адаптер executors/omp.py
 **Depends on:** Task 1, Task 2
@@ -252,12 +252,11 @@
 - Modify: `bin/gpt-review`, `SKILL.md`, `README.md`, `tests/` (в gpt-review, репо создаётся клоном codex-review до раздачи)
 - Ссылки в `~/.claude/skills/plan-dispatch` и `review-refactor` правит координатор: исполнитель вне репо не пишет
 
-- [ ] раннер вызывает `omp -p --mode json --model agent-lb/gpt-6.1-sol` с инструментами только на чтение и `--max-time`
-- [ ] бюджет команд считается по событиям tool-call из NDJSON; salvage через `--resume`
-- [ ] скил `gpt-review` (триггеры «gpt review», «ревью gpt», «второе мнение»); симлинк `~/.claude/skills/gpt-review`, симлинк `codex-review` убрать
-- [ ] ссылки в plan-dispatch и review-refactor поменять на gpt-review
-- [ ] тесты раннера на фикстурах omp: полный ответ, обрыв по бюджету, обрыв по времени, битый JSON
-- [ ] `make test` зелёный, коммит gpt-review
+- [x] раннер вызывает `omp -p --mode json --model agent-lb/gpt-6.1-sol` с инструментами только на чтение и `--max-time`
+- [x] бюджет команд считается по событиям tool-call из NDJSON; salvage через `--resume`
+- [x] скил `gpt-review` (триггеры «gpt review», «ревью gpt», «второе мнение»)
+- [x] тесты раннера на фикстурах omp: полный ответ, обрыв по бюджету, обрыв по времени, битый JSON
+- [x] `make test` зелёный, коммит gpt-review
 
 ### Task 9: Интеграция с agterm
 **Depends on:** Task 1
@@ -265,9 +264,9 @@
 **Files:**
 - Modify: `ask/`, `tests/` (в agterm-kit)
 
-- [ ] статус omp в сайдбаре agterm через хуки начала и конца хода (если Task 1 подтвердил API, иначе ⚠️)
-- [ ] `agterm-kit/ask`: установка рядом с конфигом omp
-- [ ] bats-тесты по правилам agterm-kit, `make test lint` зелёный, коммит agterm-kit
+- [x] статус omp в сайдбаре agterm через хуки начала и конца хода (если Task 1 подтвердил API, иначе ⚠️)
+- [x] `agterm-kit/ask`: установка рядом с конфигом omp
+- [x] bats-тесты по правилам agterm-kit, `make test lint` зелёный, коммит agterm-kit
 
 ### Task 10: Удаление адаптеров codex и opencode (последняя кодовая задача)
 **Depends on:** Tasks 3-9
@@ -293,6 +292,7 @@
 ### Task 12: Переключение одним шагом
 **Depends on:** Task 11
 - [ ] записать откат в `docs/research/omp-cli-facts.md`: путь к бэкапу конфига, команда установки прежней версии uv tool (коммит до Task 10), рестарт демона
+- ➕ [ ] симлинк `~/.claude/skills/gpt-review` вместо `codex-review`, ссылки в plan-dispatch и review-refactor на gpt-review (после установки omp-setup, иначе ревью сломается)
 - [ ] `agent-dispatch migrate-config` с бэкапом, переустановка uv tool, перезапуск демона (memory installed-tool-is-a-copy), `doctor` на установленной копии
 - [ ] `uv run agent-dispatch doctor --online` зелёный
 - [ ] `uv run python -m evals.smoke --executors omp/sol,omp/terra,omp/luna,omp/x5-code-large` зелёный
