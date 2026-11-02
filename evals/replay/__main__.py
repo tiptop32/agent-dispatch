@@ -23,6 +23,7 @@ from .harness import (
     render,
     replay,
     router_vs_static,
+    successor,
     timeouts,
 )
 
@@ -65,9 +66,16 @@ def main() -> int:
             since = since.astimezone()
     executors = settings.executors
 
+    def current(name: str):
+        """Настройки исполнителя или его omp-преемника для исторических codex/opencode."""
+        if name in executors:
+            return name, executors[name]
+        new = successor(name)
+        return new, executors.get(new)
+
     def limit_group(name: str) -> str:
-        item = executors.get(name)
-        return item.resolved_limit_group(name) if item else default_limit_group(name)
+        new, item = current(name)
+        return item.resolved_limit_group(new) if item else default_limit_group(name)
 
     tasks = load(args.db)
     if since is not None:
@@ -78,10 +86,10 @@ def main() -> int:
         quota_cooldown=settings.routing.quota_cooldown_seconds,
         limit_group=limit_group,
         review_only=settings.routing.review_only,
-        recheck=lambda name: name in executors and executors[name].limit_reset == "recheck",
+        recheck=lambda name: bool(current(name)[1]) and current(name)[1].limit_reset == "recheck",
     )
     report["perimeter_violations"] = perimeter_violations(
-        tasks, lambda name: name in executors and executors[name].corporate
+        tasks, lambda name: bool(current(name)[1]) and current(name)[1].corporate
     )
     report["children_refusals"] = children_refusals(tasks, settings.routing.max_children)
     report["delegations"] = delegations(tasks)

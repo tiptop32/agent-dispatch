@@ -237,6 +237,25 @@ def load_decisions(db_path: Path) -> list[Decision]:
     ]
 
 
+def successor(executor: str) -> str:
+    """Имя исполнителя omp, который заменил исторический codex/* или opencode/*.
+
+    Replay судит старые задачи по текущему конфигу: без сопоставления `codex/sol`
+    терял бы `limit_reset: recheck` своей группы agent-lb, а `opencode/x5-code-large`
+    признак `corporate`, и счётчики истории менялись бы от одного переименования.
+    Таблица та же, что у `agent-dispatch migrate-config`.
+    """
+    from agent_dispatch.migrate import BARE_CODEX_TARGET, CODEX_EXECUTOR_MAP
+
+    if executor == "codex":
+        return BARE_CODEX_TARGET
+    if executor in CODEX_EXECUTOR_MAP:
+        return CODEX_EXECUTOR_MAP[executor][0]
+    if executor.startswith("opencode/"):
+        return "omp/" + executor.removeprefix("opencode/")
+    return executor
+
+
 def default_limit_group(executor: str) -> str:
     """Группа лимита без конфига: у claude/* и codex/* один аккаунт на все модели.
 

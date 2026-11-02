@@ -1320,3 +1320,13 @@ def test_default_limit_group_splits_omp_by_provider():
     assert default_limit_group("omp/copilot-code-flash") == "omp:copilot-x5"
     assert default_limit_group("codex/sol") == "codex"
     assert default_limit_group("opencode/x5-code-large") == "opencode/x5-code-large"
+
+
+def test_successor_maps_history_to_omp_executors():
+    from evals.replay.harness import successor
+
+    assert successor("codex/sol") == "omp/sol"
+    assert successor("codex") == "omp/sol"
+    assert successor("opencode/x5-code-large") == "omp/x5-code-large"
+    assert successor("claude/opus") == "claude/opus"
+    assert successor("omp/luna") == "omp/luna"
