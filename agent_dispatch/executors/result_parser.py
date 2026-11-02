@@ -22,7 +22,7 @@ def extract_result_block(text: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def _tail(value: str) -> str:
+def tail(value: str) -> str:
     return value[-2000:]
 
 
@@ -41,7 +41,7 @@ def normalize(
             status="failed",
             executor=executor,
             model=model,
-            summary=_tail(outcome.stdout),
+            summary=tail(outcome.stdout),
             changed_files=changed_files or [],
             error=f"stalled: no output for {int(seconds)}s",
             meta=meta,
@@ -53,7 +53,7 @@ def normalize(
                 status="partial",
                 executor=executor,
                 model=model,
-                summary=_tail(outcome.stdout),
+                summary=tail(outcome.stdout),
                 changed_files=changed_files,
                 error="timeout",
                 meta=meta,
@@ -62,7 +62,7 @@ def normalize(
             status="failed",
             executor=executor,
             model=model,
-            summary=_tail(outcome.stdout),
+            summary=tail(outcome.stdout),
             changed_files=[],
             error="timeout",
             meta=meta,
@@ -72,9 +72,9 @@ def normalize(
             status="failed",
             executor=executor,
             model=model,
-            summary=_tail(outcome.stdout),
+            summary=tail(outcome.stdout),
             changed_files=changed_files or [],
-            error=_tail(outcome.stderr),
+            error=tail(outcome.stderr),
             meta=meta,
         )
     if raw is None:
@@ -83,7 +83,7 @@ def normalize(
             status="partial",
             executor=executor,
             model=model,
-            summary=_tail(outcome.stdout),
+            summary=tail(outcome.stdout),
             changed_files=changed_files or [],
             meta=meta,
         )
@@ -97,7 +97,7 @@ def normalize(
             status="partial",
             executor=executor,
             model=model,
-            summary=raw.get("summary") or _tail(outcome.stdout),
+            summary=raw.get("summary") or tail(outcome.stdout),
             changed_files=changed_files or [],
             meta=meta,
         )

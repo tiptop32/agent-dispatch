@@ -11,17 +11,26 @@ from agent_dispatch.executors.base import ExecutorAdapter
 from agent_dispatch.executors.claude import ClaudeAdapter
 from agent_dispatch.executors.codex import CodexAdapter
 from agent_dispatch.executors.env import child_env
+from agent_dispatch.executors.omp import OmpAdapter
 from agent_dispatch.executors.opencode import OpenCodeAdapter
 from agent_dispatch.models import Availability
 
 
 def build_adapters(settings: Settings) -> dict[str, ExecutorAdapter]:
     classes = {"claude": ClaudeAdapter, "codex": CodexAdapter, "opencode": OpenCodeAdapter}
-    return {
-        name: classes[item.adapter](name, item, child_env(settings))
-        for name, item in settings.executors.items()
-        if item.enabled
-    }
+    adapters: dict[str, ExecutorAdapter] = {}
+    for name, item in settings.executors.items():
+        if not item.enabled:
+            continue
+        if item.adapter == "omp":
+            # omp кладёт сессии в каталог данных демона: follow-up продолжается
+            # через --resume с тем же --session-dir, cwd и профилем.
+            adapters[name] = OmpAdapter(
+                name, item, child_env(settings), data_dir=settings.server.data_dir
+            )
+        else:
+            adapters[name] = classes[item.adapter](name, item, child_env(settings))
+    return adapters
 
 
 @dataclass(frozen=True)

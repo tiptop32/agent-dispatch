@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "omp -p --mode json event",
+  "description": "Конверт NDJSON-события omp (факты Task 1, docs/research/omp-cli-facts.md). Поля событий не перечислены полностью: omp добавляет новые, незнакомые поля фикстуру ломать не должны.",
+  "type": "object",
+  "required": ["type"],
+  "properties": {
+    "type": {
+      "enum": [
+        "session",
+        "advisor_cost_changed",
+        "agent_start",
+        "turn_start",
+        "message_start",
+        "message_update",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_update",
+        "tool_execution_end",
+        "turn_end",
+        "agent_end",
+        "auto_retry_start",
+        "auto_retry_end",
+        "notice"
+      ]
+    },
+    "id": {"type": "string"},
+    "version": {"type": "integer"},
+    "cwd": {"type": "string"},
+    "timestamp": {"type": "string"},
+    "level": {"type": "string"},
+    "source": {"type": "string"},
+    "message": {
+      "description": "У message_end это сообщение (объект), у notice — текст ошибки строкой.",
+      "type": ["object", "string"],
+      "required": ["role"],
+      "properties": {
+        "role": {"enum": ["user", "assistant", "toolResult"]},
+        "content": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+              "type": {"enum": ["text", "thinking", "toolCall"]}
+            }
+          }
+        },
+        "stopReason": {"enum": ["stop", "toolUse", "error"]},
+        "errorMessage": {"type": "string"},
+        "api": {"type": "string"},
+        "provider": {"type": "string"},
+        "model": {"type": "string"},
+        "usage": {
+          "type": "object",
+          "properties": {
+            "input": {"type": "integer"},
+            "output": {"type": "integer"},
+            "cacheRead": {"type": "integer"},
+            "cacheWrite": {"type": "integer"},
+            "totalTokens": {"type": "integer"},
+            "reasoningTokens": {"type": "integer"},
+            "premiumRequests": {"type": "integer"},
+            "cost": {
+              "type": "object",
+              "properties": {
+                "input": {"type": "number"},
+                "output": {"type": "number"},
+                "cacheRead": {"type": "number"},
+                "cacheWrite": {"type": "number"},
+                "total": {"type": "number"}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -165,7 +165,7 @@ class ExecutionSettings(_ConfigModel):
 
 
 class ExecutorSettings(_ConfigModel):
-    adapter: Literal["claude", "codex", "opencode"]
+    adapter: Literal["claude", "codex", "opencode", "omp"]
     command: str | None = None
     model: str | None = None
     extra_args: list[str] = Field(default_factory=list)

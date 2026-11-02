@@ -373,6 +373,14 @@ def test_limit_group_defaults_to_the_shared_account(adapter, model, explicit, ex
     assert item.resolved_limit_group("opencode/kimi") == expected
 
 
+def test_config_accepts_the_omp_adapter() -> None:
+    from agent_dispatch.config import ExecutorSettings
+
+    item = ExecutorSettings(adapter="omp", model="agent-lb/gpt-5.6-luna")
+    assert item.adapter == "omp"
+    assert item.resolved_command == "omp"
+
+
 @pytest.mark.parametrize("value", [-1, True, float("inf"), float("nan")])
 def test_preferred_executor_wait_rejects_invalid_values(tmp_config_dir, value):
     import yaml

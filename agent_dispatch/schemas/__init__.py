@@ -29,3 +29,14 @@ def load_agent_result_strict_schema() -> dict[str, Any]:
     поля объявлены nullable. Проверено вживую 2026-09-21."""
     path = Path(__file__).with_name("agent_result.strict.schema.json")
     return json.loads(path.read_text())
+
+
+def load_omp_session_schema() -> dict[str, Any]:
+    """Схема конверта NDJSON-событий `omp -p --mode json` (факты Task 1).
+
+    Проверяет фикстуры `tests/fixtures/omp/`: известные `type`, объект `message`
+    с ролью, контентом и `usage`. Поля событий не перечислены полностью: omp
+    добавляет новые, незнакомые поля фикстуру ломать не должны.
+    """
+    path = Path(__file__).with_name("omp_session.schema.json")
+    return json.loads(path.read_text())

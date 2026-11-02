@@ -184,16 +184,16 @@
 - Modify: `agent_dispatch/executors/registry.py`, `agent_dispatch/executors/result_parser.py`, `agent_dispatch/schemas/__init__.py`
 - Create: `tests/test_adapter_omp.py`, `tests/fakes/omp_ok.sh`, `tests/fakes/omp_env_capture.sh`
 
-- [ ] сборка команды: модель, thinking, `--max-time`, `--session-dir`, `--cwd`, профиль x5 для `corporate: true`
+- [x] сборка команды: модель, thinking, `--max-time`, `--session-dir`, `--cwd`, профиль x5 для `corporate: true`
 - ➕ запуск с `stdin=DEVNULL` (без этого omp ждёт EOF на stdin), `--config <dispatch-overlay.yml>`, `NODE_EXTRA_CA_CERTS` для x5
 - ➕ из env omp вырезать `AGENT_LB_API_KEY` (его экспортирует shell пользователя, и он доходит до bash агента)
 - ➕ режим ревью: `--tools read,grep,glob` (инструмента `find` нет, код 2)
-- [ ] `streams_output = True`, разбор NDJSON: `session_id`, итог из последнего `message_end`, `usage` и стоимость
-- [ ] режим ревью с инструментами только на чтение; follow-up через `--resume` в том же профиле
-- [ ] `last_output_age_s` на жёстком таймауте
-- [ ] тесты на фикстурах Task 1: успех, сбой хода, пустой вывод, обрыв потока, ревью, resume
-- [ ] тесты argv и env: x5-исполнитель всегда с профилем x5, в env нет `AGENT_LB_API_KEY` и секретов `Settings.secrets`
-- [ ] гейт зелёный
+- [x] `streams_output = True`, разбор NDJSON: `session_id`, итог из последнего `message_end`, `usage` и стоимость
+- [x] режим ревью с инструментами только на чтение; follow-up через `--resume` в том же профиле
+- [x] `last_output_age_s` на жёстком таймауте
+- [x] тесты на фикстурах Task 1: успех, сбой хода, пустой вывод, обрыв потока, ревью, resume
+- [x] тесты argv и env: x5-исполнитель всегда с профилем x5, в env нет `AGENT_LB_API_KEY` и секретов `Settings.secrets`
+- [x] гейт зелёный
 
 ### Task 4: Распознавание сбоев omp в health.py
 **Depends on:** Task 1
@@ -239,11 +239,11 @@
 **Files:**
 - Create: `skills/`, `bin/omp-setup`, `tests/test_drift.py` (в omp-setup)
 
-- [ ] переписать 12 скилов под `ask` и `task`; пути к скриптам (glflow, huddle.py, agterm) абсолютные, без копий
-- [ ] `source:` и `source_sha:` в шапке каждого
-- [ ] `omp-setup drift`: пересчёт sha оригиналов, список устаревших, код 1 при дрейфе; хук pre-commit
-- [ ] тесты: дрейф есть, дрейфа нет, оригинал удалён, шапки нет
-- [ ] `make test` зелёный, коммит omp-setup
+- [x] переписать 12 скилов под `ask` и `task`; пути к скриптам (glflow, huddle.py, agterm) абсолютные, без копий
+- [x] `source:` и `source_sha:` в шапке каждого
+- [x] `omp-setup drift`: пересчёт sha оригиналов, список устаревших, код 1 при дрейфе; хук pre-commit
+- [x] тесты: дрейф есть, дрейфа нет, оригинал удалён, шапки нет
+- [x] `make test` зелёный, коммит omp-setup
 
 ### Task 8: gpt-review вместо codex-review
 **Depends on:** Task 1

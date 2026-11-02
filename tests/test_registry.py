@@ -4,8 +4,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from agent_dispatch.config import ExecutorSettings, RoutingSettings, Settings
+from agent_dispatch.config import ExecutorSettings, RoutingSettings, ServerSettings, Settings
 from agent_dispatch.executors.claude import ClaudeAdapter
+from agent_dispatch.executors.omp import OmpAdapter
 from agent_dispatch.executors.registry import AvailabilityCache, build_adapters
 from agent_dispatch.models import Availability
 
@@ -25,6 +26,18 @@ def test_build_adapters():
     adapters = build_adapters(settings())
     assert set(adapters) == {"a", "c"}
     assert isinstance(adapters["a"], ClaudeAdapter)
+
+
+def test_build_adapters_omp_gets_the_data_dir(tmp_path):
+    config = Settings(
+        server=ServerSettings(data_dir=tmp_path),
+        executors={"o": ExecutorSettings(adapter="omp", model="agent-lb/gpt-5.6-luna")},
+        routing=RoutingSettings(fallback_executor="o"),
+    )
+    adapter = build_adapters(config)["o"]
+    assert isinstance(adapter, OmpAdapter)
+    # follow-up продолжается через --resume с тем же --session-dir.
+    assert adapter.session_dir == config.server.data_dir / "omp-sessions"
 
 
 def test_unavailable_empty_before_check():
