@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -9,9 +10,12 @@ from pathlib import Path
 from agent_dispatch.config import load_settings
 
 from .harness import (
+    AGENT_LB_DB,
     GitLocator,
     acceptance,
+    agent_lb_costs,
     children_refusals,
+    cost_drift,
     default_limit_group,
     delegations,
     exploration_comparison,
@@ -26,6 +30,22 @@ from .harness import (
     successor,
     timeouts,
 )
+
+
+def _cost_drift(tasks, db_path: Path) -> dict:
+    """Сверка с балансером; без его базы или со старой схемой секция пропускается."""
+    if not db_path.is_file():
+        return {"skipped": f"no agent-lb db at {db_path}"}
+    sessions = [
+        task.result.meta["session_id"]
+        for task in tasks
+        if task.result and task.result.meta.get("session_id")
+    ]
+    try:
+        billed = agent_lb_costs(db_path, sessions)
+    except sqlite3.Error as exc:
+        return {"skipped": f"agent-lb db unreadable: {exc}"}
+    return cost_drift(tasks, billed)
 
 
 def main() -> int:
@@ -53,6 +73,12 @@ def main() -> int:
         choices=("fast", "balanced", "strong"),
         default="balanced",
         help="tier of the static rule Jev is compared with",
+    )
+    parser.add_argument(
+        "--agent-lb-db",
+        type=Path,
+        default=AGENT_LB_DB.expanduser(),
+        help="agent-lb store.db to check reported task cost against (read only)",
     )
     parser.add_argument("--json", action="store_true", help="print the full JSON report")
     args = parser.parse_args()
@@ -95,6 +121,7 @@ def main() -> int:
     report["delegations"] = delegations(tasks)
     report["timeouts"] = timeouts(tasks)
     report["feedback"] = feedback_summary(tasks)
+    report["cost_drift"] = _cost_drift(tasks, args.agent_lb_db)
     # Один locator на прогон: дифы эксперимента судятся второй раз из кэша.
     locator = GitLocator()
     if not args.no_git:

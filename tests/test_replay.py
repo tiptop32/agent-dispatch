@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import subprocess
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -22,7 +23,9 @@ from evals.replay.harness import (
     Unknown,
     acceptance,
     added_lines,
+    agent_lb_costs,
     children_refusals,
+    cost_drift,
     delegations,
     exploration_comparison,
     feedback_summary,
@@ -1330,3 +1333,109 @@ def test_successor_maps_history_to_omp_executors():
     assert successor("opencode/x5-code-large") == "omp/x5-code-large"
     assert successor("claude/opus") == "claude/opus"
     assert successor("omp/luna") == "omp/luna"
+
+
+def _priced(task_id, model, cost, *, session=..., status="completed"):
+    meta = {} if session is None else {"session_id": task_id if session is ... else session}
+    result = {**_result(status, meta=meta), "model": model, "usage": {"cost_usd": cost}}
+    return _task(task_id, status, executor="omp/sol", result=result)
+
+
+def test_cost_drift_compares_reported_cost_with_agent_lb_by_session():
+    # Живой случай 2026-11-02: omp считал gpt-5.6-sol по своему каталогу
+    # ($4/$0.4/$20), балансер по pricing.py ($5/$0.5/$30): 78% счёта.
+    tasks = [
+        _priced("a" * 32, "agent-lb/gpt-6.1-sol", 0.214),
+        _priced("b" * 32, "agent-lb/gpt-5.6-sol", 0.290),
+        _priced("c" * 32, "agent-lb/gpt-5.6-sol", 0.05),
+        # Сессии нет в учёте балансера: copilot-x5 идёт мимо agent-lb.
+        _priced("d" * 32, "copilot-x5/copilot-code-large", 0.0),
+        # Без id сессии сверять не с чем.
+        _priced("e" * 32, "agent-lb/gpt-6.1-sol", 0.1, session=None),
+        # Отказ guard'а не запуск, хотя id и цена в результате есть.
+        replace(_priced("f" * 32, "agent-lb/gpt-6.1-sol", 0.3, status="failed"), executor=""),
+    ]
+    billed = {
+        "a" * 32: {"cost_usd": 0.214, "requests": 17},
+        "b" * 32: {"cost_usd": 0.372, "requests": 13},
+        # Балансер насчитал ноль, CLI нет: отношение не определено, это расхождение.
+        "c" * 32: {"cost_usd": 0.0, "requests": 2},
+        "f" * 32: {"cost_usd": 9.0, "requests": 1},
+    }
+
+    report = cost_drift(tasks, billed)
+
+    assert (report["compared"], report["not_in_lb"], report["drifted"]) == (3, 1, 2)
+    assert [(run["task_id"], run["ratio"]) for run in report["runs"]] == [
+        ("b" * 8, 0.78),
+        ("c" * 8, None),
+    ]
+    assert report["by_model"]["agent-lb/gpt-5.6-sol"] == {
+        "tasks": 2,
+        "reported_usd": 0.34,
+        "billed_usd": 0.372,
+        "ratio": 0.914,
+    }
+    assert report["by_model"]["agent-lb/gpt-6.1-sol"]["ratio"] == 1.0
+    text = render({**replay([]), "cost_drift": report})
+    assert "reported cost vs agent-lb (tolerance 10%): 3 compared, 2 drifted" in text
+    assert "  agent-lb/gpt-5.6-sol: 2 tasks, reported $0.340, billed $0.372, ratio 0.914" in text
+    assert f"  {'b' * 8} agent-lb/gpt-5.6-sol: reported $0.290, billed $0.372 (0.78)" in text
+    assert f"  {'c' * 8} agent-lb/gpt-5.6-sol: reported $0.050, billed $0.000 (n/a)" in text
+    assert recommendations({"cost_drift": report})[0]["metric"] == "cost_drift"
+
+
+def test_cost_drift_section_says_why_it_was_skipped():
+    text = render({**replay([]), "cost_drift": {"skipped": "no agent-lb db at /nope"}})
+
+    assert "reported cost vs agent-lb: skipped (no agent-lb db at /nope)" in text
+
+
+def test_agent_lb_costs_sum_billed_requests_per_session(tmp_path):
+    path = tmp_path / "store.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "create table request_logs (id integer primary key, client_session_id varchar,"
+        " cost_usd float, status varchar not null, deleted_at datetime)"
+    )
+    conn.executemany(
+        "insert into request_logs (client_session_id, cost_usd, status, deleted_at)"
+        " values (?, ?, ?, ?)",
+        [
+            ("s1", 0.1, "success", None),
+            ("s1", 0.2, "success", None),
+            # Ошибка без токенов: цены нет, но запрос был.
+            ("s1", None, "error", None),
+            # Скрытый из дашборда запрос всё равно оплачен.
+            ("s1", 0.05, "success", "2026-11-03"),
+            ("s2", 0.5, "success", None),
+            ("other", 1.0, "success", None),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    costs = agent_lb_costs(path, ["s1", "s2", "s3", "s1"])
+
+    assert set(costs) == {"s1", "s2"}
+    assert costs["s1"]["requests"] == 4
+    assert costs["s1"]["cost_usd"] == pytest.approx(0.35)
+    assert costs["s2"] == {"cost_usd": 0.5, "requests": 1}
+    assert agent_lb_costs(path, []) == {}
+
+
+def test_cost_drift_is_skipped_without_a_readable_agent_lb_db(tmp_path):
+    from evals.replay.__main__ import _cost_drift
+
+    tasks = [_priced("a" * 32, "agent-lb/gpt-6.1-sol", 0.1)]
+    assert _cost_drift(tasks, tmp_path / "missing.db") == {
+        "skipped": f"no agent-lb db at {tmp_path / 'missing.db'}"
+    }
+    # Старый agent-lb без `client_session_id`: секция пропускается, replay не падает.
+    old = tmp_path / "old.db"
+    conn = sqlite3.connect(old)
+    conn.execute("create table request_logs (id integer primary key, cost_usd float)")
+    conn.close()
+    assert _cost_drift(tasks, old)["skipped"].startswith("agent-lb db unreadable: ")
+    # Без сессий в задачах базу не открываем вовсе.
+    assert _cost_drift([], old)["compared"] == 0

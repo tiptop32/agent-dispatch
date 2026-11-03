@@ -30,6 +30,9 @@
 - `timeouts`: жёсткие таймауты по исполнителям и был ли вывод за последние
   120 с до убийства (`meta.last_output_age_s`): работавшему до конца агенту
   мал таймаут или велика задача, молчавший висел;
+- `cost_drift`: цена задачи по самоотчёту CLI против учёта agent-lb для той же
+  сессии (`~/.agent-lb/store.db`, только чтение): по самоотчёту судят потолки
+  бюджета, а каталоги цен CLI и балансера расходятся молча;
 - `router_vs_static`: как часто выбор Jev совпал бы со статическим правилом
 - `exploration`: исход и acceptance рандомизированных arm `explore` и `jev`
   (один тир для всех, без вопроса о суждении, тот же периметр) на текущем
@@ -42,7 +45,7 @@ import json
 import sqlite3
 import subprocess
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
@@ -951,6 +954,23 @@ def recommendations(report: dict) -> list[dict[str, str]]:
                 "evidence": f"{review_failed} запусков review-only завершились ошибкой",
             }
         )
+    drift = report.get("cost_drift", {})
+    if drift.get("drifted", 0):
+        models = sorted({run["model"] for run in drift["runs"]})
+        result.append(
+            {
+                "priority": "high",
+                "metric": "cost_drift",
+                "action": (
+                    "Свести цену моделей в каталоге CLI и в pricing.py agent-lb: "
+                    "потолки бюджета считают по самоотчёту CLI."
+                ),
+                "evidence": (
+                    f"{drift['drifted']}/{drift['compared']} задач расходятся со счётом "
+                    f"больше чем на {drift['tolerance']:.0%}: {', '.join(models)}"
+                ),
+            }
+        )
     timeout_info = report.get("timeouts", {})
     if timeout_info.get("unknown", 0):
         result.append(
@@ -1046,6 +1066,107 @@ def timeouts(tasks: list[Task]) -> dict:
                 by_executor.items(), key=lambda item: (-item[1]["count"], item[0])
             )
         },
+    }
+
+
+#: Допустимое расхождение цены задачи с учётом agent-lb. Дальше потолки бюджета
+#: (`max_chain_cost_usd`, `daily_cost_limit_usd`) судят по неверной цифре.
+COST_DRIFT_TOLERANCE = 0.10
+
+#: Учёт балансера: каждый запрос с ценой по его прайсу (`app/core/usage/pricing.py`).
+AGENT_LB_DB = Path("~/.agent-lb/store.db")
+
+
+def agent_lb_costs(db_path: Path, session_ids: Iterable[str]) -> dict[str, dict]:
+    """Цена и число запросов по `client_session_id` из `request_logs` agent-lb.
+
+    omp передаёт балансеру id своей сессии, тот же, что лежит в
+    `result.meta.session_id`. Скрытые из дашборда (`deleted_at`) запросы
+    оплачены и входят в сумму; у ошибок без токенов цены нет. Сессии без
+    единого запроса в ответ не попадают.
+    """
+    ids = sorted(set(session_ids))
+    if not ids:
+        return {}
+    rows: list[tuple] = []
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        # SQLite ограничивает число параметров запроса.
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            rows += conn.execute(
+                "select client_session_id, coalesce(sum(cost_usd), 0), count(*)"
+                f" from request_logs where client_session_id in ({','.join('?' * len(chunk))})"
+                " group by client_session_id",
+                chunk,
+            ).fetchall()
+    finally:
+        conn.close()
+    return {session: {"cost_usd": float(cost), "requests": n} for session, cost, n in rows}
+
+
+def _cost_ratio(reported: float, billed: float) -> float | None:
+    if billed == 0:
+        return 1.0 if reported == 0 else None
+    return reported / billed
+
+
+def cost_drift(
+    tasks: list[Task], billed: dict[str, dict], tolerance: float = COST_DRIFT_TOLERANCE
+) -> dict:
+    """Цена задачи по самоотчёту CLI против учёта agent-lb для той же сессии.
+
+    Потолки бюджета верят `usage.cost_usd`, который CLI считает по своему
+    каталогу цен, а балансер по своему прайсу. Живой случай 2026-11-02:
+    omp считал gpt-5.6-sol по $4/$20 за миллион, agent-lb по $5/$30, и
+    задачи показывали 78% счёта. `ratio` это доля счёта, которую увидел
+    бюджет. Сессии сабагентов omp у балансера отдельные, их цены нет ни в
+    самоотчёте, ни здесь. `not_in_lb`: сессии, которых балансер не видел
+    (copilot-x5 и claude идут мимо него или под другим id).
+    """
+    by_model: dict[str, dict] = {}
+    runs: list[dict] = []
+    not_in_lb = 0
+    for task in tasks:
+        result = task.result
+        if result is None or guard_refusal(task):
+            continue
+        session = result.meta.get("session_id")
+        reported = result.usage.cost_usd if result.usage else None
+        if not session or reported is None:
+            continue
+        if session not in billed:
+            not_in_lb += 1
+            continue
+        model = result.model or task.executor
+        cost = billed[session]["cost_usd"]
+        row = by_model.setdefault(model, {"tasks": 0, "reported_usd": 0.0, "billed_usd": 0.0})
+        row["tasks"] += 1
+        row["reported_usd"] += reported
+        row["billed_usd"] += cost
+        ratio = _cost_ratio(reported, cost)
+        if ratio is None or abs(ratio - 1) > tolerance:
+            runs.append(
+                {
+                    "task_id": task.task_id[:8],
+                    "model": model,
+                    "reported_usd": round(reported, 4),
+                    "billed_usd": round(cost, 4),
+                    "ratio": None if ratio is None else round(ratio, 3),
+                }
+            )
+    for row in by_model.values():
+        ratio = _cost_ratio(row["reported_usd"], row["billed_usd"])
+        row["reported_usd"] = round(row["reported_usd"], 4)
+        row["billed_usd"] = round(row["billed_usd"], 4)
+        row["ratio"] = None if ratio is None else round(ratio, 3)
+    return {
+        "tolerance": tolerance,
+        "compared": sum(row["tasks"] for row in by_model.values()),
+        "not_in_lb": not_in_lb,
+        "drifted": len(runs),
+        "runs": runs,
+        "by_model": dict(sorted(by_model.items())),
     }
 
 
@@ -1332,6 +1453,30 @@ def render(report: dict) -> str:
             f"avg {row['avg_minutes']} min"
             for name, row in info["by_executor"].items()
         ]
+    if "cost_drift" in report:
+        info = report["cost_drift"]
+        if "skipped" in info:
+            lines.append(f"reported cost vs agent-lb: skipped ({info['skipped']})")
+        else:
+
+            def ratio(value: float | None) -> str:
+                return "n/a" if value is None else f"{value:g}"
+
+            lines.append(
+                f"reported cost vs agent-lb (tolerance {info['tolerance']:.0%}): "
+                f"{info['compared']} compared, {info['drifted']} drifted, "
+                f"{info['not_in_lb']} not in agent-lb"
+            )
+            lines += [
+                f"  {model}: {row['tasks']} tasks, reported ${row['reported_usd']:.3f}, "
+                f"billed ${row['billed_usd']:.3f}, ratio {ratio(row['ratio'])}"
+                for model, row in info["by_model"].items()
+            ]
+            lines += [
+                f"  {run['task_id']} {run['model']}: reported ${run['reported_usd']:.3f}, "
+                f"billed ${run['billed_usd']:.3f} ({ratio(run['ratio'])})"
+                for run in info["runs"]
+            ]
     if "router_vs_static" in report:
         info = report["router_vs_static"]
         share = _pct(info["agreement"])
