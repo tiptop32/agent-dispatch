@@ -6,10 +6,17 @@
 
 ## Установка
 
-- `bun install -g @oh-my-pi/pi-coding-agent` ставит `omp` в `~/.bun/bin/omp`, сам пакет лежит в
-  `~/node_modules/@oh-my-pi/pi-coding-agent`.
-- omp 18.15.0 требует bun ≥ 1.4.4, на 1.3.14 он не стартует (`Bun runtime must be >= 1.4.4`).
-- bun заблокировал два postinstall-скрипта пакета, omp работает и без них.
+- Ставить через brew: `brew install can1357/tap/omp` кладёт готовый бинарь (SHA-256 закреплён в
+  формуле) в `/opt/homebrew/bin/omp`, обновление `brew upgrade omp`. С 2026-11-03 omp стоит так (18.16.0).
+- `bun install -g @oh-my-pi/pi-coding-agent` не годится: при пустом `~/.bun/install/global` bun принял
+  `$HOME` с существующим `~/package.json` за проект, дописал туда зависимость, создал `~/bun.lock` и
+  поставил ~120 пакетов в `~/node_modules`. `omp update` такую установку обновлять отказывается
+  (`Refusing to replace …/dist/cli.js: … a shebang script, not an OMP binary`). Установка через bun
+  ещё и требовала bun ≥ 1.4.4.
+- `~/.bun/bin` стоит в PATH раньше `/opt/homebrew/bin`: старая ссылка `~/.bun/bin/omp` перекрывала бы
+  brew-бинарь (brew предупреждает об этом при установке).
+- brew-бинарь проверен: профиль по умолчанию и x5 (`NODE_USE_SYSTEM_CA=1`), блокировка dcg из
+  расширения, 12 скилов, smoke диспетчера на omp/luna и omp/x5-code-large.
 
 ## Запуск без TTY
 
