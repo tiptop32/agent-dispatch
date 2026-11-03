@@ -153,6 +153,6 @@ Endpoint `POST https://openrouter.ai/api/alpha/decisions`, модель `typesaf
 Метрики, ради которых всё это собирается: routing accuracy на размеченных задачах (порог 0.8), доля `low_confidence`/`fallback`/`override`, success rate и медианная длительность по исполнителям, стоимость решения и исполнения.
 
 
-Профиль x5 запускает корпоративных исполнителей omp с `--profile x5` и `NODE_EXTRA_CA_CERTS=~/.omp/agent/x5-root.pem`; он ограничивает провайдеры и роли также для сабагентов `task`, `prewalk` и `advisor`. Каждый запуск получает `--config ~/.omp/agent/dispatch-overlay.yml` с `retry.maxRetries: 1`, потому что повторами занимается эскалация диспетчера. omp запускается со stdin=DEVNULL, иначе без TTY ждёт EOF и висит.
+Профиль x5 запускает корпоративных исполнителей omp с `--profile x5` и `NODE_USE_SYSTEM_CA=1` (корпоративный RootCA читается из Keychain); он ограничивает провайдеры и роли также для сабагентов `task`, `prewalk` и `advisor`. Каждый запуск получает `--config ~/.omp/agent/dispatch-overlay.yml` с `retry.maxRetries: 1`, потому что повторами занимается эскалация диспетчера. omp запускается со stdin=DEVNULL, иначе без TTY ждёт EOF и висит.
 
 Исторические `codex/*` и `opencode/*` replay судит по настройкам omp-преемника (`evals.replay.harness.successor`, таблица из `migrate.py`); эти источники остаются валидными для истории. Старый пользовательский конфиг с adapter codex/opencode не загружается и сообщает о необходимости `agent-dispatch migrate-config`.

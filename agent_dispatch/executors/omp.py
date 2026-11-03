@@ -31,10 +31,11 @@ class OmpAdapter(BaseExecutorAdapter):
     #: а не получасовой процесс omp.
     OVERLAY_PATH = "~/.omp/agent/dispatch-overlay.yml"
 
-    #: Корпоративный CA copilot-x5, выгруженный install.sh omp-setup. bun
-    #: системному Keychain не доверяет: без переменной TLS к api-copilot.x5.ru
-    #: падает (`TLS certificate verification failed`).
-    X5_ROOT_PEM = "~/.omp/agent/x5-root.pem"
+    #: bun по умолчанию доверяет только встроенному набору сертификатов, а
+    #: корпоративный RootCA api-copilot.x5.ru лежит в системном Keychain. С этой
+    #: переменной bun читает системное хранилище, как opencode со своим
+    #: `--use-system-ca`; без неё TLS падает (`TLS certificate verification failed`).
+    SYSTEM_CA_ENV = {"NODE_USE_SYSTEM_CA": "1"}
 
     #: Ключ балансера agent-lb. Его экспортирует профиль shell пользователя, а
     #: окружение запускающего процесса доходит до bash агента omp: без вырезания
@@ -67,9 +68,6 @@ class OmpAdapter(BaseExecutorAdapter):
         if data_dir is None:
             data_dir = os.environ.get("AGENT_DISPATCH_DATA_DIR", "~/.local/share/agent-dispatch")
         self.session_dir = Path(data_dir).expanduser() / "omp-sessions"
-        # Раскрывается один раз в синхронном __init__: из execute() блокирующих
-        # операций pathlib быть не должно.
-        self.x5_root_pem = str(Path(self.X5_ROOT_PEM).expanduser())
 
     def build_argv(self, ctx: RunContext) -> list[str]:
         extra = self.settings.extra_args
@@ -114,8 +112,7 @@ class OmpAdapter(BaseExecutorAdapter):
 
     async def execute(self, ctx: RunContext) -> ExecutionResult:
         env = {k: v for k, v in ctx.env.items() if k != self.LB_KEY_ENV}
-        if self.settings.corporate:
-            env["NODE_EXTRA_CA_CERTS"] = self.x5_root_pem
+        env.update(self.SYSTEM_CA_ENV)
         ctx = ctx.model_copy(update={"env": env})
         # stdin=None даёт DEVNULL в run_cli: без TTY omp ждёт EOF на stdin даже
         # с промптом в аргументе и висит до таймаута (факты Task 1).

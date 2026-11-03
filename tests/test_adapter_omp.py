@@ -131,7 +131,7 @@ async def test_omp_ok_with_report_block_completes(git_repo, tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_omp_x5_runs_in_x5_profile_with_corporate_ca(git_repo, tmp_path):
+async def test_omp_x5_runs_in_x5_profile_with_system_ca(git_repo, tmp_path):
     cap = tmp_path / "cap"
     env_x5 = {"PATH": os.environ["PATH"], "FAKE_CAPTURE": str(cap), "OMP_FIXTURE": "x5_ok.ndjson"}
     result = await adapter(corporate=True, command=FAKE_ENV).execute(
@@ -142,18 +142,18 @@ async def test_omp_x5_runs_in_x5_profile_with_corporate_ca(git_repo, tmp_path):
     args = captured_argv(tmp_path)
     assert args[args.index("--profile") + 1] == "x5"
     env = captured_env(tmp_path)
-    pem = adapter(corporate=True).x5_root_pem
-    assert env["NODE_EXTRA_CA_CERTS"] == pem
+    # Корпоративный RootCA лежит в Keychain: bun читает его только с NODE_USE_SYSTEM_CA.
+    assert env["NODE_USE_SYSTEM_CA"] == "1"
 
 
 @pytest.mark.asyncio
-async def test_omp_non_corporate_has_no_profile_and_no_ca(git_repo, tmp_path):
+async def test_omp_non_corporate_has_no_profile(git_repo, tmp_path):
     cap = tmp_path / "cap"
     await adapter(command=FAKE_ENV).execute(
         ctx(git_repo, tmp_path, env={"PATH": os.environ["PATH"], "FAKE_CAPTURE": str(cap)})
     )
     assert "--profile" not in captured_argv(tmp_path)
-    assert "NODE_EXTRA_CA_CERTS" not in captured_env(tmp_path)
+    assert captured_env(tmp_path)["NODE_USE_SYSTEM_CA"] == "1"
 
 
 @pytest.mark.asyncio

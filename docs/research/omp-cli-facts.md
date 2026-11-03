@@ -68,7 +68,7 @@
 
 - `api-copilot.x5.ru` подписан цепочкой `sre-vault.x5.ru` → `CN=RootCA` (корпоративный, в
   `/Library/Keychains/System.keychain`, SHA-1 `F75DAB43B5F21B4C2AB09CC4EFE0D6FA0ECF9D32`, действует до 2030-07-09).
-- bun системному Keychain не доверяет. omp учитывает `NODE_EXTRA_CA_CERTS`: с выгруженным PEM
+- bun по умолчанию системному Keychain не доверяет. Два рабочих способа: `NODE_USE_SYSTEM_CA=1` (или `BUN_OPTIONS=--use-system-ca`) — bun читает Keychain, как opencode, собранный с `--use-system-ca`; выбран он (проверено 2026-11-03, PONG через профиль x5). Прежний способ: omp учитывает `NODE_EXTRA_CA_CERTS`: с выгруженным PEM
   x5 отвечает. omp-setup должен выгружать этот CA в PEM, а адаптер и интерактивный запуск должны
   передавать путь к нему.
 

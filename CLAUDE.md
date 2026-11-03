@@ -65,7 +65,7 @@
 
 - omp запускается со stdin=DEVNULL, потому что без TTY omp ждёт EOF и висит.
 - Каждый запуск omp получает `--config ~/.omp/agent/dispatch-overlay.yml` с `retry.maxRetries: 1`, потому что повторами занимается эскалация диспетчера.
-- Корпоративные исполнители omp запускаются с `--profile x5` и `NODE_EXTRA_CA_CERTS=~/.omp/agent/x5-root.pem`, потому что профиль x5 держит периметр и для сабагентов omp (`task`, `prewalk`, `advisor`).
+- omp запускается с `NODE_USE_SYSTEM_CA=1`, потому что корпоративный RootCA copilot-x5 лежит в системном Keychain, а bun без флага доверяет только встроенному набору (opencode собран с `--use-system-ca`). Корпоративные исполнители omp запускаются с `--profile x5`, потому что профиль x5 держит периметр и для сабагентов omp (`task`, `prewalk`, `advisor`).
 - Ключ балансера omp берёт сам через `apiKey: "!…"` из `omp-setup/bin/lb-key`, а диспетчер вырезает `AGENT_LB_API_KEY` из env omp, потому что окружение запускающего процесса доходит до bash-агента.
 - `codex-env-vars` заменён на проверки `omp-mcp-env`, `omp-version`, `omp-x5-profile`, потому что omp передаёт MCP-переменные через собственный конфиг и требует проверяемый профиль.
 - `usage` и `cost_usd` суммируются по всем ассистентским `message_end`, потому что каждый ход omp имеет собственный usage.
