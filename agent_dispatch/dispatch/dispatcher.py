@@ -28,6 +28,7 @@ from agent_dispatch.executors.health import classify_failure, cooldown_seconds, 
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     FINAL_STATUSES,
+    ContextMode,
     DispatchRequest,
     ExecutionResult,
     FollowupRequest,
@@ -99,6 +100,15 @@ def _failed_result(
         error=error,
         meta=dict(previous.meta if previous else {}) if meta is None else meta,
     )
+
+
+#: Сколько символов отчёта ревьюера ложится в `result.meta.review.summary`
+#: и в контекст следующего звена; полный отчёт остаётся у задачи-потомка.
+REVIEW_SUMMARY_LIMIT = 2000
+
+#: Запас ожидания ревью сверх таймаута ревьюера: жёсткий таймаут убивает CLI
+#: ровно в срок, а запись результата потомка занимает ещё мгновение.
+REVIEW_WAIT_GRACE_SECONDS = 60
 
 
 def _not_integrated(result: ExecutionResult, error: str) -> None:
@@ -789,6 +799,8 @@ class Dispatcher:
         await self._note_executor_failure(record, decision, result)
         if not review and req.verify and result.status in ("completed", "partial"):
             await self._verify(record, result, tree)
+        if not review and self._wants_review(record, decision, result):
+            await self._review_work(record, decision, result, tree)
         # Ревью, после которого изменилась рабочая копия, не эскалируется:
         # иначе вызывающий получил бы ответ следующего ревьюера без
         # предупреждения о правках первого.
@@ -872,6 +884,191 @@ class Dispatcher:
                 # Работа уже в коммите: несостоявшийся откат оставляет в патче
                 # только артефакты проверки, а не отменяет результат исполнителя.
                 result.meta["verify_artifacts_kept"] = f"discard failed: {exc}"
+
+    def _wants_review(
+        self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
+    ) -> bool:
+        """Правка исполнителя с `review_by` закончена и что-то изменила.
+
+        Упавшая проверка уже сделала результат `partial` и эскалирует его:
+        ревью тогда только тратило бы время. Задача без изменений ревьюеру
+        ничего не показала бы.
+        """
+        configured = self.settings.executors.get(decision.executor)
+        return bool(
+            configured is not None
+            and configured.review_by
+            and record.request.kind == "task"
+            and result.status == "completed"
+            and result.changed_files
+        )
+
+    async def _review_work(
+        self,
+        record: TaskRecord,
+        decision: RouteDecision,
+        result: ExecutionResult,
+        tree: worktree.Worktree | None,
+    ) -> None:
+        """Отдать законченную правку на ревью `review_by` до интеграции.
+
+        Ревью — обычная задача-потомок: её видно в `status`, её цена входит в
+        `tree_cost` цепочки, а guard'ы (глубина, периметр, бюджет) судят её как
+        любую вложенную задачу. Ревьюер получает только задачу и диф: заметки
+        вызывающего и рассуждения исполнителя в его контекст не попадают.
+        Отказ, сбой или срыв срока ревью работу не держат: итог `skipped`.
+        `fail` делает результат `partial`, дальше работает эскалация.
+        """
+        req, task_id = record.request, record.task_id
+        reviewer = self.settings.executors[decision.executor].review_by or ""
+        cwd, base, task = req.cwd, None, req.task
+        scope = ""
+        if tree is not None:
+            # Работы в рабочей копии вызывающего ещё нет: ревьюер читает
+            # дерево. Коммит нужен, чтобы `git diff <base>` показал и новые
+            # файлы; после `verify` он возвращает тот же HEAD.
+            try:
+                await asyncio.to_thread(
+                    worktree.commit, tree, f"agent-dispatch: task {task_id[:8]}"
+                )
+            except worktree.WorktreeError as exc:
+                self._note_review(result, reviewer, None, "skipped", reason=f"commit: {exc}")
+                return
+            cwd, base = str(tree.path), tree.base or None
+            # Ревью идёт in_place в дереве, и `render_prompt` пути не
+            # переписывает: без этого ревьюер читал бы нетронутые файлы
+            # вызывающего вместо работы.
+            with contextlib.suppress(worktree.WorktreeError):
+                root = await asyncio.to_thread(worktree.repo_root, req.cwd)
+                task = rewrite_repo_prefix(task, str(root), str(tree.path)) or task
+        else:
+            # `git diff HEAD` рабочей копии показывает и собственные
+            # незакоммиченные правки вызывающего: без списка файлов ревьюер
+            # провалил бы работу за чужие изменения.
+            scope = (
+                f" Review the changes in these files: {', '.join(result.changed_files)}; "
+                "other uncommitted changes in the working copy are not part of this review."
+            )
+        request = DispatchRequest(
+            task=(
+                f"{task}\n\nThe change to review was made by another executor "
+                f"({decision.executor}) for the task above; judge it before it is merged."
+                f"{scope}"
+            ),
+            cwd=cwd,
+            kind="review",
+            executor=reviewer,
+            parent_task_id=task_id,
+            hop=record.hop + 1,
+            allow_escalation=False,
+            source_agent=record.source_agent,
+            root_agent=record.root_agent,
+            review_base=base,
+        )
+        timeout = self.settings.timeout_for(reviewer)
+        # `submit` создаёт воркер ревью до своего конца (событие `git` пишется
+        # после): отмена посреди него оставила бы ревьюера без хозяина. Поэтому
+        # `submit` идёт отдельной задачей под shield, и отмена на любом шаге до
+        # конца `wait` дожидается её и отменяет ревью.
+        submitting = asyncio.create_task(self.submit(request))
+        try:
+            try:
+                child = await asyncio.shield(submitting)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Сбой постановки ревью не должен ронять готовую работу.
+                reason = f"submit: {type(exc).__name__}: {exc}"
+                self._note_review(result, reviewer, None, "skipped", reason=reason)
+                return
+            await self.storage.add_event(
+                task_id, "review_by", {"child": child.task_id, "by": reviewer}
+            )
+            done = await self.wait(child.task_id, timeout + REVIEW_WAIT_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            await self._abandon_review(submitting)
+            raise
+        outcome = done.result
+        if done.status not in FINAL_STATUSES:
+            with contextlib.suppress(KeyError, ValueError):
+                await self.cancel(child.task_id)
+        if tree is not None:
+            # После отмены ревьюера по сроку: иначе он писал бы после отката.
+            await self._reset_after_review(tree, result)
+        if done.status not in FINAL_STATUSES:
+            verdict, reason = "skipped", f"timeout: no review within {timeout} s"
+        elif outcome is None or done.status not in (TaskStatus.completed, TaskStatus.partial):
+            error = (outcome.error if outcome else None) or done.status.value
+            guard = outcome.meta.get("guard") if outcome else None
+            verdict = "skipped"
+            reason = f"{guard}: {error}" if guard else f"review {done.status.value}: {error}"
+        else:
+            # Отчёт без вердикта (старый шаблон, сорванный формат) работу не держит.
+            verdict, reason = outcome.verdict or "unknown", None
+        self._note_review(
+            result,
+            reviewer,
+            child.task_id,
+            verdict,
+            summary=outcome.summary if outcome is not None and reason is None else "",
+            reason=reason,
+        )
+        if outcome is not None and outcome.meta.get("warning"):
+            # Ревьюер тронул файлы: вызывающий должен узнать об этом из итога.
+            result.meta["review"]["warning"] = outcome.meta["warning"]
+        await self.storage.add_event(
+            task_id, "review_by", {"child": child.task_id, "verdict": verdict}
+        )
+        if verdict == "fail":
+            # Текст ревью в `error` не идёт: `health.classify_failure` принял
+            # бы слова ревьюера о лимитах за лимит CLI.
+            result.status = "partial"
+            result.error = f"review failed ({reviewer})"
+
+    async def _abandon_review(self, submitting: asyncio.Task[TaskRecord]) -> None:
+        """Отменить ревью задачи, которую отменили посреди `_review_work`."""
+        try:
+            child = await asyncio.shield(submitting)
+        except Exception:
+            # `submit` упал: воркера ревью нет или он уже записал сбой.
+            return
+        worker = self._tasks.get(child.task_id)
+        if worker is not None:
+            worker.cancel()
+
+    async def _reset_after_review(self, tree: worktree.Worktree, result: ExecutionResult) -> None:
+        """Вернуть дерево к закоммиченной работе: правки ревьюера не идут в патч.
+
+        Ревью только читает, но CLI ревьюера может что-то записать, а
+        `build_patch` взял бы это как работу исполнителя.
+        """
+        if await self._tree_in_use(tree):
+            result.meta["review_artifacts_kept"] = "active children"
+            return
+        try:
+            await asyncio.to_thread(worktree.discard_changes, tree)
+        except worktree.WorktreeError as exc:
+            result.meta["review_artifacts_kept"] = f"discard failed: {exc}"
+
+    @staticmethod
+    def _note_review(
+        result: ExecutionResult,
+        reviewer: str,
+        child: str | None,
+        verdict: str,
+        *,
+        summary: str = "",
+        reason: str | None = None,
+    ) -> None:
+        review: dict[str, object] = {
+            "by": reviewer,
+            "task_id": child,
+            "verdict": verdict,
+            "summary": summary[:REVIEW_SUMMARY_LIMIT],
+        }
+        if reason is not None:
+            review["reason"] = reason[:500]
+        result.meta["review"] = review
 
     async def _recover_report(
         self,
@@ -1304,6 +1501,17 @@ class Dispatcher:
             # Звено follow-up продолжает упавшую попытку, а не задачу до неё:
             # иначе следующий исполнитель видел бы устаревший отчёт.
             update["followup_of"] = record.task_id
+        review = result.meta.get("review") or {}
+        if review.get("verdict") == "fail":
+            # Следующее звено стартует с HEAD и должно знать, что ревьюер
+            # нашёл у прошлой попытки, иначе повторит ту же ошибку.
+            note = f"Review of the previous attempt by {review['by']}: {review.get('summary', '')}"
+            if record.request.context_mode == ContextMode.prompt:
+                # В режиме `prompt` раздел Context не рендерится.
+                update["task"] = f"{record.request.task}\n\n{note}"
+            else:
+                context = record.request.context
+                update["context"] = f"{context}\n\n{note}" if context else note
         child = await self.submit(
             record.request.model_copy(update=update),
             escalated_from=record.task_id,

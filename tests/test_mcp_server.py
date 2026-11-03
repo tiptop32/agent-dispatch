@@ -460,3 +460,45 @@ async def test_followup_tool_reports_a_refusal(tmp_path):
     )
     result = await call(settings(tmp_path), "followup", {"task_id": "t0", "message": "x"})
     assert result.is_error and "still running" in result.content[0].text
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(
+    ("review", "line"),
+    [
+        (
+            {"by": "omp/sol", "verdict": "fail", "summary": "a.py:1 off by one\nmore"},
+            "review: fail by omp/sol — a.py:1 off by one",
+        ),
+        (
+            {"by": "omp/sol", "verdict": "skipped", "summary": "", "reason": "max_hops: hop 2"},
+            "review: skipped by omp/sol — max_hops: hop 2",
+        ),
+        ({"by": "omp/sol", "verdict": "pass", "summary": "fine"}, "review: pass by omp/sol"),
+    ],
+)
+async def test_compact_output_shows_the_review(tmp_path, review, line):
+    reviewed = view()
+    reviewed.result.meta["review"] = review
+    respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(200, json=reviewed.model_dump(mode="json"))
+    )
+    r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
+    lines = r.content[0].text.splitlines()
+    assert line in lines
+    assert "more" not in r.content[0].text.split("summary:")[0]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dispatch_tools_pass_review_base(tmp_path):
+    # Финальное ревью плана смотрит диф всей ветки: `git diff <база>`.
+    request = respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(200, json=view().model_dump(mode="json"))
+    )
+    args = {"task": "review plan", "cwd": ".", "kind": "review", "review_base": "abc1234"}
+    await call(settings(tmp_path), "dispatch_to", {"executor": "claude", **args})
+    await call(settings(tmp_path), "dispatch", args)
+    for sent in request.calls:
+        assert '"review_base":"abc1234"' in sent.request.content.decode()

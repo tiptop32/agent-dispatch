@@ -43,7 +43,8 @@ class TaskPackage(BaseModel):
     request: DispatchRequest
     git_status: str | None = None
     git_diff_stat: str | None = None
-    #: Дифф рабочей копии против HEAD для ревью: ревьюер работает без Bash.
+    #: Дифф рабочей копии против HEAD (или `review_base`) для ревью: ревьюер
+    #: работает без Bash.
     git_diff: str | None = None
     #: Рабочий каталог исполнителя, если это не сам cwd запроса.
     worktree: str | None = None
@@ -70,7 +71,15 @@ def build_task_package(
     branch: str | None = None,
 ) -> TaskPackage:
     if req.kind == "review":
-        diff = _git(req.cwd, ["diff", "HEAD"])
+        if req.review_base and not _git(
+            req.cwd, ["rev-parse", "--verify", "--quiet", f"{req.review_base}^{{commit}}"]
+        ):
+            # `git diff` с несуществующей базой молча пуст, и ревьюер увидел
+            # бы «нет изменений» вместо ошибки в имени ревизии.
+            raise ValueError(f"review_base not found: {req.review_base}")
+        # `--` отделяет ревизию от путей; валидатор поля уже не пускает
+        # значения, похожие на опции git.
+        diff = _git(req.cwd, ["diff", req.review_base or "HEAD", "--"])
         if len(diff) > REVIEW_DIFF_LIMIT:
             diff = diff[:REVIEW_DIFF_LIMIT] + "\n... (diff truncated, read the files directly)\n"
         return TaskPackage(
@@ -195,6 +204,7 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         git_status=package.git_status or "",
         git_diff_stat=package.git_diff_stat or "",
         git_diff=package.git_diff or "",
+        diff_base=req.review_base or "HEAD",
         source_agent=req.source_agent.value,
         hop=req.hop,
         max_hops=settings.routing.max_hops,

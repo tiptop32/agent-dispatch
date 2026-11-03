@@ -33,6 +33,7 @@ from evals.replay.harness import (
     load,
     load_decisions,
     perimeter_violations,
+    post_review,
     recommendations,
     render,
     replay,
@@ -1439,3 +1440,75 @@ def test_cost_drift_is_skipped_without_a_readable_agent_lb_db(tmp_path):
     assert _cost_drift(tasks, old)["skipped"].startswith("agent-lb db unreadable: ")
     # Без сессий в задачах базу не открываем вовсе.
     assert _cost_drift([], old)["compared"] == 0
+
+
+def test_post_review_counts_verdicts_skips_and_chain_outcomes():
+    def edited(task_id, status, verdict, *, child=None, reason=None, escalated_to=None):
+        review = {"by": "omp/sol", "task_id": child, "verdict": verdict, "summary": "s"}
+        if reason:
+            review["reason"] = reason
+        meta = {"review": review}
+        if escalated_to:
+            meta["escalated_to"] = escalated_to
+        return _task(task_id, status, result=_result(status, changed=["a.py"], meta=meta))
+
+    def reviewer(task_id, parent, cost):
+        result = {**_result("completed"), "usage": {"cost_usd": cost}}
+        task = _task(task_id, "completed", executor="omp/sol", result=result)
+        return replace(task, kind="review", parent_task_id=parent)
+
+    a, b, c, d, e, f, g, h = (letter * 32 for letter in "abcdefgh")
+    tasks = [
+        edited(a, "completed", "pass", child="r1"),
+        reviewer("r1", a, 0.1),
+        # fail → следующее звено довело до completed.
+        edited(b, "partial", "fail", child="r2", escalated_to=c),
+        reviewer("r2", b, 0.25),
+        _task(c, "completed", parent=b),
+        # fail → цепочка кончилась ничем.
+        edited(d, "partial", "fail", child="r3", escalated_to=e),
+        reviewer("r3", d, 0.05),
+        _task(e, "failed", parent=d, result=_result("failed", error="exit 1")),
+        edited(f, "completed", "skipped", reason="max_hops: hop 2 >= 2"),
+        edited(g, "completed", "unknown", child="r4"),
+        edited(h, "completed", "skipped", reason="perimeter: corporate perimeter required"),
+        # Ревью, которое вызывающий заказал сам, к post_review не относится.
+        replace(_task("z" * 32, "completed", result=_result("completed")), kind="review"),
+    ]
+    report = post_review(tasks)
+
+    assert report["reviews"] == 6
+    assert report["verdicts"] == {"pass": 1, "fail": 2, "unknown": 1, "skipped": 2}
+    assert report["skipped_reasons"] == {"max_hops": 1, "perimeter": 1}
+    assert report["review_failed"] == {"escalated": 2, "completed": 1, "not_completed": 1}
+    assert report["cost_usd"] == 0.4
+    assert report["skipped_share"] == pytest.approx(2 / 6)
+
+    text = render({**replay([]), "post_review": report})
+    assert "post-merge reviews by review_by: 6, pass 1, fail 2, unknown 1, skipped 2" in text
+    assert "skipped: max_hops 1, perimeter 1" in text
+    assert "review_failed escalations 2: completed 1, not completed 1" in text
+    items = recommendations({"post_review": report})
+    assert [item["metric"] for item in items] == ["post_review.skipped_share"]
+    assert recommendations({"post_review": post_review(tasks[:2])}) == []
+
+
+def test_post_review_counts_a_chain_with_two_failed_reviews_once():
+    def failed(task_id, *, parent=None, escalated_to=None):
+        meta = {"review": {"by": "omp/sol", "task_id": None, "verdict": "fail", "summary": ""}}
+        if escalated_to:
+            meta["escalated_to"] = escalated_to
+        result = _result("partial", changed=["a.py"], meta=meta)
+        return _task(task_id, "partial", parent=parent, result=result)
+
+    a, b, c = ("a" * 32, "b" * 32, "c" * 32)
+    # Оба звена провалили ревью, третье довело до completed: цепочка одна.
+    tasks = [
+        failed(a, escalated_to=b),
+        failed(b, parent=a, escalated_to=c),
+        _task(c, "completed", parent=b),
+    ]
+    report = post_review(tasks)
+
+    assert report["verdicts"]["fail"] == 2
+    assert report["review_failed"] == {"escalated": 1, "completed": 1, "not_completed": 0}

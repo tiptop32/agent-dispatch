@@ -23,6 +23,7 @@ from .harness import (
     load,
     load_decisions,
     perimeter_violations,
+    post_review,
     recommendations,
     render,
     replay,
@@ -120,6 +121,7 @@ def main() -> int:
     report["children_refusals"] = children_refusals(tasks, settings.routing.max_children)
     report["delegations"] = delegations(tasks)
     report["timeouts"] = timeouts(tasks)
+    report["post_review"] = post_review(tasks)
     report["feedback"] = feedback_summary(tasks)
     report["cost_drift"] = _cost_drift(tasks, args.agent_lb_db)
     # Один locator на прогон: дифы эксперимента судятся второй раз из кэша.

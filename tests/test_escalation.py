@@ -892,3 +892,27 @@ async def test_rerouting_terminates_with_more_than_ten_executors(tmp_path, git_r
     assert last.result.error == "no available executors"
     assert all(len(adapter.calls) == 1 for adapter in adapters.values())
     assert len(await storage.list_tasks(limit=50)) == len(names) + 1
+
+
+def _reviewed(verdict: str, **kwargs) -> ExecutionResult:
+    return ExecutionResult(
+        status="partial",
+        executor="omp",
+        model=None,
+        summary="done",
+        changed_files=["a.py"],
+        meta={"review": {"by": "omp/sol", "verdict": verdict}},
+        **kwargs,
+    )
+
+
+def test_failed_review_escalates_after_verification_and_before_tests():
+    assert should_escalate(_reviewed("fail")) == "review_failed"
+    for verdict in ("pass", "unknown", "skipped"):
+        assert should_escalate(_reviewed(verdict)) is None
+    # Упавшая проверка демона сильнее: ревью тогда и не запускается.
+    failed_check = _reviewed("fail", verification=VerificationInfo(result="failed"))
+    assert should_escalate(failed_check) == "verification_failed"
+    # Вердикт ревьюера сильнее самоотчёта о тестах.
+    red_tests = _reviewed("fail", tests=ResultTestsInfo(command="pytest", result="failed"))
+    assert should_escalate(red_tests) == "review_failed"

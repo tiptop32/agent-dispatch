@@ -113,6 +113,7 @@ def normalize(
         else None,
         confidence=raw.get("confidence"),
         needs_escalation=raw.get("needs_escalation", False),
+        verdict=raw.get("verdict"),
         meta=meta,
     )
 

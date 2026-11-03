@@ -111,6 +111,10 @@ class DispatchRequest(_Model):
     #: Задача, которую продолжает этот запрос. Его `task` — новое сообщение
     #: исполнителю, остальное демон берёт из продолжаемой задачи.
     followup_of: str | None = None
+    #: Коммит, против которого ревью смотрит диф (`git diff <review_base>`).
+    #: Ревью работы исполнителя в worktree: работа уже закоммичена на ветке
+    #: задачи, и `git diff HEAD` был бы пуст. None — диф против HEAD.
+    review_base: str | None = Field(None, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_./~^@{}-]*$")
 
     @field_validator("files")
     @classmethod
@@ -228,6 +232,9 @@ class ExecutionResult(_Model):
     verification: VerificationInfo | None = None
     confidence: float | None = None
     needs_escalation: bool = False
+    #: Вердикт ревью: `fail`, если до слияния что-то нужно исправить. У задач
+    #: на правку и у старых ревью его нет.
+    verdict: Literal["pass", "fail"] | None = None
     error: str | None = None
     usage: Usage | None = None
     meta: dict[str, Any] = Field(default_factory=dict)

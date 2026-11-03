@@ -1,4 +1,5 @@
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -252,3 +253,54 @@ def test_report_prompt_asks_only_for_the_report_in_the_adapter_format(adapter, f
     assert prompt.startswith("# Report")
     assert "Do not change any files" in prompt
     assert format_hint in prompt
+
+
+def test_review_package_diffs_against_review_base(git_repo):
+    repo = Path(git_repo)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    (repo / "new.py").write_text("y = 1\n")
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@e"]
+    subprocess.run([*git, "add", "-A"], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "work"], cwd=repo, check=True)
+
+    req = request(cwd=str(repo), kind="review", review_base=base)
+    package = build_task_package(req, settings())
+    assert "new.py" in package.git_diff
+    rendered = render_prompt(package, "claude", settings())
+    assert f"$ git diff {base}" in rendered and "$ git diff HEAD" not in rendered
+    # Без review_base закоммиченная работа не видна: диф против HEAD пуст.
+    plain = build_task_package(request(cwd=str(repo), kind="review"), settings())
+    assert "new.py" not in plain.git_diff
+    assert "$ git diff HEAD" in render_prompt(plain, "claude", settings())
+
+
+def test_unresolved_review_base_fails_instead_of_an_empty_diff(git_repo):
+    # Опечатка в базе дала бы «(no changes against origin/mian)», и ревьюер
+    # одобрил бы пустоту.
+    req = request(cwd=str(git_repo), kind="review", review_base="origin/mian")
+    with pytest.raises(ValueError, match="review_base not found: origin/mian"):
+        build_task_package(req, settings())
+
+
+def test_review_prompt_asks_for_a_verdict():
+    rendered = render_prompt(TaskPackage(request=request(kind="review")), "claude", settings())
+    assert '"verdict"' in rendered and "`fail`" in rendered
+    task = render_prompt(TaskPackage(request=request()), "claude", settings())
+    assert '"verdict"' not in task
+
+
+@pytest.mark.parametrize("base", ["--output=/tmp/pwned", "-p", "HEAD; rm -rf /", "a b", ""])
+def test_review_base_rejects_options_and_shell_text(base):
+    # review_base приходит из MCP и идёт в `git diff <review_base>`: значение с
+    # ведущим `-` git прочёл бы как опцию (`--output=<файл>` пишет файл).
+    with pytest.raises(ValueError):
+        request(kind="review", review_base=base)
+
+
+@pytest.mark.parametrize(
+    "base", ["main", "origin/main", "a1b2c3d", "HEAD~3", "v1.2.0", "feat/x-y_z"]
+)
+def test_review_base_accepts_refs_and_shas(base):
+    assert request(kind="review", review_base=base).review_base == base

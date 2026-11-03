@@ -246,3 +246,17 @@ def test_normalize_drops_nulls():
 def test_normalize_valid_confidence_is_not_reported_as_coerced():
     result = normalize(_block(confidence=0.7), outcome(), [], "x", None)
     assert result.confidence == 0.7 and "coerced" not in result.meta
+
+
+def test_normalize_reads_the_review_verdict():
+    raw = {"status": "completed", "summary": "a.py:1 bug", "verdict": "fail"}
+    assert normalize(raw, outcome(), None, "omp", None).verdict == "fail"
+    # Старые отчёты без поля остаются валидными.
+    old = normalize({"status": "completed", "summary": "ok"}, outcome(), None, "omp", None)
+    assert old.status == "completed" and old.verdict is None
+
+
+def test_normalize_rejects_an_unknown_verdict():
+    raw = {"status": "completed", "summary": "ok", "verdict": "maybe"}
+    result = normalize(raw, outcome(), None, "omp", None)
+    assert result.status == "partial" and "'maybe' is not one of" in result.meta["parse_error"]

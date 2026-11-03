@@ -16,12 +16,13 @@ Changed files: {{ followup.changed_files | join(", ") or "(none)" }}
 
 # Review only
 This is a review request. Read the code and report findings. Do NOT create, modify or delete any file: your tools are read-only, and the caller fixes what you find. Put the findings in `summary`, most severe first, each with `path:line`, what is wrong and the concrete failure it causes. Leave `changed_files` empty. If you find nothing worth fixing, say so plainly.
+Add a field `"verdict"` to the result block: `fail` if something must be fixed before merging (a bug, wrong behaviour, or a missing test for changed behaviour), otherwise `pass`.
 
 ## Working copy
 $ git status --short
 {{ git_status or "(clean)" }}
-$ git diff HEAD
-{{ git_diff or "(no changes against HEAD)" }}
+$ git diff {{ diff_base }}
+{{ git_diff or "(no changes against " ~ diff_base ~ ")" }}
 {% endif %}
 
 # Workspace

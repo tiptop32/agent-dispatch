@@ -987,6 +987,23 @@ def recommendations(report: dict) -> list[dict[str, str]]:
                 ),
             }
         )
+    reviews = report.get("post_review", {})
+    if (reviews.get("skipped_share") or 0) > REVIEW_SKIPPED_SHARE:
+        reasons = ", ".join(f"{reason} {n}" for reason, n in reviews["skipped_reasons"].items())
+        result.append(
+            {
+                "priority": "medium",
+                "metric": "post_review.skipped_share",
+                "action": (
+                    "Разобрать причины skipped: ревьюер review_by недоступен, вне периметра "
+                    "или задачи упираются в max_hops, и работа уходит без ревью."
+                ),
+                "evidence": (
+                    f"{reviews['verdicts']['skipped']}/{reviews['reviews']} ревью не состоялись"
+                    + (f": {reasons}" if reasons else "")
+                ),
+            }
+        )
     feedback_info = report.get("feedback", {})
     if feedback_info.get("eligible", 0) and feedback_info.get("labeled", 0) == 0:
         result.append(
@@ -1067,6 +1084,77 @@ def timeouts(tasks: list[Task]) -> dict:
             )
         },
     }
+
+
+#: Вердикты ревью `review_by` в порядке вывода.
+_REVIEW_VERDICTS = ("pass", "fail", "unknown", "skipped")
+
+
+def post_review(tasks: list[Task]) -> dict:
+    """Ревью правок исполнителей с `review_by` (`Dispatcher._review_work`).
+
+    Сколько ревью было и с каким вердиктом, почему ревью не состоялось
+    (`skipped`: guard, сбой ревьюера, срок), чем кончились цепочки после
+    `review_failed` и сколько стоили сами ревью. Ревью, которые вызывающий
+    заказал сам (`kind: review` без `meta.review` у родителя), сюда не входят.
+    """
+    by_id = {task.task_id: task for task in tasks}
+    reviewed = [task for task in tasks if task.result and task.result.meta.get("review")]
+    verdicts: Counter[str] = Counter()
+    reasons: Counter[str] = Counter()
+    outcomes: Counter[str] = Counter()
+    cost = 0.0
+    chains: set[str] = set()
+    for task in reviewed:
+        review = task.result.meta["review"]
+        verdict = review.get("verdict", "unknown")
+        verdicts[verdict] += 1
+        if verdict == "skipped":
+            # Короткий ключ причины: guard или вид сбоя до первого двоеточия.
+            reasons[str(review.get("reason") or "unknown").split(":", 1)[0]] += 1
+        child = by_id.get(review.get("task_id") or "")
+        if child is not None and child.result and child.result.usage:
+            cost += child.result.usage.cost_usd or 0.0
+        if verdict != "fail" or not task.result.meta.get("escalated_to"):
+            continue
+        # Цепочка считается один раз от первого звена: иначе провал ревью
+        # у следующего звена посчитал бы её снова.
+        first, seen = task, {task.task_id}
+        while (prev := by_id.get(first.escalated_from or "")) and prev.task_id not in seen:
+            seen.add(prev.task_id)
+            first = prev
+        if first.task_id in chains:
+            continue
+        chains.add(first.task_id)
+        last, seen = task, {task.task_id}
+        while last.result and (nxt := by_id.get(last.result.meta.get("escalated_to") or "")):
+            if nxt.task_id in seen:
+                break
+            seen.add(nxt.task_id)
+            last = nxt
+        outcomes["escalated"] += 1
+        if last.status not in FINAL_STATUSES:
+            outcomes["in_flight"] += 1
+        else:
+            outcomes["completed" if last.status == "completed" else "not_completed"] += 1
+    total = len(reviewed)
+    return {
+        "reviews": total,
+        "verdicts": {verdict: verdicts[verdict] for verdict in _REVIEW_VERDICTS},
+        "skipped_reasons": dict(reasons.most_common()),
+        "skipped_share": verdicts["skipped"] / total if total else None,
+        "review_failed": {
+            key: outcomes[key]
+            for key in ("escalated", "completed", "not_completed", "in_flight")
+            if key != "in_flight" or outcomes[key]
+        },
+        "cost_usd": round(cost, 4),
+    }
+
+
+#: Доля несостоявшихся ревью, после которой `review_by` надо чинить: ревьюер
+#: недоступен, вне периметра или задачи упираются в `max_hops`.
+REVIEW_SKIPPED_SHARE = 0.20
 
 
 #: Допустимое расхождение цены задачи с учётом agent-lb. Дальше потолки бюджета
@@ -1453,6 +1541,26 @@ def render(report: dict) -> str:
             f"avg {row['avg_minutes']} min"
             for name, row in info["by_executor"].items()
         ]
+    if "post_review" in report:
+        info = report["post_review"]
+        verdicts = info["verdicts"]
+        lines.append(
+            f"post-merge reviews by review_by: {info['reviews']}, "
+            + ", ".join(f"{verdict} {verdicts[verdict]}" for verdict in _REVIEW_VERDICTS)
+            + f", cost ${info['cost_usd']:.2f}"
+        )
+        if info["skipped_reasons"]:
+            lines.append(
+                "  skipped: "
+                + ", ".join(f"{reason} {n}" for reason, n in info["skipped_reasons"].items())
+            )
+        failed = info["review_failed"]
+        if failed["escalated"]:
+            lines.append(
+                f"  review_failed escalations {failed['escalated']}: "
+                f"completed {failed['completed']}, not completed {failed['not_completed']}"
+                + (f", in flight {failed['in_flight']}" if failed.get("in_flight") else "")
+            )
     if "cost_drift" in report:
         info = report["cost_drift"]
         if "skipped" in info:

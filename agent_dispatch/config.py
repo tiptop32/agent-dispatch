@@ -191,6 +191,9 @@ class ExecutorSettings(_ConfigModel):
     #: Жёсткий таймаут задач этого исполнителя, секунды. Запрос с
     #: `timeout_seconds` сильнее, без обоих действует `routing.default_timeout_seconds`.
     timeout_seconds: int | None = Field(None, ge=1)
+    #: Исполнитель, который демон зовёт на ревью законченной правки этого
+    #: исполнителя до интеграции (`Dispatcher._review_work`). `fail` эскалирует.
+    review_by: str | None = None
 
     @model_validator(mode="after")
     def validate_adapter(self) -> ExecutorSettings:
@@ -239,6 +242,13 @@ class Settings(_ConfigModel):
             for index, target in enumerate(targets):
                 if target not in names:
                     raise ValueError(f"escalation.{source}[{index}]: unknown executor {target!r}")
+        for name, item in self.executors.items():
+            if item.review_by is None:
+                continue
+            if item.review_by not in names:
+                raise ValueError(f"executors.{name}.review_by: unknown executor {item.review_by!r}")
+            if item.review_by == name:
+                raise ValueError(f"executors.{name}.review_by: an executor cannot review itself")
         return self
 
     def timeout_for(self, executor: str, requested: int | None = None) -> int:

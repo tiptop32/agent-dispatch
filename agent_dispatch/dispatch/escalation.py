@@ -13,6 +13,10 @@ def should_escalate(result: ExecutionResult) -> str | None:
         # Проверка демона сильнее самоотчёта: исполнитель мог написать
         # `tests: passed`, не запуская их.
         return "verification_failed"
+    if (result.meta.get("review") or {}).get("verdict") == "fail":
+        # Ревьюер нашёл, что исправить до слияния. Его вердикт сильнее
+        # самоотчёта о тестах; `skipped` и `unknown` работу не держат.
+        return "review_failed"
     if result.tests is not None and result.tests.result == "failed":
         # И наоборот: прошедшая проверка демона сильнее самоотчёта «упали».
         # Исполнитель мог гонять что-то шире гейта вызывающего или ошибиться

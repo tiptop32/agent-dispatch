@@ -39,7 +39,9 @@ def _agent(value: str | None, default: SourceAgent | None = None) -> SourceAgent
 
 KIND_HINT = (
     "kind='task' (default) changes code; kind='review' asks for a read-only review "
-    "of the working copy and returns findings without editing files."
+    "of the working copy and returns findings without editing files. With "
+    "`review_base` (a ref or sha) the reviewer sees `git diff <review_base>` instead of "
+    "`git diff HEAD`, e.g. a whole branch since its merge-base."
 )
 VERIFY_HINT = (
     " Pass `verify` with shell commands (e.g. the test command for the touched scope, "
@@ -158,6 +160,19 @@ def _verification_line(info: VerificationInfo) -> str:
     return text
 
 
+def _review_line(review: dict) -> str:
+    """Итог ревью `review_by` одной строкой: у `fail` первая строка замечаний,
+    у `skipped` причина. Полный текст ревью лежит в задаче-потомке."""
+    text = f"review: {review.get('verdict')} by {review.get('by')}"
+    if review.get("verdict") == "fail":
+        detail = next((line for line in (review.get("summary") or "").splitlines() if line), "")
+    elif review.get("verdict") == "skipped":
+        detail = review.get("reason") or ""
+    else:
+        detail = ""
+    return f"{text} — {detail[:300]}" if detail else text
+
+
 def _task_text(view: TaskView, verbose: bool = False) -> str:
     result = view.result
     executor = (
@@ -199,6 +214,8 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
             lines.append(f"tests: {tests}")
         if result.verification:
             lines.append(_verification_line(result.verification))
+        if review := result.meta.get("review"):
+            lines.append(_review_line(review))
         if result.error:
             lines.append(f"error: {result.error[:500]}")
         for key in _META_LINES:
@@ -301,6 +318,7 @@ def build_server(
         verbose: bool,
         kind: str = "task",
         verify: list[str] | None = None,
+        review_base: str | None = None,
     ) -> str:
         try:
             wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
@@ -321,6 +339,7 @@ def build_server(
                 max_capability=max_capability,
                 kind=kind,
                 verify=verify or [],
+                review_base=review_base,
             )
             return _task_text(await client.submit(req), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
@@ -346,6 +365,7 @@ def build_server(
         max_capability: Literal["fast", "balanced", "strong"] | None = None,
         kind: str = "task",
         verify: list[str] | None = None,
+        review_base: str | None = None,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -364,6 +384,7 @@ def build_server(
             verbose,
             kind,
             verify,
+            review_base,
         )
 
     @server.tool(
@@ -389,6 +410,7 @@ def build_server(
         timeout_seconds: int | None = None,
         kind: str = "task",
         verify: list[str] | None = None,
+        review_base: str | None = None,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -407,6 +429,7 @@ def build_server(
             verbose,
             kind,
             verify,
+            review_base,
         )
 
     @server.tool(

@@ -111,6 +111,7 @@ executors:
     tier: balanced
     corporate: true  # copilot-x5: корпоративный периметр данных
     description: "omp с X5 Airun Code Large через copilot-x5: корпоративные данные не уходят за периметр"
+    # review_by: omp/sol  # ревью законченной правки до интеграции, fail эскалирует
   omp/x5-small-coder:
     adapter: omp
     command: omp

@@ -14,7 +14,8 @@
       }
     },
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-    "needs_escalation": {"type": "boolean"}
+    "needs_escalation": {"type": "boolean"},
+    "verdict": {"enum": ["pass", "fail"]}
   },
   "additionalProperties": false
 }
