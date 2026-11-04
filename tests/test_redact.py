@@ -96,3 +96,45 @@ def test_clean_result_gets_no_mark():
     result = ExecutionResult(status="completed", executor="omp/x5", model=None, summary="42 rows")
     redact_result(result)
     assert result.summary == "42 rows" and "redacted" not in result.meta
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "kept"),
+    [
+        pytest.param(
+            "cache redis://:s3cretpass@cache.example:6379/0",  # pragma: allowlist secret
+            "s3cretpass",
+            "redis://:[REDACTED]@cache.example:6379/0",
+            id="empty-login",
+        ),
+        pytest.param(
+            "db postgres://svc:ab/cD+ef/gh==@db.example/orders",  # pragma: allowlist secret
+            "ab/cD+ef",
+            "postgres://svc:[REDACTED]@db.example/orders",
+            id="base64-password-with-slash",
+        ),
+        pytest.param("Authorization: Bearer abc123", "abc123", "Bearer [REDACTED]", id="short"),
+        pytest.param("Bearer AbCdEf", "AbCdEf", "Bearer [REDACTED]", id="short-mixed-case"),
+        pytest.param("header bearer x9.y", "x9.y", "bearer [REDACTED]", id="lower-with-digit"),
+        pytest.param("db_pwd=hunter2 ok", "hunter2", "db_pwd=", id="db-pwd"),
+        pytest.param("PASSWORD=hunter2", "hunter2", "PASSWORD=", id="upper-password"),
+    ],
+)
+def test_edge_secrets_are_masked(text, secret, kept):
+    redacted, count = redact_text(text)
+    assert secret not in redacted and kept in redacted
+    assert count == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "the API uses bearer authentication",
+        "Bearer token is required.",
+        "a bearer token goes into the header",
+        "env PWD=/home/svc/app OLDPWD=/x",
+        "http://host:8080/@scope/pkg",
+    ],
+)
+def test_edge_prose_is_left_alone(text):
+    assert redact_text(text) == (text, 0)

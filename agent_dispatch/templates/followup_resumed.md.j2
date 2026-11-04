@@ -6,6 +6,10 @@ This continues your previous run in this session (AgentDispatch task {{ followup
 
 The previous verification: {{ followup.verification }}
 {% endif %}
+{% if prod %}
+
+{% include "prod_data_rule.md.j2" %}
+{% endif %}
 {% if verify and not review %}
 
 # Verification

@@ -167,6 +167,23 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
         tests = {**tests, "command": _as_text(command)}
         raw = {**raw, "tests": tests}
         coerced.append(f"tests.command: {type(command).__name__} -> str")
+    if (
+        isinstance(tests, dict)
+        and "result" in tests
+        and tests["result"] is not None
+        and not isinstance(tests["result"], str)
+    ):
+        # Строка дальше проходит обычное сопоставление синонимов.
+        result = tests["result"]
+        tests = {**tests, "result": _as_text(result)}
+        raw = {**raw, "tests": tests}
+        coerced.append(f"tests.result: {type(result).__name__} -> str")
+    changed = raw.get("changed_files")
+    if isinstance(changed, list) and not all(isinstance(item, str) for item in changed):
+        kinds = sorted({type(item).__name__ for item in changed if not isinstance(item, str)})
+        files = [item if isinstance(item, str) else _as_text(item) for item in changed]
+        raw = {**raw, "changed_files": files}
+        coerced.append(f"changed_files: {', '.join(kinds)} -> str")
     confidence = raw.get("confidence")
     if confidence is not None and not _is_unit_number(confidence):
         mapped_confidence = _coerce_confidence(confidence)

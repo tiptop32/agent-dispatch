@@ -20,6 +20,7 @@ from .capability import (
     select,
 )
 from .claude_local import ClaudeLocalRouter
+from .exploration import STATIC_BASELINE_TIER
 from .guards import fallback_choice, post_guards, single_candidate_decision
 from .jev import JevRouter
 
@@ -71,6 +72,45 @@ def _apply_capability_ceiling(
     return result
 
 
+#: Почему у задачи с `prod` нет ответа роутера.
+PROD_ROUTERS_SKIPPED_NOTE = (
+    "prod: routers skipped; the task text is not sent to an external router, "
+    "the executor is picked statically inside the corporate perimeter"
+)
+
+
+def _prod_decision(req: DispatchRequest, candidates: dict[str, ExecutorSettings]) -> RouteDecision:
+    """Детерминированный выбор для задачи с `prod`, без роутеров.
+
+    Ответ о корп. данных известен заранее, а текст задачи с продовыми данными
+    нельзя отдавать ни Jev (внешний endpoint), ни `claude_local`. Пул уже сужен
+    диспетчером до `corporate: true`; тир статический, как у плеча `explore`,
+    потолок `max_capability` соблюдается.
+    """
+    names = list(candidates)
+    if len(names) == 1:
+        decision = single_candidate_decision(names[0])
+        decision.meta["perimeter"] = "prod"
+        return decision
+    selection = select(
+        STATIC_BASELINE_TIER, candidates, max_capability=req.max_capability, corporate=True
+    )
+    meta: dict[str, object] = {
+        "perimeter": "prod",
+        "selection_notes": [PROD_ROUTERS_SKIPPED_NOTE, *selection.notes],
+    }
+    if selection.capability_uncapped is not None:
+        meta["capability_uncapped"] = selection.capability_uncapped
+    return RouteDecision(
+        router=RouterKind.fallback,
+        executor=selection.executor,
+        confidence=1.0,
+        scores={selection.executor: 1.0},
+        capability=selection.capability,
+        meta=meta,
+    )
+
+
 async def decide_with_fallback(
     req: DispatchRequest,
     candidates: dict[str, ExecutorSettings],
@@ -79,14 +119,11 @@ async def decide_with_fallback(
 ) -> tuple[RouteDecision, list[GuardEvent]]:
     names = list(candidates)
     configured = settings.executors
-    perimeter = req.prod or perimeter_applies(settings.routing.corporate_perimeter, configured)
-    if len(names) == 1 and (req.prod or not perimeter):
-        # Задаче с `prod` ответ о корп. данных не нужен: пул уже сужен
-        # диспетчером, единственный кандидат и есть выбор.
-        decision = single_candidate_decision(names[0])
-        if req.prod:
-            decision.meta["perimeter"] = "prod"
-        return decision, []
+    if req.prod:
+        return _prod_decision(req, candidates), []
+    perimeter = perimeter_applies(settings.routing.corporate_perimeter, configured)
+    if len(names) == 1 and not perimeter:
+        return single_candidate_decision(names[0]), []
     # При применимом периметре короткого пути нет: ответ о корп. данных решает
     # судьбу всей линии задачи (эскалации, вложенных задач). Без вопроса
     # пришлось бы либо выпускать её наружу, либо запирать в периметре вслепую;
@@ -118,9 +155,7 @@ async def decide_with_fallback(
     )
     meta: dict[str, str | list[str]] = {}
     extra_events: list[GuardEvent] = []
-    if req.prod:
-        meta["perimeter"] = "prod"
-    elif perimeter:
+    if perimeter:
         meta["perimeter"] = "unknown"
         if any(item.corporate for item in pool.values()):
             notes.append(PERIMETER_UNKNOWN_NOTE)

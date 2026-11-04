@@ -303,3 +303,27 @@ def test_normalize_turns_a_non_string_tests_command_into_text():
     assert result.status == "completed"
     assert result.tests.command == "uv run pytest\nuv run ruff check ."
     assert result.tests.result == "passed"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected", "kind"),
+    [
+        pytest.param(True, "not_run", "bool", id="bool"),
+        pytest.param(["3 passed"], "passed", "list", id="list"),
+        pytest.param({"failed": 2}, "failed", "dict", id="dict"),
+    ],
+)
+def test_normalize_coerces_non_string_tests_result(value, expected, kind):
+    raw = _block(tests={"command": "pytest", "result": value})
+    result = normalize(raw, outcome(), [], "omp", None)
+    assert result.status == "completed" and "parse_error" not in result.meta
+    assert result.tests.result == expected
+    assert f"tests.result: {kind} -> str" in result.meta["coerced"]
+
+
+def test_normalize_coerces_non_string_changed_files_items():
+    raw = _block(changed_files=["a.py", 7, {"path": "b.py"}])
+    result = normalize(raw, outcome(), None, "omp", None)
+    assert result.status == "completed" and "parse_error" not in result.meta
+    assert result.changed_files == ["a.py", "7", '{"path": "b.py"}']
+    assert result.meta["coerced"] == ["changed_files: dict, int -> str"]

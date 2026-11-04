@@ -356,7 +356,30 @@ class Dispatcher:
         return meta
 
     async def route_only(self, req: DispatchRequest) -> tuple[RouteDecision, list[GuardEvent]]:
-        routing = await self._route(req)
+        # Вложенный `route` из задачи под периметром наследует его так же, как
+        # `_prepare`: иначе при `corporate_perimeter: false` роутер увидел бы
+        # внешнего исполнителя и текст продовой задачи.
+        located = req if req.parent_task_id else await self._inherit_worktree_parent(req)
+        parent = (
+            await self.storage.get_task(located.parent_task_id) if located.parent_task_id else None
+        )
+        inherited = await self._lineage_perimeter(parent) if parent is not None else None
+        exclude: set[str] = set()
+        if req.executor is None and inherited:
+            exclude = {name for name, item in self.settings.executors.items() if not item.corporate}
+        prod = req.prod
+        if inherited == "prod":
+            req = req.model_copy(update={"prod": True})
+        routing = await self._route(req, exclude=exclude)
+        blocked = routing.guard and routing.guard.reason != GuardReason.user_override
+        refusal = (
+            None if blocked else self._perimeter_refusal(routing.decision, inherited, prod=prod)
+        )
+        if refusal is not None:
+            # Явный внешний `executor` наследника: `dispatch` получил бы отказ.
+            routing = Routing(
+                self._fallback_decision(refusal.reason), refusal, [], routing.candidates
+            )
         await self.storage.add_decision(None, routing.decision, routing.candidates)
         # Сработавший guard объясняет решение целиком: события роутеров к нему не относятся.
         return routing.decision, [routing.guard] if routing.guard else routing.events
@@ -956,9 +979,10 @@ class Dispatcher:
             reviewer = configured.perimeter_review_by or ""
             reviewer_settings = self.settings.executors.get(reviewer)
             if reviewer_settings is None or not reviewer_settings.corporate:
+                # Внешний `review_by` не вызывался, поэтому и в `by` его нет.
                 self._note_review(
                     result,
-                    reviewer or configured.review_by or "",
+                    reviewer,
                     None,
                     "skipped",
                     reason="perimeter: no corporate reviewer",

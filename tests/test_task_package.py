@@ -6,6 +6,7 @@ import pytest
 
 from agent_dispatch.config import ExecutorSettings, RoutingSettings, Settings
 from agent_dispatch.dispatch.task_package import (
+    Followup,
     TaskPackage,
     build_task_package,
     render_prompt,
@@ -332,3 +333,30 @@ def test_prod_prompt_carries_the_data_rule(package):
     assert "conclusions and numbers only" in rendered
     assert "tokens, passwords, keys" in rendered and "personal data" in rendered
     assert REFUSAL_RULE in rendered
+
+
+@pytest.mark.parametrize(
+    "package",
+    [
+        TaskPackage(request=request(prod=True)),
+        # Наследник линии `prod`: флага в запросе нет, демон ставит `prod` пакета.
+        TaskPackage(request=request(), prod=True),
+    ],
+    ids=["prod-request", "prod-inherited"],
+)
+def test_resumed_followup_prompt_carries_the_data_rule(package):
+    """Возобновлённая сессия получает короткий промпт, но правило данных в нём есть.
+
+    Prod мог впервые прийти к линии вместе с этим follow-up: прежний Task
+    Package сессии правила тогда не содержал.
+    """
+    followup = Followup(task_id="t1", executor="omp", status="completed", resumed=True)
+    rendered = render_prompt(package.model_copy(update={"followup": followup}), "omp", settings())
+    assert rendered.startswith("# Follow-up")
+    assert "# Prod data rule" in rendered and "conclusions and numbers only" in rendered
+
+
+def test_resumed_followup_prompt_without_prod_has_no_data_rule():
+    followup = Followup(task_id="t1", executor="omp", status="completed", resumed=True)
+    rendered = render_prompt(TaskPackage(request=request(), followup=followup), "omp", settings())
+    assert "# Prod data rule" not in rendered

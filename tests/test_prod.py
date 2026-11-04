@@ -34,11 +34,13 @@ from tests.fakes.adapters import FakeAdapter
 from tests.test_cli import _patch_autostart
 from tests.test_cli import _state as cli_state
 from tests.test_cli import _view as cli_view
+from tests.test_escalation import SPEND_LIMIT
 from tests.test_mcp_server import call, view
 from tests.test_mcp_server import settings as mcp_settings
 
 WAIT = 2.0
 X5, X5_FAST, SOL = "omp/x5", "omp/x5-fast", "omp/sol"
+X5_MID = "omp/x5-mid"
 PERIMETER = pytest.mark.parametrize("corporate_perimeter", [True, False], ids=["on", "off"])
 
 
@@ -111,7 +113,8 @@ async def test_router_sees_only_corporate_executors(tmp_path, git_repo, corporat
     task = await dispatcher.submit(_request(git_repo))
     done = await dispatcher.wait(task.task_id, WAIT)
 
-    assert router.candidates == [[X5, X5_FAST]]
+    # Текст продовой задачи роутеру не уходит: выбор статический внутри периметра.
+    assert not router.candidates
     assert done.status == "completed" and done.decision.executor in {X5, X5_FAST}
     assert done.decision.meta["perimeter"] == "prod"
     assert not adapters[SOL].calls
@@ -126,7 +129,7 @@ async def test_route_only_sees_only_corporate_executors(tmp_path, git_repo, corp
 
     decision, _ = await dispatcher.route_only(_request(git_repo))
 
-    assert router.candidates == [[X5, X5_FAST]]
+    assert not router.candidates
     assert decision.executor != SOL and decision.meta["perimeter"] == "prod"
     await storage.close()
 
@@ -244,7 +247,7 @@ async def test_nested_task_inherits_prod(tmp_path, git_repo, corporate_perimeter
 
     assert refused.status == "failed" and refused.result.meta["guard"] == "perimeter"
     assert "ancestor prod task" in refused.result.error
-    assert router.candidates == [[X5, X5_FAST]]
+    assert not router.candidates
     assert routed.decision.executor != SOL and routed.decision.meta["perimeter"] == "prod"
     assert not adapters[SOL].calls
     await storage.close()
@@ -412,6 +415,8 @@ async def test_prod_review_without_corporate_reviewer_is_skipped(
     review = done.result.meta["review"]
     assert review["verdict"] == "skipped"
     assert review["reason"] == "perimeter: no corporate reviewer"
+    # Внешнего `review_by` не звали: называть его ревьюером было бы неправдой.
+    assert review["by"] == ""
     # Внешний ревьюер не ставится вовсе, а не отказывается guard'ом.
     assert review.get("task_id") is None
     assert not adapters[SOL].calls and len(adapters[X5].calls) == 1
@@ -469,3 +474,169 @@ def test_perimeter_reviewer_must_be_corporate(tmp_path):
     data["executors"][X5]["perimeter_review_by"] = "ghost"
     with pytest.raises(ValueError, match="perimeter_review_by: unknown executor 'ghost'"):
         Settings.model_validate(data)
+
+
+async def _silent_routers(tmp_path: Path, corporate_perimeter: bool, results=None):
+    """Три корпоративных исполнителя и два роутера (как Jev и `claude_local`).
+
+    Ни один роутер не должен получить текст продовой задачи: у любого шага
+    линии остаётся не меньше двух корпоративных кандидатов, поэтому короткий
+    путь «один кандидат» здесь не срабатывает.
+    """
+    settings = _settings(tmp_path, corporate_perimeter=corporate_perimeter)
+    settings.executors[X5_MID] = ExecutorSettings(
+        adapter="omp", model="x5", tier="balanced", corporate=True
+    )
+    storage, adapters, router, dispatcher = await _dispatcher(tmp_path, settings, results)
+    routers = [router, _Router()]
+    dispatcher.routers = routers
+    return storage, adapters, routers, dispatcher
+
+
+@PERIMETER
+@pytest.mark.asyncio
+async def test_prod_root_task_never_reaches_a_router(tmp_path, git_repo, corporate_perimeter):
+    storage, adapters, routers, dispatcher = await _silent_routers(tmp_path, corporate_perimeter)
+
+    task = await dispatcher.submit(_request(git_repo))
+    done = await dispatcher.wait(task.task_id, WAIT)
+
+    assert not any(router.candidates for router in routers)
+    # Статический тир `balanced`, как у плеча `explore`.
+    assert done.status == "completed" and done.decision.executor == X5_MID
+    assert done.decision.router == RouterKind.fallback
+    assert done.decision.meta["perimeter"] == "prod"
+    assert any("prod: routers skipped" in n for n in done.decision.meta["selection_notes"])
+    assert not adapters[SOL].calls
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_prod_static_choice_respects_max_capability(tmp_path, git_repo):
+    storage, _, routers, dispatcher = await _silent_routers(tmp_path, False)
+
+    task = await dispatcher.submit(_request(git_repo, max_capability="fast"))
+    done = await dispatcher.wait(task.task_id, WAIT)
+
+    assert not any(router.candidates for router in routers)
+    assert done.decision.executor == X5_FAST and done.decision.capability == "fast"
+    assert done.decision.meta["capability_uncapped"] == "balanced"
+    await storage.close()
+
+
+@PERIMETER
+@pytest.mark.asyncio
+async def test_prod_reroute_after_executor_failure_never_reaches_a_router(
+    tmp_path, git_repo, corporate_perimeter
+):
+    failed = ExecutionResult(
+        status="failed", executor=X5, model=None, summary="", error=SPEND_LIMIT
+    )
+    storage, adapters, routers, dispatcher = await _silent_routers(
+        tmp_path, corporate_perimeter, results={X5: failed}
+    )
+    dispatcher.settings.escalation = {}
+
+    first = await dispatcher.submit(_request(git_repo, executor=X5))
+    done = await dispatcher.wait(first.task_id, WAIT)
+
+    assert done.task_id != first.task_id and done.status == "completed"
+    assert done.decision.executor in {X5_FAST, X5_MID}
+    assert not any(router.candidates for router in routers)
+    assert not adapters[SOL].calls
+    await storage.close()
+
+
+@PERIMETER
+@pytest.mark.asyncio
+async def test_prod_followup_never_reaches_a_router(tmp_path, git_repo, corporate_perimeter):
+    storage, adapters, routers, dispatcher = await _silent_routers(tmp_path, corporate_perimeter)
+    first = await dispatcher.submit(_request(git_repo, executor=X5))
+    assert (await dispatcher.wait(first.task_id, WAIT)).status == "completed"
+    dispatcher.availability.trip(X5, "rate_limit", "test", 600)
+
+    record = await dispatcher.followup(first.task_id, FollowupRequest(message="more"))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    assert not any(router.candidates for router in routers)
+    assert done.decision.executor == X5_MID and done.decision.meta["perimeter"] == "prod"
+    assert not adapters[SOL].calls
+    await storage.close()
+
+
+@PERIMETER
+@pytest.mark.asyncio
+async def test_prod_nested_task_never_reaches_a_router(tmp_path, git_repo, corporate_perimeter):
+    storage, adapters, routers, dispatcher = await _silent_routers(tmp_path, corporate_perimeter)
+    gate = asyncio.Event()
+    adapters[X5].gate = gate
+    parent = await dispatcher.submit(_request(git_repo, executor=X5))
+    await asyncio.wait_for(adapters[X5].started.wait(), WAIT)
+
+    routed = await _nested(dispatcher, adapters, git_repo, parent.task_id, None)
+    gate.set()
+    await dispatcher.wait(parent.task_id, WAIT)
+
+    assert not any(router.candidates for router in routers)
+    assert routed.decision.executor == X5_MID and routed.decision.meta["perimeter"] == "prod"
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_nested_route_only_inherits_prod(tmp_path, git_repo):
+    """Вложенный MCP `route` из продовой задачи без своего `prod`.
+
+    При `corporate_perimeter: false` без наследования роутер увидел бы
+    внешнего исполнителя и текст задачи.
+    """
+    storage, adapters, routers, dispatcher = await _silent_routers(tmp_path, False)
+    gate = asyncio.Event()
+    adapters[X5].gate = gate
+    parent = await dispatcher.submit(_request(git_repo, executor=X5))
+    await asyncio.wait_for(adapters[X5].started.wait(), WAIT)
+
+    decision, _ = await dispatcher.route_only(
+        DispatchRequest(task="nested", cwd=str(git_repo), parent_task_id=parent.task_id, hop=1)
+    )
+    gate.set()
+    await dispatcher.wait(parent.task_id, WAIT)
+
+    assert not any(router.candidates for router in routers)
+    assert decision.executor != SOL and decision.meta["perimeter"] == "prod"
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_route_only_inherits_the_answered_perimeter(tmp_path, git_repo):
+    """Наследник задачи под периметром по ответу Jev: роутер видит только корпоративных."""
+    storage, adapters, routers, dispatcher = await _silent_routers(tmp_path, True)
+    parent = await dispatcher.submit(DispatchRequest(task="x", cwd=str(git_repo), executor=X5))
+    done = await dispatcher.wait(parent.task_id, WAIT)
+    record = await storage.get_task(done.task_id)
+    record.decision = record.decision.model_copy(update={"meta": {"perimeter": "answered"}})
+    await storage.update_task(record)
+
+    decision, _ = await dispatcher.route_only(
+        DispatchRequest(task="nested", cwd=str(git_repo), parent_task_id=parent.task_id, hop=1)
+    )
+
+    assert routers[0].candidates == [[X5, X5_FAST, X5_MID]]
+    assert decision.executor != SOL
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_nested_route_only_refuses_an_explicit_external_executor(tmp_path, git_repo):
+    storage, _, _, dispatcher = await _silent_routers(tmp_path, False)
+    parent = await dispatcher.submit(_request(git_repo, executor=X5))
+    await dispatcher.wait(parent.task_id, WAIT)
+
+    _, events = await dispatcher.route_only(
+        DispatchRequest(
+            task="nested", cwd=str(git_repo), executor=SOL, parent_task_id=parent.task_id, hop=1
+        )
+    )
+
+    assert [event.reason for event in events] == ["perimeter"]
+    assert "ancestor prod task" in events[0].detail
+    await storage.close()
