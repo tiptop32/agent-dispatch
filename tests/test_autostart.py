@@ -54,6 +54,27 @@ async def test_dead_state_starts_and_returns(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_daemon_starts_outside_callers_cwd(tmp_path, monkeypatch):
+    # `python -m` ставит текущий каталог первым в sys.path. MCP, запущенный из
+    # рабочей копии agent-dispatch, поднимал демон с кодом репозитория на момент
+    # старта, а шаблоны тот читал с диска свежими: 2026-11-04 задачи падали с
+    # `UndefinedError: 'prod' is undefined`.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.chdir(repo)
+    data_dir = tmp_path / "data"
+    settings = make_settings(data_dir)
+    calls = []
+
+    def popen(*args, **kwargs):
+        calls.append(kwargs)
+        write_state(data_dir, make_state())
+
+    await ensure_daemon(settings, popen=popen, health=AsyncMock(return_value=True))
+    assert calls[0]["cwd"] == data_dir
+
+
+@pytest.mark.asyncio
 async def test_timeout(tmp_path):
     settings = make_settings(tmp_path)
     now = iter([0.0, 0.4, 0.4, 0.4])

@@ -41,8 +41,12 @@ async def ensure_daemon(
     log_path = log_dir / "serve.log"
     log_file = log_path.open("ab")
     try:
+        # `-m` ставит текущий каталог первым в sys.path: из рабочей копии
+        # agent-dispatch демон взял бы её код вместо установленного, а шаблоны
+        # читал бы с диска свежими. Каталог данных такой ловушки не держит.
         popen(
             [sys.executable, "-m", "agent_dispatch.cli", "serve"],
+            cwd=data_dir,
             stdin=subprocess.DEVNULL,
             stdout=log_file,
             stderr=subprocess.STDOUT,
