@@ -40,7 +40,7 @@ from agent_dispatch.models import (
     TaskStatus,
 )
 from agent_dispatch.routing.base import Router
-from agent_dispatch.routing.capability import JUDGMENT_ADAPTER
+from agent_dispatch.routing.capability import JUDGMENT_ADAPTER, perimeter_applies
 from agent_dispatch.routing.decision import decide_with_fallback
 from agent_dispatch.routing.exploration import apply_exploration
 from agent_dispatch.routing.guards import candidates, pre_guards, review_only_executors
@@ -369,6 +369,17 @@ class Dispatcher:
         exclude: set[str] | frozenset[str] = frozenset(),
         current_task_id: str | None = None,
     ) -> Routing:
+        if req.prod and not perimeter_applies(True, self.settings.executors):
+            # Снаружи прод не запускается никогда: без корпоративного
+            # исполнителя в конфиге задаче некуда идти.
+            guard = GuardEvent(
+                reason=GuardReason.perimeter,
+                detail=(
+                    "prod task must stay inside the corporate perimeter, but no enabled "
+                    "executor with `corporate: true` is configured"
+                ),
+            )
+            return Routing(self._fallback_decision(guard.reason), guard, [], [])
         await self.availability.check_all()
         review_only = review_only_executors(req, self.settings)
         unavailable = self.availability.unavailable() | set(exclude)
@@ -399,6 +410,10 @@ class Dispatcher:
             running_siblings=running_siblings,
         )
         names = candidates(self.settings, unavailable | review_only, req.source_agent, req.hop)
+        if req.prod:
+            # Явный `executor` сюда не относится: внешний получит отказ
+            # `guard: perimeter` в `_perimeter_refusal`, а не «недоступен».
+            names = [name for name in names if self.settings.executors[name].corporate]
         if isinstance(verdict, GuardEvent):
             cooldown = self.availability.cooldown(verdict.executor) if verdict.executor else None
             if verdict.reason == GuardReason.unavailable and cooldown is not None:
@@ -417,7 +432,10 @@ class Dispatcher:
             )
             return Routing(verdict, guard, [], names)
         if not names:
-            guard = GuardEvent(reason=GuardReason.unavailable, detail="no available executors")
+            detail = "no available executors"
+            if req.prod:
+                detail += " inside the corporate perimeter required by the prod task"
+            guard = GuardEvent(reason=GuardReason.unavailable, detail=detail)
             return Routing(self._fallback_decision(guard.reason), guard, [], names)
         pool = {n: self.settings.executors[n] for n in names}
         decision, events = await decide_with_fallback(req, pool, self.settings, self.routers)
@@ -516,6 +534,7 @@ class Dispatcher:
             # задачу, в выбор не входят, иначе роутер вернул бы её им же.
             exclude = set(await self._escalation_chain(record))
         inherited = await self._lineage_perimeter(record, ancestors_only=True)
+        prod = record.request.prod or inherited == "prod"
         if record.request.executor is None and inherited:
             # Переадресация, follow-up и вложенная задача наследуют периметр
             # предка: новый ответ Jev «не корпоративное» не выпускает их наружу.
@@ -523,7 +542,10 @@ class Dispatcher:
                 name for name, item in self.settings.executors.items() if not item.corporate
             }
         routing = await self._route(
-            record.request,
+            # Наследник продовой задачи сам флага не несёт (вложенный dispatch,
+            # ревью), но роутер должен видеть его: вопрос о корп. данных не
+            # нужен, решение помечается `perimeter: prod`.
+            record.request.model_copy(update={"prod": True}) if prod else record.request,
             is_escalation=record.escalated_from is not None,
             exclude=exclude,
             current_task_id=record.task_id,
@@ -536,10 +558,14 @@ class Dispatcher:
             await self._guard_failure(record, routing.guard)
             return None
         decision = routing.decision
-        refusal = self._perimeter_refusal(decision, inherited)
+        refusal = self._perimeter_refusal(decision, inherited, prod=record.request.prod)
         if refusal is not None:
             await self._guard_failure(record, refusal)
             return None
+        if prod and decision.meta.get("perimeter") != "prod":
+            # Явный `executor` роутер не проходит: требование `prod` пишется
+            # в решение здесь, по нему его наследует вся линия задачи.
+            decision = decision.model_copy(update={"meta": {**decision.meta, "perimeter": "prod"}})
         if record.escalated_from is not None:
             decision = decision.model_copy(
                 update={"router": RouterKind.fallback, "reason": GuardReason.escalated}
@@ -1377,13 +1403,14 @@ class Dispatcher:
 
         Звенья эскалации, переадресация роутеру, follow-up и вложенные задачи
         не видят ответа Jev о корп. данных исходной задачи. Требование
-        читается из `decision.meta.perimeter` самой задачи (кроме
-        `ancestors_only`) и всех её предков по `escalated_from`, `followup_of`
-        и `parent_task_id` в базе, поэтому переживает рестарт демона.
-        Выключенный в конфиге периметр не наследуется.
+        читается из `decision.meta.perimeter` (и флага `prod` запроса) самой
+        задачи (кроме `ancestors_only`) и всех её предков по `escalated_from`,
+        `followup_of` и `parent_task_id` в базе, поэтому переживает рестарт
+        демона. Выключенный в конфиге периметр не наследуется, кроме `prod`:
+        прод закрыт всегда, и `prod` в линии сильнее остальных статусов.
         """
-        if not self.settings.routing.corporate_perimeter:
-            return None
+        statuses = ("answered", "unknown") if self.settings.routing.corporate_perimeter else ()
+        found: str | None = None
         pending: list[TaskRecord] = [record]
         seen: set[str] = set()
         while pending:
@@ -1391,10 +1418,12 @@ class Dispatcher:
             if current.task_id in seen:
                 continue
             seen.add(current.task_id)
-            own = current is not record or not ancestors_only
-            status = current.decision.meta.get("perimeter") if current.decision else None
-            if own and status in ("answered", "unknown"):
-                return status
+            if current is not record or not ancestors_only:
+                status = current.decision.meta.get("perimeter") if current.decision else None
+                if current.request.prod or status == "prod":
+                    return "prod"
+                if found is None and status in statuses:
+                    found = status
             for parent_id in (
                 current.escalated_from,
                 current.request.followup_of,
@@ -1404,21 +1433,32 @@ class Dispatcher:
                     parent = await self.storage.get_task(parent_id)
                     if parent is not None:
                         pending.append(parent)
-        return None
+        return found
 
     def _perimeter_refusal(
-        self, decision: RouteDecision, inherited: str | None
+        self, decision: RouteDecision, inherited: str | None, *, prod: bool = False
     ) -> GuardEvent | None:
         """Последний рубеж: задача под периметром не уходит к внешнему исполнителю.
 
         Под периметром задача, чьё решение его потребовало (`meta.perimeter`),
-        или наследница предка под периметром. Явный `executor` корневой задачи
-        это решение владельца данных и отказа не получает: у него нет ни
-        предка, ни `meta.perimeter`.
+        задача с `prod` или наследница предка под периметром. Явный `executor`
+        корневой задачи это решение владельца данных и отказа не получает: у
+        него нет ни предка, ни `meta.perimeter`. С `prod` владелец уже решил,
+        поэтому внешний явный `executor` получает отказ.
         """
         configured = self.settings.executors.get(decision.executor)
         if configured is None or configured.corporate:
             return None
+        if prod or inherited == "prod" or decision.meta.get("perimeter") == "prod":
+            return GuardEvent(
+                reason=GuardReason.perimeter,
+                detail=(
+                    "corporate perimeter required by "
+                    f"{'this prod task' if prod else 'an ancestor prod task'}: "
+                    f"{decision.executor} is not `corporate: true`"
+                ),
+                executor=decision.executor,
+            )
         if inherited is None and decision.meta.get("perimeter") not in ("answered", "unknown"):
             return None
         source = "an ancestor task" if inherited else "this task (corporate_data)"

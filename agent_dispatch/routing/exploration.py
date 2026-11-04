@@ -43,6 +43,8 @@ def _static_executor(
     decision: RouteDecision,
     candidates: dict[str, ExecutorSettings],
     settings: Settings,
+    *,
+    prod: bool = False,
 ) -> str:
     verdict = perimeter_required(
         candidates,
@@ -50,6 +52,7 @@ def _static_executor(
         corporate=decision.judgments.get("corporate_data"),
         min_confidence=settings.routing.corporate_min_confidence,
         configured=settings.executors,
+        prod=prod,
     )
     return select(STATIC_BASELINE_TIER, candidates, corporate=verdict.required).executor
 
@@ -85,7 +88,7 @@ def apply_exploration(
 
     result = decision.model_copy(deep=True)
     jev_executor = result.executor
-    static_executor = _static_executor(result, candidates, settings)
+    static_executor = _static_executor(result, candidates, settings, prod=request.prod)
     explored = is_explore_task(task_id, settings.routing.explore_share)
     arm = "explore" if explored else "jev"
     result.judgments[ARM_JUDGMENT] = _choice(arm, 1.0)

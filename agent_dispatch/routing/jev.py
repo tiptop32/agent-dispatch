@@ -25,7 +25,11 @@ class JevRouter:
     name = "jev"
 
     def _corporate_verdict(
-        self, corporate: Judgment | None, candidates: dict[str, ExecutorSettings]
+        self,
+        corporate: Judgment | None,
+        candidates: dict[str, ExecutorSettings],
+        *,
+        prod: bool = False,
     ) -> PerimeterVerdict:
         """Сужать ли пул до периметра, и что об этом сказать.
 
@@ -42,6 +46,7 @@ class JevRouter:
             corporate=corporate,
             min_confidence=routing.corporate_min_confidence,
             configured=self.settings.executors,
+            prod=prod,
         )
 
     def __init__(
@@ -60,7 +65,8 @@ class JevRouter:
         if not api_key:
             raise RouterError(f"missing API key: {cfg.api_key_env}")
         capabilities = tiers_present(candidates)
-        ask_corporate = perimeter_applies(
+        # У задачи с `prod` ответ уже известен: периметр требуется всегда.
+        ask_corporate = not req.prod and perimeter_applies(
             self.settings.routing.corporate_perimeter, {**self.settings.executors, **candidates}
         )
         body = {
@@ -99,7 +105,7 @@ class JevRouter:
                     # `score`/`choice` со значением 0 читался бы как «нет».
                     raise RouterError("invalid noul answer: corporate_data")
                 judgment = judgments.get("judgment")
-                verdict = self._corporate_verdict(corporate, candidates)
+                verdict = self._corporate_verdict(corporate, candidates, prod=req.prod)
                 narrow, extra_note = verdict.required, verdict.note
                 if not ask_corporate:
                     # Вопрос не задавался: ответа нет, и заметке о нём не место.

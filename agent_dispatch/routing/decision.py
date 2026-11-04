@@ -46,6 +46,7 @@ def _apply_capability_ceiling(
         corporate=decision.judgments.get("corporate_data"),
         min_confidence=settings.routing.corporate_min_confidence,
         configured=settings.executors,
+        prod=req.prod,
     )
     corporate = decision.judgments.get("corporate_data")
     judgment = decision.judgments.get("judgment")
@@ -78,9 +79,14 @@ async def decide_with_fallback(
 ) -> tuple[RouteDecision, list[GuardEvent]]:
     names = list(candidates)
     configured = settings.executors
-    perimeter = perimeter_applies(settings.routing.corporate_perimeter, configured)
-    if len(names) == 1 and not perimeter:
-        return single_candidate_decision(names[0]), []
+    perimeter = req.prod or perimeter_applies(settings.routing.corporate_perimeter, configured)
+    if len(names) == 1 and (req.prod or not perimeter):
+        # Задаче с `prod` ответ о корп. данных не нужен: пул уже сужен
+        # диспетчером, единственный кандидат и есть выбор.
+        decision = single_candidate_decision(names[0])
+        if req.prod:
+            decision.meta["perimeter"] = "prod"
+        return decision, []
     # При применимом периметре короткого пути нет: ответ о корп. данных решает
     # судьбу всей линии задачи (эскалации, вложенных задач). Без вопроса
     # пришлось бы либо выпускать её наружу, либо запирать в периметре вслепую;
@@ -91,7 +97,7 @@ async def decide_with_fallback(
             decision = await router.decide(req, candidates)
             decision = _apply_capability_ceiling(req, decision, candidates, settings)
             final, post_events = post_guards(
-                decision, settings, names, max_capability=req.max_capability
+                decision, settings, names, max_capability=req.max_capability, prod=req.prod
             )
             return final, events + post_events
         except RouterError as exc:
@@ -112,7 +118,9 @@ async def decide_with_fallback(
     )
     meta: dict[str, str | list[str]] = {}
     extra_events: list[GuardEvent] = []
-    if perimeter:
+    if req.prod:
+        meta["perimeter"] = "prod"
+    elif perimeter:
         meta["perimeter"] = "unknown"
         if any(item.corporate for item in pool.values()):
             notes.append(PERIMETER_UNKNOWN_NOTE)

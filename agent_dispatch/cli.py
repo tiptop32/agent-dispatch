@@ -134,6 +134,7 @@ def _request(
     allow_escalation: bool = True,
     kind: str = "task",
     verify: list[str] | None = None,
+    prod: bool = False,
 ) -> DispatchRequest:
     return DispatchRequest(
         task=task,
@@ -149,6 +150,7 @@ def _request(
         timeout_seconds=timeout,
         allow_escalation=allow_escalation,
         verify=verify or [],
+        prod=prod,
     )
 
 
@@ -175,6 +177,12 @@ def _print_task(view: TaskView, as_json: bool) -> None:
         typer.echo(f"still running: agent-dispatch status {view.task_id}")
 
 
+PROD_HELP = (
+    "The task touches production: the whole chain stays with `corporate: true` executors, "
+    "even with routing.corporate_perimeter off."
+)
+
+
 @app.command(help="Run the AgentDispatch daemon.")
 def serve() -> None:
     run_server(load_settings())
@@ -196,11 +204,21 @@ def route(
     kind: str = typer.Option(
         "task", help="task changes code; review reads the working copy and reports findings."
     ),
+    prod: bool = typer.Option(False, "--prod", help=PROD_HELP),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     decision = _daemon_call(
         "route",
-        _request(task, cwd, context, files, constraints, kind=kind, max_capability=max_capability),
+        _request(
+            task,
+            cwd,
+            context,
+            files,
+            constraints,
+            kind=kind,
+            max_capability=max_capability,
+            prod=prod,
+        ),
         start=True,
     )
     if as_json:
@@ -237,6 +255,7 @@ def dispatch(
         "--verify",
         help="Shell command the daemon runs after the executor; non-zero exit escalates.",
     ),
+    prod: bool = typer.Option(False, "--prod", help=PROD_HELP),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     views = asyncio.run(
@@ -255,6 +274,7 @@ def dispatch(
                 allow_escalation=not no_escalation,
                 kind=kind,
                 verify=verify,
+                prod=prod,
             ),
             wait,
             poll_seconds,

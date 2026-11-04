@@ -115,6 +115,10 @@ class DispatchRequest(_Model):
     #: Ревью работы исполнителя в worktree: работа уже закоммичена на ветке
     #: задачи, и `git diff HEAD` был бы пуст. None — диф против HEAD.
     review_base: str | None = Field(None, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_./~^@{}-]*$")
+    #: Задача трогает продовые системы: вся её линия (выбор, fallback,
+    #: эскалация, переадресация, follow-up, вложенные задачи) остаётся у
+    #: исполнителей `corporate: true`, даже при `routing.corporate_perimeter: false`.
+    prod: bool = False
 
     @field_validator("files")
     @classmethod

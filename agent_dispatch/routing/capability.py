@@ -70,8 +70,9 @@ class PerimeterVerdict:
     """Применим ли периметр к решению и почему.
 
     `required` значит, что пул сужен до `corporate: true`; `status` —
-    `answered` (по ответу Jev) или `unknown` (ответа нет, сужение fail closed);
-    оба пусты, когда периметр не применим.
+    `answered` (по ответу Jev), `unknown` (ответа нет, сужение fail closed)
+    или `prod` (флаг запроса, ответ не нужен); оба пусты, когда периметр не
+    применим.
     """
 
     required: bool
@@ -114,10 +115,16 @@ def perimeter_required(
     corporate: Judgment | None,
     min_confidence: float,
     configured: dict[str, ExecutorSettings] | None = None,
+    prod: bool = False,
 ) -> PerimeterVerdict:
     """Единственное место, решающее, применим ли периметр к решению.
 
-    Три случая. Периметр выключен или среди кандидатов нет `corporate: true` —
+    Задача с `prod` требует периметра всегда, независимо от
+    `routing.corporate_perimeter` и ответа Jev: решение уже принял владелец.
+    Нет корпоративных исполнителей — требование остаётся, отказ выносит
+    диспетчер.
+
+    Дальше три случая. Периметр выключен или среди кандидатов нет `corporate: true` —
     не применим. Ответ Jev есть — прежнее правило `narrows_to_perimeter`
     вместе с `corporate_min_confidence`. Ответа нет, пока периметр включён и
     корпоративные исполнители в пуле есть, — применим (fail closed): fallback
@@ -128,6 +135,8 @@ def perimeter_required(
     без него судят по `candidates`. Требование без корпоративных кандидатов
     остаётся требованием: отказ выносит диспетчер (`guard: perimeter`).
     """
+    if prod:
+        return PerimeterVerdict(required=True, status="prod")
     if not perimeter_applies(perimeter, {**(configured or {}), **candidates}):
         return PerimeterVerdict(required=False)
     if corporate is None:

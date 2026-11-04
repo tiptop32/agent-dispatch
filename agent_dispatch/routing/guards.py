@@ -212,6 +212,7 @@ def post_guards(
     candidates: list[str],
     *,
     max_capability: str | None = None,
+    prod: bool = False,
 ) -> tuple[RouteDecision, list[GuardEvent]]:
     result = decision.model_copy(deep=True)
     result.confidence_tier = classify_confidence(result.confidence, settings)
@@ -238,6 +239,7 @@ def post_guards(
         corporate=decision.judgments.get("corporate_data"),
         min_confidence=settings.routing.corporate_min_confidence,
         configured=settings.executors,
+        prod=prod,
     )
     if verdict.required:
         result.meta["perimeter"] = verdict.status

@@ -48,6 +48,11 @@ VERIFY_HINT = (
     "written for `cwd`): AgentDispatch runs them itself after the executor, and a "
     "failure counts as not done and escalates."
 )
+PROD_HINT = (
+    " Pass `prod=true` when the task touches production systems: the whole chain "
+    "(escalation, follow-up, nested tasks) stays with in-perimeter `corporate: true` "
+    "executors, and an explicit outside executor is refused."
+)
 
 
 def _source() -> SourceAgent:
@@ -263,7 +268,11 @@ def build_server(
         state = await result if inspect.isawaitable(result) else result
         return factory(state, wait + 30)
 
-    @server.tool(description="Choose the best executor for a task without running it. " + KIND_HINT)
+    @server.tool(
+        description="Choose the best executor for a task without running it. "
+        + KIND_HINT
+        + PROD_HINT
+    )
     async def route(
         task: str,
         cwd: str,
@@ -274,6 +283,7 @@ def build_server(
         context_mode: str = "prompt+summary",
         max_capability: Literal["fast", "balanced", "strong"] | None = None,
         kind: str = "task",
+        prod: bool = False,
         verbose: bool = False,
     ) -> str:
         try:
@@ -290,6 +300,7 @@ def build_server(
                     context_mode=ContextMode(context_mode),
                     max_capability=max_capability,
                     kind=kind,
+                    prod=prod,
                 )
             )
             if verbose:
@@ -319,6 +330,7 @@ def build_server(
         kind: str = "task",
         verify: list[str] | None = None,
         review_base: str | None = None,
+        prod: bool = False,
     ) -> str:
         try:
             wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
@@ -340,6 +352,7 @@ def build_server(
                 kind=kind,
                 verify=verify or [],
                 review_base=review_base,
+                prod=prod,
             )
             return _task_text(await client.submit(req), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
@@ -348,7 +361,10 @@ def build_server(
     @server.tool(
         description=(
             "Dispatch a coding task to the selected executor. Do not re-dispatch an "
-            "already delegated task unless escalation is allowed. " + KIND_HINT + VERIFY_HINT
+            "already delegated task unless escalation is allowed. "
+            + KIND_HINT
+            + VERIFY_HINT
+            + PROD_HINT
         )
     )
     async def dispatch(
@@ -366,6 +382,7 @@ def build_server(
         kind: str = "task",
         verify: list[str] | None = None,
         review_base: str | None = None,
+        prod: bool = False,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -385,6 +402,7 @@ def build_server(
             kind,
             verify,
             review_base,
+            prod,
         )
 
     @server.tool(
@@ -394,6 +412,7 @@ def build_server(
             "Executors out of usage limits are refused: call `executors` first. "
             + KIND_HINT
             + VERIFY_HINT
+            + PROD_HINT
         )
     )
     async def dispatch_to(
@@ -411,6 +430,7 @@ def build_server(
         kind: str = "task",
         verify: list[str] | None = None,
         review_base: str | None = None,
+        prod: bool = False,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -430,6 +450,7 @@ def build_server(
             kind,
             verify,
             review_base,
+            prod,
         )
 
     @server.tool(
