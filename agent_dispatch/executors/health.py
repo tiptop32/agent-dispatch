@@ -78,8 +78,15 @@ _ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
 
 
 def classify_failure(result: ExecutionResult) -> FailureKind | None:
-    """Вид сбоя исполнителя или None, если сбой относится к задаче."""
-    if result.status != "failed":
+    """Вид сбоя исполнителя или None, если сбой относится к задаче.
+
+    `partial` судится только с `meta.cli_error`: адаптер omp так помечает ход,
+    оборванный ошибкой CLI после правок. Работа сохранена, но исполнитель
+    неисправен так же, как при `failed`.
+    """
+    if result.status != "failed" and not (
+        result.status == "partial" and result.meta.get("cli_error")
+    ):
         return None
     error = result.error or ""
     for kind, pattern in _ERROR_PATTERNS:

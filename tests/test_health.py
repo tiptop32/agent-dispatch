@@ -108,6 +108,18 @@ def test_no_response_phrase_inside_another_error_does_not_count():
             ),
             id="not-failed",
         ),
+        pytest.param(
+            # `partial` без пометки адаптера: таймаут, ревью и прочее не судят исполнителя.
+            ExecutionResult(
+                status="partial",
+                executor="x",
+                model=None,
+                summary="ok",
+                error="Couldn't connect to 127.0.0.1:9 (connection refused)",
+                changed_files=["a.py"],
+            ),
+            id="partial-without-cli-error",
+        ),
     ],
 )
 def test_task_failures_do_not_blame_the_executor(result):

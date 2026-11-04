@@ -167,12 +167,16 @@ class OmpAdapter(BaseExecutorAdapter):
         if stop_error:
             # Сообщение хода с ошибкой пишет сам CLI о провайдере (badkey, down,
             # TLS), а не агент: `health.classify_failure` узнаёт его и остужает.
-            result = result.model_copy(
-                update={
-                    "status": "failed",
-                    "error": omp_error(outcome.stdout) or tail(outcome.stderr),
-                }
-            )
+            update: dict = {"error": omp_error(outcome.stdout) or tail(outcome.stderr)}
+            if changed:
+                # Ход оборвался после правок (например, `Codex websocket transport
+                # error`): работа в дереве есть, судит вызывающий по дифу, как
+                # при таймауте с изменениями. `meta.cli_error` сохраняет остывание.
+                update["status"] = "partial"
+                update["meta"] = {**result.meta, "cli_error": True}
+            else:
+                update["status"] = "failed"
+            result = result.model_copy(update=update)
         elif outcome.exit_code == 3:
             # omp сам остановил ход по потолку расходов (--max-cost). Повтор на
             # следующей задаче зависит от бюджета, а не от исполнителя: статус

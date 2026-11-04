@@ -309,3 +309,39 @@ def test_omp_fake_scripts_are_executable():
     for fake in (FAKE, FAKE_ENV):
         assert os.access(fake, os.X_OK)
         assert stat.S_IMODE(fake.stat().st_mode) & stat.S_IXUSR
+
+
+TRANSPORT_ERROR = "Codex websocket transport error: socket closed"
+
+
+def _stop_error_outcome(error: str | None = None) -> ProcessOutcome:
+    stdout = (FIXTURES / "down.ndjson").read_text()
+    if error is not None:
+        stdout = stdout.replace(
+            "Couldn't connect to 127.0.0.1:9 (connection refused). "
+            "Check that the server is running and reachable.",
+            error,
+        )
+    return ProcessOutcome(exit_code=1, stdout=stdout, stderr="", timed_out=False, duration_ms=5)
+
+
+def test_omp_transport_error_after_edits_keeps_the_work_as_partial():
+    result = adapter()._parse_result(_stop_error_outcome(TRANSPORT_ERROR), ["a.py"])
+    # Работа в дереве есть: судит вызывающий по дифу, как при таймауте с изменениями.
+    assert result.status == "partial"
+    assert result.error == TRANSPORT_ERROR
+    assert result.changed_files == ["a.py"]
+
+
+def test_omp_transport_error_without_edits_fails():
+    result = adapter()._parse_result(_stop_error_outcome(TRANSPORT_ERROR), [])
+    assert result.status == "failed"
+    assert result.error == TRANSPORT_ERROR
+
+
+@pytest.mark.parametrize("changed", [[], ["a.py"]], ids=["no-edits", "with-edits"])
+def test_omp_stop_error_cools_the_executor_with_or_without_edits(changed):
+    # Остывание по строке CLI не зависит от того, успел ли агент что-то поправить.
+    result = adapter()._parse_result(_stop_error_outcome(), changed)
+    assert result.error.startswith("Couldn't connect to 127.0.0.1:9 (connection refused)")
+    assert classify_failure(result) == "network"

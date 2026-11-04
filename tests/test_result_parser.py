@@ -260,3 +260,46 @@ def test_normalize_rejects_an_unknown_verdict():
     raw = {"status": "completed", "summary": "ok", "verdict": "maybe"}
     result = normalize(raw, outcome(), None, "omp", None)
     assert result.status == "partial" and "'maybe' is not one of" in result.meta["parse_error"]
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected"),
+    [
+        (["поправил a.py", "добавил тест"], "поправил a.py\nдобавил тест"),
+        ({"verdict": "ок", "notes": 2}, '{"verdict": "ок", "notes": 2}'),
+        (42, "42"),
+    ],
+    ids=["list", "object", "number"],
+)
+def test_normalize_turns_a_non_string_summary_into_text(summary, expected):
+    # Живой случай 2026-11-04: ревью omp/sol вернуло `summary` списком, и разбор
+    # падал `ValidationError`, теряя отчёт целиком.
+    raw = {"status": "completed", "summary": summary, "verdict": "pass"}
+    result = normalize(raw, outcome(), ["a.py"], "omp", None)
+
+    assert result.status == "completed"
+    assert result.summary == expected
+    assert result.verdict == "pass"
+    assert result.meta["coerced"] == [f"summary: {type(summary).__name__} -> str"]
+
+
+def test_normalize_non_string_summary_in_an_invalid_report_stays_partial():
+    raw = {"status": "running", "summary": ["шаг 1", "шаг 2"]}
+    result = normalize(raw, outcome(), None, "omp", None)
+
+    assert result.status == "partial"
+    assert result.summary == "шаг 1\nшаг 2"
+    assert result.meta["parse_error"]
+
+
+def test_normalize_turns_a_non_string_tests_command_into_text():
+    raw = {
+        "status": "completed",
+        "summary": "ok",
+        "tests": {"command": ["uv run pytest", "uv run ruff check ."], "result": "passed"},
+    }
+    result = normalize(raw, outcome(), None, "omp", None)
+
+    assert result.status == "completed"
+    assert result.tests.command == "uv run pytest\nuv run ruff check ."
+    assert result.tests.result == "passed"

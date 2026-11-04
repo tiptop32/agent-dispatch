@@ -126,6 +126,13 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
     что агент не соблюдал формат.
     """
     coerced: list[str] = []
+    # Текст отчёта модели присылают и списком пунктов, и объектом. Схема ждёт
+    # строку, а `ExecutionResult` с нестроковым `summary` ронял разбор целиком
+    # (живой случай 2026-11-04: ревью omp/sol, `summary` списком).
+    summary = raw.get("summary")
+    if summary is not None and not isinstance(summary, str):
+        raw = {**raw, "summary": _as_text(summary)}
+        coerced.append(f"summary: {type(summary).__name__} -> str")
     status = raw.get("status")
     if isinstance(status, str):
         status_aliases = {
@@ -155,6 +162,11 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
         tests = {name: value for name, value in tests.items() if name not in dropped}
         raw = {**raw, "tests": tests}
         coerced.extend(f"tests.{key}: None -> dropped" for key in dropped)
+    if isinstance(tests, dict) and "command" in tests and not isinstance(tests["command"], str):
+        command = tests["command"]
+        tests = {**tests, "command": _as_text(command)}
+        raw = {**raw, "tests": tests}
+        coerced.append(f"tests.command: {type(command).__name__} -> str")
     confidence = raw.get("confidence")
     if confidence is not None and not _is_unit_number(confidence):
         mapped_confidence = _coerce_confidence(confidence)
@@ -181,6 +193,13 @@ _OPTIONAL_FIELDS = ("changed_files", "tests", "confidence", "needs_escalation")
 
 #: Уверенность словами: модели пишут «high» вместо числа.
 _CONFIDENCE_WORDS = {"high": 0.9, "medium": 0.6, "moderate": 0.6, "low": 0.3}
+
+
+def _as_text(value: object) -> str:
+    """Строка из нестрокового поля отчёта: список строк построчно, иначе JSON."""
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return "\n".join(value)
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _is_unit_number(value: object) -> bool:
