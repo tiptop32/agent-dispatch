@@ -574,7 +574,13 @@ class Dispatcher:
             current_task_id=record.task_id,
         )
         if routing.guard and routing.guard.reason != GuardReason.user_override:
-            if inherited and routing.guard.reason == GuardReason.unavailable:
+            # У наследника prod `_route` уже назвал периметр prod: вторая фраза
+            # про предка в той же строке только путала бы.
+            if (
+                inherited
+                and routing.guard.reason == GuardReason.unavailable
+                and "corporate perimeter" not in (routing.guard.detail or "")
+            ):
                 routing.guard.detail += (
                     " inside the corporate perimeter inherited from an ancestor task"
                 )

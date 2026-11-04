@@ -234,7 +234,11 @@ def perimeter_violations(tasks: list[Task], corporate: Callable[[str], bool]) ->
 def _prod_section(tasks: list[Task], by_id: dict[str, Task]) -> dict:
     """Продовые задачи, включая отказы, и только состоявшиеся запуски."""
     prod = [task for task in tasks if _lineage_perimeter(task, by_id) == "prod"]
-    executors = Counter(task.executor for task in prod if not guard_refusal(task))
+    # Запуск это старт исполнителя: назначенная, но ждущая слот или отменённая
+    # до старта задача уже имеет исполнителя в БД, но запуском не была.
+    executors = Counter(
+        task.executor for task in prod if not guard_refusal(task) and task.started_at is not None
+    )
     verdicts: Counter[str] = Counter()
     fields: Counter[str] = Counter()
     redacted_tasks = replacements = 0

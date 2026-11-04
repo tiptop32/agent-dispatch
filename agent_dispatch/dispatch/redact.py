@@ -46,25 +46,38 @@ _PATTERNS: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]] = 
     ),
     # `схема://логин:пароль@хост`: пароль маскируется, схема, логин и хост
     # остаются. Логин бывает пустым (`redis://:пароль@`), пароль в base64
-    # содержит `/`; порт с путём (`host:8080/@scope`) паролем не считается.
+    # содержит `/`, некодированный `@` тоже бывает: пароль идёт до последнего
+    # `@` слова. Порт (`host:8080/@scope`, `host:8080?ref=a@b`) паролем не считается.
     (
-        re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:)(?!\d+/)[^\s@]+@"),
+        re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:)(?!\d+(?:[/?#]|$))\S+@(?=[^\s@]+)"),
         rf"\g<1>{MASK}@",
     ),
     (
         re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"),
         "[REDACTED JWT]",
     ),
+    # Значение заголовка `Authorization` секретно всегда, какое бы слово ни было
+    # токеном; эвристика `_bearer` ниже только для прозы.
+    (
+        re.compile(
+            r"(?i)\b(authorization[\"']?\s*[:=]\s*[\"']?(?:(?:bearer|basic|token|digest)\s+)?)"
+            r"[^\s\"',;]+"
+        ),
+        rf"\g<1>{MASK}",
+    ),
     (re.compile(r"\b(bearer\s+)([A-Za-z0-9._~+/-]+=*)", re.IGNORECASE), _bearer),
-    # Ключ кончается словом-секретом (`DB_PASSWORD`, `access_token`), поэтому
-    # `max_tokens=100` не трогается. `pwd` только после разделителя (`db_pwd`):
-    # `PWD=/path` и `OLDPWD` в выводе `env` это каталоги, а не пароли.
-    # Двоеточие только у ключа в кавычках (JSON): в прозе «token: expired» это
-    # не секрет.
+    # Ключи API провайдеров (`sk-...`, `sk-proj-...`, ключ agent-lb `sk-clb-...`).
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "[REDACTED KEY]"),
+    # Ключ кончается словом-секретом (`DB_PASSWORD`, `access_token`, `API_KEY`,
+    # `AWS_SECRET_ACCESS_KEY`), поэтому `max_tokens=100` и `monkey=` не трогаются.
+    # `pwd` только после разделителя (`db_pwd`): `PWD=/path` и `OLDPWD` в выводе
+    # `env` это каталоги, а не пароли. Двоеточие только у ключа в кавычках
+    # (JSON): в прозе «token: expired» это не секрет.
     (
         re.compile(
             r"""(?ix)
-            (\b[A-Za-z0-9_.-]*(?:password|passwd|[_.-]pwd|token|secret)
+            (\b[A-Za-z0-9_.-]*(?:password|passwd|[_.-]pwd|token|secret
+                |api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key)
              (?:\s*=\s*|["']\s*:\s*))
             ("[^"\n]*"|'[^'\n]*'|[^\s"'&,;]+)
             """

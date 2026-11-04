@@ -1380,9 +1380,15 @@ def test_prod_replay_aggregates_reviews_and_redactions_without_raw_data():
             kind="review",
         )
     )
+    # Исполнитель назначен, но запуска не было: задача ждёт слот или отменена
+    # до старта. В «runs only» такие не входят, в число продовых задач входят.
+    for task_id, status in (("waiting0", "running"), ("cancel00", "cancelled")):
+        tasks.append(
+            replace(_task(task_id, status, executor="internal"), prod=True, started_at=None)
+        )
     report = replay(tasks)["prod"]
     assert report == {
-        "tasks": 5,
+        "tasks": 7,
         "executors": {"internal": 4, "reviewer": 1},
         "review_verdicts": {"pass": 1, "fail": 1, "unknown": 1, "skipped": 1},
         "redacted": {"tasks": 4, "replacements": 10, "fields": {"summary": 4}},

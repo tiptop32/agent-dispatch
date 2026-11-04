@@ -331,6 +331,8 @@ def test_omp_transport_error_after_edits_keeps_the_work_as_partial():
     assert result.status == "partial"
     assert result.error == TRANSPORT_ERROR
     assert result.changed_files == ["a.py"]
+    # По этой метке classify_failure остужает исполнителя и у partial.
+    assert result.meta["cli_error"] is True
 
 
 def test_omp_transport_error_without_edits_fails():

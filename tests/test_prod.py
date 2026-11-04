@@ -255,6 +255,31 @@ async def test_nested_task_inherits_prod(tmp_path, git_repo, corporate_perimeter
 
 @PERIMETER
 @pytest.mark.asyncio
+async def test_nested_prod_without_corporate_executors_names_the_perimeter_once(
+    tmp_path, git_repo, corporate_perimeter
+):
+    """Наследник prod без доступных корпоративных: одна фраза о периметре, не две."""
+    settings = _settings(tmp_path, corporate_perimeter=corporate_perimeter)
+    storage, adapters, router, dispatcher = await _dispatcher(tmp_path, settings)
+    gate = asyncio.Event()
+    adapters[X5].gate = gate
+    parent = await dispatcher.submit(_request(git_repo, executor=X5))
+    await asyncio.wait_for(adapters[X5].started.wait(), WAIT)
+    for name in (X5, X5_FAST):
+        dispatcher.availability.trip(name, "rate_limit", "test", 600)
+
+    child = await _nested(dispatcher, adapters, git_repo, parent.task_id, None)
+    gate.set()
+    await dispatcher.wait(parent.task_id, WAIT)
+
+    assert child.status == "failed" and child.result.meta["guard"] == "unavailable"
+    assert child.result.error.count("corporate perimeter") == 1
+    assert not adapters[SOL].calls
+    await storage.close()
+
+
+@PERIMETER
+@pytest.mark.asyncio
 async def test_daemon_restart_keeps_the_requirement(tmp_path, git_repo, corporate_perimeter):
     """Новый демон над той же базой читает требование `prod` из записи предка."""
     settings = _settings(tmp_path, corporate_perimeter=corporate_perimeter)

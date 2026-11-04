@@ -118,6 +118,49 @@ def test_clean_result_gets_no_mark():
         pytest.param("header bearer x9.y", "x9.y", "bearer [REDACTED]", id="lower-with-digit"),
         pytest.param("db_pwd=hunter2 ok", "hunter2", "db_pwd=", id="db-pwd"),
         pytest.param("PASSWORD=hunter2", "hunter2", "PASSWORD=", id="upper-password"),
+        pytest.param(
+            "dsn mysql://root:p@ss@db.example/app",  # pragma: allowlist secret
+            "ss@db",
+            "mysql://root:[REDACTED]@db.example/app",
+            id="at-in-password",
+        ),
+        # В заголовке токен маскируется любой: похожий на слово тоже.
+        pytest.param(
+            "Authorization: Bearer abcdefgh",
+            "abcdefgh",
+            "Authorization: Bearer [REDACTED]",
+            id="header-word-token",
+        ),
+        pytest.param(
+            "authorization: bearer AbCdEfGh",
+            "AbCdEfGh",
+            "bearer [REDACTED]",
+            id="header-lowercase",
+        ),
+        pytest.param(
+            "Authorization: Basic dXNlcjpwYXNz",  # pragma: allowlist secret
+            "dXNlcjpwYXNz",  # pragma: allowlist secret
+            "Basic [REDACTED]",
+            id="header-basic",
+        ),
+        pytest.param(
+            "API_KEY=abc123def",  # pragma: allowlist secret
+            "abc123def",  # pragma: allowlist secret
+            "API_KEY=",
+            id="api-key",
+        ),
+        pytest.param(
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI",  # pragma: allowlist secret
+            "wJalrXUtnFEMI",  # pragma: allowlist secret
+            "AWS_SECRET_ACCESS_KEY=",
+            id="aws-secret-access-key",
+        ),
+        pytest.param(
+            "key sk-proj-AbCdEf0123456789xyz in log",  # pragma: allowlist secret
+            "AbCdEf0123456789xyz",  # pragma: allowlist secret
+            "[REDACTED KEY]",
+            id="sk-key",
+        ),
     ],
 )
 def test_edge_secrets_are_masked(text, secret, kept):
@@ -134,6 +177,8 @@ def test_edge_secrets_are_masked(text, secret, kept):
         "a bearer token goes into the header",
         "env PWD=/home/svc/app OLDPWD=/x",
         "http://host:8080/@scope/pkg",
+        "http://host:8080?ref=a@b",
+        "monkey=banana keyboard=us",
     ],
 )
 def test_edge_prose_is_left_alone(text):
