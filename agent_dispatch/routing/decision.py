@@ -91,6 +91,7 @@ def _prod_decision(req: DispatchRequest, candidates: dict[str, ExecutorSettings]
     if len(names) == 1:
         decision = single_candidate_decision(names[0])
         decision.meta["perimeter"] = "prod"
+        decision.meta["selection_notes"] = [PROD_ROUTERS_SKIPPED_NOTE]
         return decision
     selection = select(
         STATIC_BASELINE_TIER, candidates, max_capability=req.max_capability, corporate=True

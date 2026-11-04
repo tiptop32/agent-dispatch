@@ -854,7 +854,7 @@ class Dispatcher:
         await self._note_executor_failure(record, decision, result)
         if not review and req.verify and result.status in ("completed", "partial"):
             await self._verify(record, result, tree)
-        if not review and self._wants_review(record, decision, result):
+        if not review and await self._wants_review(record, decision, result):
             await self._review_work(record, decision, result, tree)
         # Ревью, после которого изменилась рабочая копия, не эскалируется:
         # иначе вызывающий получил бы ответ следующего ревьюера без
@@ -940,23 +940,29 @@ class Dispatcher:
                 # только артефакты проверки, а не отменяет результат исполнителя.
                 result.meta["verify_artifacts_kept"] = f"discard failed: {exc}"
 
-    def _wants_review(
+    async def _wants_review(
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
     ) -> bool:
-        """Правка исполнителя с `review_by` или `perimeter_review_by` закончена и что-то изменила.
+        """Законченная правка, которой положено ревью или отметка о его пропуске.
 
-        Упавшая проверка уже сделала результат `partial` и эскалирует его:
-        ревью тогда только тратило бы время. Задача без изменений ревьюеру
-        ничего не показала бы.
+        Ревью ставится исполнителю с `review_by` или `perimeter_review_by`.
+        Правка под периметром идёт в `_review_work` и без них: там она получает
+        `skipped` с причиной, иначе отсутствие корпоративного ревью не видно ни
+        в результате, ни в replay. Упавшая проверка уже сделала результат
+        `partial` и эскалирует его: ревью тогда только тратило бы время. Задача
+        без изменений ревьюеру ничего не показала бы.
         """
         configured = self.settings.executors.get(decision.executor)
-        return bool(
+        if not (
             configured is not None
-            and (configured.review_by or configured.perimeter_review_by)
             and record.request.kind == "task"
             and result.status == "completed"
             and result.changed_files
-        )
+        ):
+            return False
+        if configured.review_by or configured.perimeter_review_by:
+            return True
+        return await self._lineage_perimeter(record) is not None
 
     async def _review_work(
         self,

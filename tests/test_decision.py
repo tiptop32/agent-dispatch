@@ -461,3 +461,23 @@ async def test_all_routers_failed_and_nothing_within_ceiling_uses_the_fallback_c
     )
     assert d.executor == "second"
     assert any("ceiling was not applied" in note for note in d.meta["selection_notes"])
+
+
+@pytest.mark.asyncio
+async def test_prod_single_candidate_skips_routers_with_a_note():
+    """Единственный корпоративный кандидат: роутеры не зовутся, причина видна в решении."""
+    from agent_dispatch.routing.decision import PROD_ROUTERS_SKIPPED_NOTE
+
+    s = Settings.model_validate(
+        {
+            "routing": {"fallback_executor": "x5"},
+            "executors": {"x5": {"adapter": "omp", "model": "x5", "corporate": True}},
+        }
+    )
+    router = Counting("jev")
+    d, events = await decide_with_fallback(
+        DispatchRequest(task="x", cwd=".", prod=True), {"x5": s.executors["x5"]}, s, [router]
+    )
+    assert d.executor == "x5" and not events and router.calls == 0
+    assert d.meta["perimeter"] == "prod"
+    assert PROD_ROUTERS_SKIPPED_NOTE in d.meta["selection_notes"]

@@ -34,6 +34,21 @@ def _bearer(match: re.Match[str]) -> str:
     return f"{prefix}{MASK}{tail}" if secret else match.group(0)
 
 
+def _userinfo(match: re.Match[str]) -> str:
+    """Пароль строки подключения, но не порт хоста.
+
+    `host.example:8080/@scope` и `registry:8080?ref=a@b` по форме не отличить
+    от `логин:пароль@хост`. Портом считаются цифры только после имени хоста
+    (с точкой или `localhost`); иначе маскируем: лишняя маска дешевле пароля,
+    оставшегося в отчёте продовой задачи (`redis://:123/AbCd@cache`).
+    """
+    prefix, login, password = match.group(1), match.group(2), match.group(3)
+    host_like = "." in login or login.lower() == "localhost"
+    if host_like and re.match(r"\d+(?:[/?#]|$)", password):
+        return match.group(0)
+    return f"{prefix}{MASK}@"
+
+
 #: Порядок важен: PEM и строки подключения целиком раньше пар `key=value`,
 #: JWT раньше `Bearer`, чтобы один секрет не считался дважды.
 _PATTERNS: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]] = [
@@ -47,10 +62,10 @@ _PATTERNS: list[tuple[re.Pattern[str], str | Callable[[re.Match[str]], str]]] = 
     # `схема://логин:пароль@хост`: пароль маскируется, схема, логин и хост
     # остаются. Логин бывает пустым (`redis://:пароль@`), пароль в base64
     # содержит `/`, некодированный `@` тоже бывает: пароль идёт до последнего
-    # `@` слова. Порт (`host:8080/@scope`, `host:8080?ref=a@b`) паролем не считается.
+    # `@` слова. Порт после имени хоста паролем не считается (`_userinfo`).
     (
-        re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:)(?!\d+(?:[/?#]|$))\S+@(?=[^\s@]+)"),
-        rf"\g<1>{MASK}@",
+        re.compile(r"\b([A-Za-z][A-Za-z0-9+.-]*://([^\s:/@]*):)(\S+)@(?=[^\s@]+)"),
+        _userinfo,
     ),
     (
         re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"),

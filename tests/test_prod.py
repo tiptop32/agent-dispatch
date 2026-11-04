@@ -424,6 +424,68 @@ async def test_prod_review_goes_to_the_corporate_reviewer(tmp_path, git_repo, co
 
 @PERIMETER
 @pytest.mark.asyncio
+async def test_only_perimeter_review_by_reviews_prod_work(tmp_path, git_repo, corporate_perimeter):
+    """Конфиг владельца из Post-Completion: только `perimeter_review_by`, без `review_by`."""
+    settings = _settings(tmp_path, corporate_perimeter=corporate_perimeter)
+    settings.executors[X5].perimeter_review_by = X5
+    storage, adapters, _, dispatcher = await _dispatcher(tmp_path, settings)
+    review = ExecutionResult(
+        status="completed", executor=X5, model=None, summary="looks right", verdict="pass"
+    )
+    _work_then_review(adapters[X5], _prod_work(), review)
+
+    task = await dispatcher.submit(_request(git_repo, executor=X5))
+    done = await dispatcher.wait(task.task_id, WAIT)
+
+    assert done.result.meta["review"]["by"] == X5
+    assert done.result.meta["review"]["verdict"] == "pass"
+    assert len(adapters[X5].calls) == 2
+    await storage.close()
+
+
+@PERIMETER
+@pytest.mark.asyncio
+async def test_only_perimeter_review_by_skips_work_outside_the_perimeter(
+    tmp_path, git_repo, corporate_perimeter
+):
+    settings = _settings(tmp_path, corporate_perimeter=corporate_perimeter)
+    settings.executors[X5].perimeter_review_by = X5
+    storage, adapters, _, dispatcher = await _dispatcher(
+        tmp_path, settings, results={X5: _prod_work()}
+    )
+
+    task = await dispatcher.submit(_request(git_repo, executor=X5, prod=False))
+    done = await dispatcher.wait(task.task_id, WAIT)
+
+    assert done.status == "completed"
+    assert "review" not in done.result.meta
+    assert len(adapters[X5].calls) == 1
+    await storage.close()
+
+
+@PERIMETER
+@pytest.mark.asyncio
+async def test_prod_work_without_any_reviewer_setting_is_marked_skipped(
+    tmp_path, git_repo, corporate_perimeter
+):
+    """Поставляемый конфиг: оба ключа закомментированы. Пропуск ревью виден в результате."""
+    settings = _settings(tmp_path, corporate_perimeter=corporate_perimeter)
+    storage, adapters, _, dispatcher = await _dispatcher(
+        tmp_path, settings, results={X5: _prod_work()}
+    )
+
+    task = await dispatcher.submit(_request(git_repo, executor=X5))
+    done = await dispatcher.wait(task.task_id, WAIT)
+
+    assert done.status == "completed"
+    assert done.result.meta["review"]["verdict"] == "skipped"
+    assert done.result.meta["review"]["reason"] == "perimeter: no corporate reviewer"
+    assert len(adapters[X5].calls) == 1
+    await storage.close()
+
+
+@PERIMETER
+@pytest.mark.asyncio
 async def test_prod_review_without_corporate_reviewer_is_skipped(
     tmp_path, git_repo, corporate_perimeter
 ):

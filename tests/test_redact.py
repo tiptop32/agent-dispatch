@@ -118,6 +118,19 @@ def test_clean_result_gets_no_mark():
         pytest.param("header bearer x9.y", "x9.y", "bearer [REDACTED]", id="lower-with-digit"),
         pytest.param("db_pwd=hunter2 ok", "hunter2", "db_pwd=", id="db-pwd"),
         pytest.param("PASSWORD=hunter2", "hunter2", "PASSWORD=", id="upper-password"),
+        # Пароль из цифр и `/` похож на порт с путём, но хоста перед ним нет.
+        pytest.param(
+            "cache redis://:123/AbCd@cache.example/0",  # pragma: allowlist secret
+            "123/AbCd",  # pragma: allowlist secret
+            "redis://:[REDACTED]@cache.example/0",
+            id="digit-slash-password-empty-login",
+        ),
+        pytest.param(
+            "db postgres://svc:123/AbCd@db.example/x",  # pragma: allowlist secret
+            "123/AbCd",  # pragma: allowlist secret
+            "postgres://svc:[REDACTED]@db.example/x",
+            id="digit-slash-password",
+        ),
         pytest.param(
             "dsn mysql://root:p@ss@db.example/app",  # pragma: allowlist secret
             "ss@db",
@@ -176,8 +189,9 @@ def test_edge_secrets_are_masked(text, secret, kept):
         "Bearer token is required.",
         "a bearer token goes into the header",
         "env PWD=/home/svc/app OLDPWD=/x",
-        "http://host:8080/@scope/pkg",
-        "http://host:8080?ref=a@b",
+        "http://registry.example:8080/@scope/pkg",
+        "http://registry.example:8080?ref=a@b",
+        "http://localhost:3000/@scope/pkg",
         "monkey=banana keyboard=us",
     ],
 )
