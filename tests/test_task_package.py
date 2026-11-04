@@ -304,3 +304,31 @@ def test_review_base_rejects_options_and_shell_text(base):
 )
 def test_review_base_accepts_refs_and_shas(base):
     assert request(kind="review", review_base=base).review_base == base
+
+
+REFUSAL_RULE = "A refused tool call is not an obstacle to work around."
+
+
+@pytest.mark.parametrize("kind", ["task", "review"])
+def test_every_prompt_forbids_working_around_a_refused_tool(kind):
+    package = TaskPackage(request=request(kind=kind))
+    rendered = render_prompt(package, "omp", settings())
+    assert REFUSAL_RULE in rendered and "`eval`" in rendered
+    assert "# Prod data rule" not in rendered
+
+
+@pytest.mark.parametrize(
+    "package",
+    [
+        TaskPackage(request=request(prod=True)),
+        # Ревью и вложенные задачи линии `prod` флага не несут: его ставит демон.
+        TaskPackage(request=request(kind="review"), prod=True),
+    ],
+    ids=["prod-request", "prod-lineage-review"],
+)
+def test_prod_prompt_carries_the_data_rule(package):
+    rendered = render_prompt(package, "omp", settings())
+    assert "# Prod data rule" in rendered
+    assert "conclusions and numbers only" in rendered
+    assert "tokens, passwords, keys" in rendered and "personal data" in rendered
+    assert REFUSAL_RULE in rendered

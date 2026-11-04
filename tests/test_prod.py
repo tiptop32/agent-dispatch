@@ -343,3 +343,129 @@ def test_cli_sends_prod(tmp_config_dir, monkeypatch, command):
 
     assert result.exit_code == 0, result.output
     assert json.loads(request.calls[0].request.content)["prod"] is True
+
+
+def _work_then_review(adapter: FakeAdapter, work: ExecutionResult, review: ExecutionResult) -> None:
+    """Один исполнитель делает правку и сам же её ревьюит вторым запуском."""
+
+    async def pick(ctx) -> None:
+        adapter.result = review if ctx.read_only else work
+
+    adapter.on_execute = pick
+
+
+def _prod_work(summary: str = "done", **kwargs) -> ExecutionResult:
+    return ExecutionResult(
+        status="completed",
+        executor=X5,
+        model=None,
+        summary=summary,
+        changed_files=["a.py"],
+        **kwargs,
+    )
+
+
+@PERIMETER
+@pytest.mark.asyncio
+async def test_prod_review_goes_to_the_corporate_reviewer(tmp_path, git_repo, corporate_perimeter):
+    """`perimeter_review_by` указывает на себя: ревьюит второй запуск x5, sol не зовётся."""
+    settings = _settings(tmp_path, corporate_perimeter=corporate_perimeter)
+    settings.executors[X5].review_by = SOL
+    settings.executors[X5].perimeter_review_by = X5
+    storage, adapters, _, dispatcher = await _dispatcher(tmp_path, settings)
+    review = ExecutionResult(
+        status="completed", executor=X5, model=None, summary="looks right", verdict="pass"
+    )
+    _work_then_review(adapters[X5], _prod_work(), review)
+
+    task = await dispatcher.submit(_request(git_repo, executor=X5))
+    done = await dispatcher.wait(task.task_id, WAIT)
+
+    assert done.status == "completed"
+    assert done.result.meta["review"]["by"] == X5
+    assert done.result.meta["review"]["verdict"] == "pass"
+    assert not adapters[SOL].calls
+    work_ctx, review_ctx = adapters[X5].calls
+    assert not work_ctx.read_only and review_ctx.read_only
+    # Правило данных у исполнителя и у ревьюера, хотя флага `prod` у ревью нет.
+    assert "# Prod data rule" in work_ctx.prompt and "# Prod data rule" in review_ctx.prompt
+    child = await storage.get_task(done.result.meta["review"]["task_id"])
+    assert not child.request.prod and child.decision.meta["perimeter"] == "prod"
+    await storage.close()
+
+
+@PERIMETER
+@pytest.mark.asyncio
+async def test_prod_review_without_corporate_reviewer_is_skipped(
+    tmp_path, git_repo, corporate_perimeter
+):
+    settings = _settings(tmp_path, corporate_perimeter=corporate_perimeter)
+    settings.executors[X5].review_by = SOL
+    storage, adapters, _, dispatcher = await _dispatcher(
+        tmp_path, settings, results={X5: _prod_work()}
+    )
+
+    task = await dispatcher.submit(_request(git_repo, executor=X5))
+    done = await dispatcher.wait(task.task_id, WAIT)
+
+    assert done.status == "completed"
+    review = done.result.meta["review"]
+    assert review["verdict"] == "skipped"
+    assert review["reason"] == "perimeter: no corporate reviewer"
+    # Внешний ревьюер не ставится вовсе, а не отказывается guard'ом.
+    assert review.get("task_id") is None
+    assert not adapters[SOL].calls and len(adapters[X5].calls) == 1
+    assert not [t for t in await storage.list_tasks() if t.parent_task_id == task.task_id]
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_prod_report_is_redacted_before_it_is_stored(tmp_path, git_repo):
+    settings = _settings(tmp_path, corporate_perimeter=True)
+    work = _prod_work(
+        summary=(
+            "checked 42 orders; db "
+            "postgres://svc:hunter2@db.example:5432/orders"  # pragma: allowlist secret
+        ),
+        error="curl failed: Authorization: Bearer abcdef1234567890",
+    )
+    storage, _, _, dispatcher = await _dispatcher(tmp_path, settings, results={X5: work})
+
+    task = await dispatcher.submit(_request(git_repo, executor=X5))
+    await dispatcher.wait(task.task_id, WAIT)
+    stored = await storage.get_task(task.task_id)
+
+    assert "hunter2" not in stored.result.summary and "checked 42 orders" in stored.result.summary
+    assert "abcdef1234567890" not in stored.result.error  # pragma: allowlist secret
+    assert stored.result.meta["redacted"] == {"replacements": 2, "fields": ["summary", "error"]}
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_report_outside_prod_is_not_redacted(tmp_path, git_repo):
+    settings = _settings(tmp_path, corporate_perimeter=True)
+    summary = "local test db postgres://dev:dev@localhost/test"  # pragma: allowlist secret
+    storage, _, _, dispatcher = await _dispatcher(
+        tmp_path, settings, results={X5: _prod_work(summary=summary)}
+    )
+
+    task = await dispatcher.submit(_request(git_repo, executor=X5, prod=False))
+    stored = await dispatcher.wait(task.task_id, WAIT)
+
+    assert stored.result.summary == summary and "redacted" not in stored.result.meta
+    await storage.close()
+
+
+def test_perimeter_reviewer_must_be_corporate(tmp_path):
+    settings = _settings(tmp_path, corporate_perimeter=True)
+    data = settings.model_dump()
+    data["executors"][X5]["perimeter_review_by"] = X5
+    assert Settings.model_validate(data).executors[X5].perimeter_review_by == X5
+    data["executors"][X5]["perimeter_review_by"] = SOL
+    with pytest.raises(
+        ValueError, match=r"perimeter_review_by: 'omp/sol' is not `corporate: true`"
+    ):
+        Settings.model_validate(data)
+    data["executors"][X5]["perimeter_review_by"] = "ghost"
+    with pytest.raises(ValueError, match="perimeter_review_by: unknown executor 'ghost'"):
+        Settings.model_validate(data)

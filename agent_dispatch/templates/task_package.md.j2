@@ -24,6 +24,11 @@ $ git status --short
 $ git diff {{ diff_base }}
 {{ git_diff or "(no changes against " ~ diff_base ~ ")" }}
 {% endif %}
+{% if prod %}
+
+# Prod data rule
+This task touches production systems. Answer with conclusions and numbers only: counts, statuses, which check passed or failed and why. Do NOT put table rows, whole logs, tokens, passwords, keys, connection strings or personal data (names, phones, emails, addresses) into your messages, the report or any file. Quote at most the one line that proves a conclusion, with secrets and personal data masked. AgentDispatch also masks obvious secrets in the report, but that is a safety net, not permission.
+{% endif %}
 
 # Workspace
 cwd: {{ cwd }}
@@ -63,6 +68,8 @@ This task was delegated by {{ source_agent }} via AgentDispatch (hop {{ hop }} o
 
 # Rules
 {% if review %}Do not edit files, commit or push.{% else %}Do not commit or push: leave all changes in the working tree, the caller reviews and commits.{% endif %}
+
+A refused tool call is not an obstacle to work around. If a hook, guard or sandbox refuses a call, do not look for another path to the same action (another tool, `eval`, a script written to a file, a different shell): stop that action and put the refusal and its reason in the report.
 
 
 # Result format

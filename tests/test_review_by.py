@@ -297,6 +297,31 @@ async def test_perimeter_is_stronger_than_the_review(tmp_path, git_repo):
     assert not adapters["rev"].calls
 
 
+@pytest.mark.asyncio
+async def test_perimeter_task_is_reviewed_by_the_corporate_reviewer(tmp_path, git_repo):
+    storage, adapters, dispatcher = await _make(tmp_path)
+    dispatcher.settings.executors["omp"].corporate = True
+    dispatcher.settings.executors["claude"].corporate = True
+    dispatcher.settings.executors["omp"].perimeter_review_by = "claude"
+    dispatcher.adapters["claude"].result = _review("pass")
+    dispatcher.routers = [
+        FakeRouter(
+            RouteDecision(
+                router=RouterKind.jev, executor="omp", confidence=0.99, scores={"omp": 0.99}
+            )
+        )
+    ]
+    record = await dispatcher.submit(_req(git_repo, executor=None))
+    done = await dispatcher.wait(record.task_id, WAIT)
+
+    assert done.decision.meta["perimeter"] == "unknown"
+    review = done.result.meta["review"]
+    assert review["by"] == "claude" and review["verdict"] == "pass"
+    assert not adapters["rev"].calls
+    (ctx,) = adapters["claude"].calls
+    assert ctx.read_only and "A refused tool call is not an obstacle" in ctx.prompt
+
+
 async def _review_child(storage: Storage, parent_id: str):
     tasks = await storage.list_tasks(limit=100)
     (child,) = [task for task in tasks if task.parent_task_id == parent_id]

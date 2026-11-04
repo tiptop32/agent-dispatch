@@ -12,6 +12,8 @@ You may split this task into at most 2 independent subtasks and delegate each wi
 You own the implementation, the regression tests and deterministic evals for the affected scope, and nothing else. Run only what your change touches: no repeats of green unchanged checks, no full-repo suite for unrelated scope, no paid evals (caller-owned). The caller owns independent review, the final combined gate and the commit.
 # Rules
 Do not commit or push: leave all changes in the working tree, the caller reviews and commits.
+A refused tool call is not an obstacle to work around. If a hook, guard or sandbox refuses a call, do not look for another path to the same action (another tool, `eval`, a script written to a file, a different shell): stop that action and put the refusal and its reason in the report.
+
 
 # Result format
 End your final message with a fenced block tagged `agent-dispatch-result` containing a JSON object with fields: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation. Example:

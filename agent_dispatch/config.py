@@ -194,6 +194,11 @@ class ExecutorSettings(_ConfigModel):
     #: Исполнитель, который демон зовёт на ревью законченной правки этого
     #: исполнителя до интеграции (`Dispatcher._review_work`). `fail` эскалирует.
     review_by: str | None = None
+    #: Ревьюер правки задачи под периметром (своим, предка или `prod`) вместо
+    #: `review_by`: обязан быть `corporate: true`, может быть самим исполнителем
+    #: (второй экземпляр в режиме только чтения с чистым контекстом). Без него
+    #: ревью такой задачи `skipped`, внешний `review_by` не зовётся.
+    perimeter_review_by: str | None = None
 
     @model_validator(mode="after")
     def validate_adapter(self) -> ExecutorSettings:
@@ -249,6 +254,18 @@ class Settings(_ConfigModel):
                 raise ValueError(f"executors.{name}.review_by: unknown executor {item.review_by!r}")
             if item.review_by == name:
                 raise ValueError(f"executors.{name}.review_by: an executor cannot review itself")
+        for name, item in self.executors.items():
+            reviewer = item.perimeter_review_by
+            if reviewer is None:
+                continue
+            if reviewer not in names:
+                raise ValueError(
+                    f"executors.{name}.perimeter_review_by: unknown executor {reviewer!r}"
+                )
+            if not self.executors[reviewer].corporate:
+                raise ValueError(
+                    f"executors.{name}.perimeter_review_by: {reviewer!r} is not `corporate: true`"
+                )
         return self
 
     def timeout_for(self, executor: str, requested: int | None = None) -> int:

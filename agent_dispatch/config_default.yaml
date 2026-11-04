@@ -112,6 +112,7 @@ executors:
     corporate: true  # copilot-x5: корпоративный периметр данных
     description: "omp с X5 Airun Code Large через copilot-x5: корпоративные данные не уходят за периметр"
     # review_by: omp/sol  # ревью законченной правки до интеграции, fail эскалирует
+    # perimeter_review_by: omp/x5-code-large  # ревью задач под периметром и prod: только corporate, можно себя
   omp/x5-small-coder:
     adapter: omp
     command: omp

@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_dispatch.config import Settings
-from agent_dispatch.dispatch import followup, report_recovery, verify
+from agent_dispatch.dispatch import followup, redact, report_recovery, verify
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import (
     Followup,
@@ -914,7 +914,7 @@ class Dispatcher:
     def _wants_review(
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
     ) -> bool:
-        """Правка исполнителя с `review_by` закончена и что-то изменила.
+        """Правка исполнителя с `review_by` или `perimeter_review_by` закончена и что-то изменила.
 
         Упавшая проверка уже сделала результат `partial` и эскалирует его:
         ревью тогда только тратило бы время. Задача без изменений ревьюеру
@@ -923,7 +923,7 @@ class Dispatcher:
         configured = self.settings.executors.get(decision.executor)
         return bool(
             configured is not None
-            and configured.review_by
+            and (configured.review_by or configured.perimeter_review_by)
             and record.request.kind == "task"
             and result.status == "completed"
             and result.changed_files
@@ -944,9 +944,31 @@ class Dispatcher:
         вызывающего и рассуждения исполнителя в его контекст не попадают.
         Отказ, сбой или срыв срока ревью работу не держат: итог `skipped`.
         `fail` делает результат `partial`, дальше работает эскалация.
+
+        Задача под периметром (своим, предка или `prod`) идёт только к
+        `perimeter_review_by`. Без него ревью `skipped`, а внешний `review_by`
+        не ставится вовсе: отказ guard'а `_perimeter_refusal` остаётся вторым
+        рубежом, а не единственным.
         """
         req, task_id = record.request, record.task_id
-        reviewer = self.settings.executors[decision.executor].review_by or ""
+        configured = self.settings.executors[decision.executor]
+        if await self._lineage_perimeter(record) is not None:
+            reviewer = configured.perimeter_review_by or ""
+            reviewer_settings = self.settings.executors.get(reviewer)
+            if reviewer_settings is None or not reviewer_settings.corporate:
+                self._note_review(
+                    result,
+                    reviewer or configured.review_by or "",
+                    None,
+                    "skipped",
+                    reason="perimeter: no corporate reviewer",
+                )
+                return
+        elif configured.review_by:
+            reviewer = configured.review_by
+        else:
+            # Только `perimeter_review_by`: задачу вне периметра не ревьюят.
+            return
         cwd, base, task = req.cwd, None, req.task
         scope = ""
         if tree is not None:
@@ -1200,7 +1222,10 @@ class Dispatcher:
             str(tree.path) if tree else None,
             tree.branch if tree else None,
         )
-        package = package.model_copy(update={"executor": decision.executor})
+        # `perimeter: prod` несёт вся линия задачи: вложенные задачи и ревью
+        # получают правило данных, хотя флага `prod` в своём запросе не имеют.
+        prod = req.prod or decision.meta.get("perimeter") == "prod"
+        package = package.model_copy(update={"executor": decision.executor, "prod": prod})
         session = None
         if req.followup_of:
             attempt, session = await self._followup(req, decision, tree, resume=resume)
@@ -1503,6 +1528,10 @@ class Dispatcher:
         plan: EscalationPlan | None = None,
     ) -> None:
         """Записать результат, при необходимости эскалировать, разбудить ожидающих."""
+        if record.request.prod or decision.meta.get("perimeter") == "prod":
+            # Отчёт продовой задачи читают вызывающий и следующие звенья: явные
+            # секреты маскируются до записи и до передачи в эскалацию.
+            redact.redact_result(result)
         record.result = result
         record.status, record.finished_at = TaskStatus(result.status), self._now()
         if plan is not None:

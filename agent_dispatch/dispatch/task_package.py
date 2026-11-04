@@ -55,6 +55,8 @@ class TaskPackage(BaseModel):
     followup: Followup | None = None
     #: Выбранный исполнитель: бюджет времени в промпте равен его таймауту.
     executor: str | None = None
+    #: Задача из продовой линии: промпт получает правило данных.
+    prod: bool = False
 
 
 def _git(cwd: str, args: list[str]) -> str:
@@ -191,6 +193,7 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         followup=followup,
         task=task,
         review=req.kind == "review",
+        prod=package.prod or req.prod,
         cwd=worktree or req.cwd,
         repo=req.cwd,
         worktree=bool(worktree),
