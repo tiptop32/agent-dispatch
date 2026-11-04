@@ -70,9 +70,9 @@
 **Depends on:** Task 2
 **Complexity:** normal
 
-- [ ] `evals.replay`: `perimeter_violations` учитывает требование `prod`. Новая секция `prod`: число продовых задач, исполнители, вердикты ревью, сработавшие очистки
-- [ ] `CLAUDE.md`: правило про `prod` (всегда периметр, независимо от `corporate_perimeter`; корпоративное ревью; правило данных и очистка)
-- [ ] `docs/architecture.md` и `evals/README.md`: то же для читателя
+- [x] `evals.replay`: `perimeter_violations` учитывает требование `prod`. Новая секция `prod`: число продовых задач, исполнители, вердикты ревью, сработавшие очистки
+- [x] `CLAUDE.md`: правило про `prod` (всегда периметр, независимо от `corporate_perimeter`; корпоративное ревью; правило данных и очистка)
+- [x] `docs/architecture.md` и `evals/README.md`: то же для читателя
 
 ### Task 4: разбор отчёта omp не теряет выполненную работу
 **Files:**

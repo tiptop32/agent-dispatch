@@ -1266,6 +1266,129 @@ def test_perimeter_violations_follow_the_whole_lineage():
     assert {row["task_id"] for row in report["runs"]} == {"leak0000", "nest0000", "foll0000"}
 
 
+@pytest.mark.parametrize("link", ["escalated_from", "followup_of", "parent_task_id"])
+def test_prod_replay_includes_refused_requests_and_unmarked_descendants(tmp_path, link):
+    """Отказ до decision не скрывает prod и требование у последующих звеньев."""
+    db = _db(
+        tmp_path,
+        [
+            (
+                "root0000",
+                "",
+                "10:00",
+                "10:01",
+                0,
+                None,
+                _result("failed", meta={"guard": "perimeter"}),
+            ),
+            (
+                "child000",
+                "external",
+                "10:02",
+                "10:03",
+                1,
+                None,
+                _result(
+                    "completed",
+                    meta={
+                        "review": {
+                            "verdict": "skipped",
+                            "reason": "perimeter: no corporate reviewer",
+                        },
+                        "redacted": {"replacements": 3, "fields": ["summary", "error"]},
+                    },
+                ),
+            ),
+            ("free0000", "external", "10:04", "10:05", 1, None, _result("completed")),
+        ],
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "update tasks set request_json = ? where task_id = 'root0000'",
+            (json.dumps({"prod": True}),),
+        )
+        if link == "followup_of":
+            conn.execute(
+                "update tasks set request_json = ? where task_id = 'child000'",
+                (json.dumps({link: "root0000"}),),
+            )
+        else:
+            conn.execute(f"update tasks set {link} = 'root0000' where task_id = 'child000'")
+    tasks = load(db)
+    assert perimeter_violations(tasks, lambda _: False) == {
+        "count": 1,
+        "runs": [{"task_id": "child000", "executor": "external", "perimeter": "prod"}],
+    }
+    report = replay(tasks)
+    assert report["prod"] == {
+        "tasks": 2,
+        "executors": {"external": 1},
+        "review_verdicts": {"pass": 0, "fail": 0, "unknown": 0, "skipped": 1},
+        "redacted": {"tasks": 1, "replacements": 3, "fields": {"summary": 1, "error": 1}},
+    }
+    assert "prod tasks: 2" in render(report)
+    # CLI отбирает окно после load: prod-предок уже не виден, но правило осталось.
+    window = [task for task in tasks if task.task_id != "root0000"]
+    assert replay(window)["prod"]["tasks"] == 1
+    assert perimeter_violations(window, lambda _: False)["runs"] == [
+        {"task_id": "child000", "executor": "external", "perimeter": "prod"}
+    ]
+
+
+def test_prod_lineage_overrides_other_perimeter_marks_and_survives_cycles():
+    root = replace(_task("root0000", "completed"), perimeter="prod")
+    child = replace(_task("child000", "completed", parent="root0000"), perimeter="answered")
+    root.parent_task_id = child.task_id
+    orphan = replace(_task("orphan00", "completed", parent="missing"), perimeter="unknown")
+    report = perimeter_violations([child, orphan, root], lambda _: False)
+    assert [row["perimeter"] for row in report["runs"]] == ["prod", "unknown", "prod"]
+    assert replay([child, orphan, root])["prod"]["tasks"] == 2
+
+
+def test_prod_replay_empty_section():
+    assert replay([])["prod"] == {
+        "tasks": 0,
+        "executors": {},
+        "review_verdicts": {"pass": 0, "fail": 0, "unknown": 0, "skipped": 0},
+        "redacted": {"tasks": 0, "replacements": 0, "fields": {}},
+    }
+
+
+def test_prod_replay_aggregates_reviews_and_redactions_without_raw_data():
+    tasks = []
+    for index, verdict in enumerate(("pass", "fail", "unknown", "skipped")):
+        tasks.append(
+            replace(
+                _task(
+                    f"prod000{index}",
+                    "completed",
+                    executor="internal",
+                    result=_result(
+                        "completed",
+                        meta={
+                            "review": {"verdict": verdict},
+                            "redacted": {"replacements": index + 1, "fields": ["summary"]},
+                        },
+                    ),
+                ),
+                prod=True,
+            )
+        )
+    tasks.append(
+        replace(
+            _task("review00", "completed", executor="reviewer", parent_task_id="prod0000"),
+            kind="review",
+        )
+    )
+    report = replay(tasks)["prod"]
+    assert report == {
+        "tasks": 5,
+        "executors": {"internal": 4, "reviewer": 1},
+        "review_verdicts": {"pass": 1, "fail": 1, "unknown": 1, "skipped": 1},
+        "redacted": {"tasks": 4, "replacements": 10, "fields": {"summary": 4}},
+    }
+
+
 @pytest.mark.parametrize("count", [0, 1, 2])
 def test_queue_policy_metrics_exclude_legacy_and_handle_small_samples(tmp_path, count):
     db = _db(tmp_path, [("a" * 32, "codex/sol", "10:00", "10:01", 1, None, _result("completed"))])

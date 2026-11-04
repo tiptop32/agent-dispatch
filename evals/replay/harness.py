@@ -98,11 +98,13 @@ class Task:
     events: list[dict] = field(default_factory=list)
     #: Общий git dir cwd из события `git` при `submit`; у задач до него None.
     git_common_dir: str | None = None
-    #: `decision.meta.perimeter` задачи (`answered`/`unknown`) или None.
+    #: Требование периметра (`answered`/`unknown`/`prod`) или None.
     perimeter: str | None = None
     followup_of: str | None = None
     #: Явные оценки вызывающего, сохранённые через `/tasks/{id}/feedback`.
     feedback: list[dict] = field(default_factory=list)
+    #: Флаг запроса, доступный и при отказе до записи решения роутера.
+    prod: bool = False
 
 
 @dataclass
@@ -135,7 +137,8 @@ def load(db_path: Path) -> list[Task]:
             " coalesce(duration_ms, 0), escalated_from, result_json, source_agent,"
             " coalesce(json_extract(request_json, '$.kind'), 'task'), cwd, parent_task_id,"
             " json_extract(decision_json, '$.meta.perimeter'),"
-            " json_extract(request_json, '$.followup_of')"
+            " json_extract(request_json, '$.followup_of'),"
+            " coalesce(json_extract(request_json, '$.prod'), 0)"
             " from tasks order by created_at"
         ).fetchall()
         # Только нужные события: таблица растёт с каждой задачей.
@@ -155,7 +158,7 @@ def load(db_path: Path) -> list[Task]:
             git[task_id] = data["common_dir"]
         elif kind == "feedback":
             feedback.setdefault(task_id, []).append({"ts": ts, **data})
-    return [
+    tasks = [
         Task(
             task_id=row[0],
             executor=row[1],
@@ -175,45 +178,87 @@ def load(db_path: Path) -> list[Task]:
             perimeter=row[13],
             followup_of=row[14],
             feedback=feedback.get(row[0], []),
+            prod=bool(row[15]),
         )
         for row in rows
     ]
+    by_id = {task.task_id: task for task in tasks}
+    # CLI фильтрует --since после load: предок вне окна не должен открыть prod.
+    for task in tasks:
+        if _lineage_perimeter(task, by_id) == "prod":
+            task.perimeter = "prod"
+    return tasks
+
+
+def _lineage_perimeter(task: Task, by_id: dict[str, Task]) -> str | None:
+    """Prod сильнее остальных меток во всех ветках линии; циклы безопасны."""
+    pending, seen = [task], set()
+    required = None
+    while pending:
+        current = pending.pop()
+        if current.task_id in seen:
+            continue
+        seen.add(current.task_id)
+        if current.prod or current.perimeter == "prod":
+            return "prod"
+        if required is None and current.perimeter in ("answered", "unknown"):
+            required = current.perimeter
+        for parent_id in (current.escalated_from, current.followup_of, current.parent_task_id):
+            if parent_id in by_id:
+                pending.append(by_id[parent_id])
+    return required
 
 
 def perimeter_violations(tasks: list[Task], corporate: Callable[[str], bool]) -> dict:
     """Запуски вне корпоративного периметра, который требовала задача или её предок.
 
-    Требование читается так же, как в `Dispatcher._lineage_perimeter`: своё
-    `decision.meta.perimeter` или любого предка по `escalated_from`,
-    `followup_of` и `parent_task_id`. Отказы guard'а не запуски. Порог ноль:
+    Требование читается из `request_json.prod`, своего `decision.meta.perimeter`
+    или любого предка по `escalated_from`, `followup_of` и `parent_task_id`.
+    `prod` сильнее `answered`/`unknown`. Отказы guard'а не запуски. Порог ноль:
     любой такой запуск это утечка корпоративного кода наружу. `corporate`
     судит по текущему конфигу: исполнитель, позже снятый с периметра, даст
     ложное срабатывание, а не пропуск.
     """
     by_id = {task.task_id: task for task in tasks}
 
-    def required(task: Task) -> str | None:
-        pending, seen = [task], set()
-        while pending:
-            current = pending.pop()
-            if current.task_id in seen:
-                continue
-            seen.add(current.task_id)
-            if current.perimeter in ("answered", "unknown"):
-                return current.perimeter
-            for parent_id in (current.escalated_from, current.followup_of, current.parent_task_id):
-                if parent_id in by_id:
-                    pending.append(by_id[parent_id])
-        return None
-
     rows = [
         {"task_id": task.task_id[:8], "executor": task.executor, "perimeter": status}
         for task in tasks
         if not guard_refusal(task)
         and not corporate(task.executor)
-        and (status := required(task)) is not None
+        and (status := _lineage_perimeter(task, by_id)) is not None
     ]
     return {"count": len(rows), "runs": rows}
+
+
+def _prod_section(tasks: list[Task], by_id: dict[str, Task]) -> dict:
+    """Продовые задачи, включая отказы, и только состоявшиеся запуски."""
+    prod = [task for task in tasks if _lineage_perimeter(task, by_id) == "prod"]
+    executors = Counter(task.executor for task in prod if not guard_refusal(task))
+    verdicts: Counter[str] = Counter()
+    fields: Counter[str] = Counter()
+    redacted_tasks = replacements = 0
+    for task in prod:
+        if not task.result:
+            continue
+        meta = task.result.meta
+        if review := meta.get("review"):
+            verdicts[review.get("verdict", "unknown")] += 1
+        if redacted := meta.get("redacted"):
+            if redacted.get("replacements", 0) > 0:
+                redacted_tasks += 1
+                replacements += redacted["replacements"]
+                fields.update(redacted.get("fields", []))
+    return {
+        "tasks": len(prod),
+        "executors": dict(executors.most_common()),
+        "review_verdicts": {verdict: verdicts[verdict] for verdict in _REVIEW_VERDICTS},
+        "redacted": {
+            "tasks": redacted_tasks,
+            "replacements": replacements,
+            "fields": dict(fields.most_common()),
+        },
+    }
 
 
 def load_decisions(db_path: Path) -> list[Decision]:
@@ -334,6 +379,7 @@ def replay(
     recheck: Callable[[str], bool] = lambda _executor: False,
     since: datetime | None = None,
 ) -> dict:
+    lineage = {task.task_id: task for task in tasks}
     if since is not None:
         tasks = [task for task in tasks if task.created_at >= since]
     by_id = {task.task_id: task for task in tasks}
@@ -461,6 +507,7 @@ def replay(
         "review_only_minutes": round(sum(task.duration_ms for task in restricted) / 60000, 1),
         "queue_wait_by_limit_group": _queue_wait_by_limit_group(tasks),
         "queue_policy": _queue_policy(tasks),
+        "prod": _prod_section(tasks, lineage),
         "section_windows": {
             "executor_failures": _window(failure_times),
             "avoidable_runs": _window(avoidable_times),
@@ -1478,6 +1525,25 @@ def render(report: dict) -> str:
             f"  {row['task_id']} {row['executor']} (perimeter {row['perimeter']})"
             for row in info["runs"]
         ]
+    prod = report["prod"]
+    lines.append(f"prod tasks: {prod['tasks']}")
+    lines.append(
+        "  executors (runs only): "
+        + (", ".join(f"{name} {n}" for name, n in prod["executors"].items()) or "none")
+    )
+    lines.append(
+        "  review verdicts: "
+        + ", ".join(f"{verdict} {n}" for verdict, n in prod["review_verdicts"].items())
+    )
+    redacted = prod["redacted"]
+    lines.append(
+        f"  redacted: {redacted['tasks']} tasks, {redacted['replacements']} replacements"
+        + (
+            ", fields " + ", ".join(f"{name} {n}" for name, n in redacted["fields"].items())
+            if redacted["fields"]
+            else ""
+        )
+    )
     if "children_refusals" in report:
         info = report["children_refusals"]
         lines.append(
