@@ -694,6 +694,16 @@ def outcome_metrics(tasks: list[Task]) -> dict:
             for task in finished
             if task.result
         )
+        # Повтор транспорта: сколько задач он довёл до completed и сколько
+        # закончилось без эскалации после повторного обрыва. Рост второго при
+        # нуле первого значит, что подавление эскалации теряет результаты.
+        retry_recovered = sum(
+            bool(task.result and task.result.meta.get("retry_count")) and task.status == "completed"
+            for task in finished
+        )
+        suppressed = sum(
+            bool(task.result and task.result.meta.get("escalation_suppressed")) for task in finished
+        )
         median_latency = median(latency) if latency else None
         if median_latency is not None and float(median_latency).is_integer():
             median_latency = int(median_latency)
@@ -715,6 +725,8 @@ def outcome_metrics(tasks: list[Task]) -> dict:
             "retry_rate": round(retries / len(finished), 3) if finished else None,
             "escalation_rate": round(escalated / len(finished), 3) if finished else None,
             "transport_error_rate": round(transport / len(finished), 3) if finished else None,
+            "retry_recovered": retry_recovered,
+            "escalation_suppressed": suppressed,
             "wasted_dispatches": sum(
                 not _has_work(task) and task.status in FINAL_STATUSES for task in finished
             ),
@@ -1786,7 +1798,9 @@ def render(report: dict) -> str:
                 f"verified success {_pct(info['verified_success_rate'])}, "
                 f"cost/success ${cost}, median latency {latency} ms, "
                 f"retries {retries}, escalations {escalations}, "
-                f"transport errors {transport}"
+                f"transport errors {transport}, "
+                f"retry recovered {info['retry_recovered']}, "
+                f"escalation suppressed {info['escalation_suppressed']}"
             )
     if "recommendations" in report:
         lines.append("recommended actions:")

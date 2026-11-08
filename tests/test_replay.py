@@ -650,7 +650,16 @@ def test_outcome_metrics_are_observed_and_policy_grouped():
                     "routing_policy_version": "static-v1",
                     "failure_class": "transport_error",
                     "retry_count": 1,
+                    "escalation_suppressed": "transport_error",
                 },
+            ),
+        ),
+        # Повтор помог: completed после одного обрыва транспорта.
+        _task(
+            "c" * 32,
+            "completed",
+            result=_result(
+                "completed", meta={"routing_policy_version": "static-v1", "retry_count": 1}
             ),
         ),
     ]
@@ -658,17 +667,19 @@ def test_outcome_metrics_are_observed_and_policy_grouped():
     report = outcome_metrics(tasks)
 
     assert report["policies"]["static-v1"] == {
-        "n": 2,
+        "n": 3,
         "verified_successes": 1,
-        "verified_success_rate": 0.5,
-        "observed_completed_rate": 0.5,
+        "verified_success_rate": 0.333,
+        "observed_completed_rate": 0.667,
         "cost_usd": 0.2,
         "cost_per_verified_success_usd": 0.2,
         "median_latency_ms": 60000,
-        "retry_count": 1,
-        "retry_rate": 0.5,
+        "retry_count": 2,
+        "retry_rate": 0.667,
         "escalation_rate": 0.0,
-        "transport_error_rate": 0.5,
+        "transport_error_rate": 0.333,
+        "retry_recovered": 1,
+        "escalation_suppressed": 1,
         "wasted_dispatches": 1,
     }
 
