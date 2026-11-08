@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 
-from agent_dispatch.executors.workspace import diff, is_git_repo, snapshot
+from agent_dispatch.executors.workspace import diff, fingerprint, is_git_repo, snapshot
 
 
 def test_is_git_repo_returns_true_for_git_repository(git_repo: Path) -> None:
@@ -75,6 +75,18 @@ def test_diff_reports_edited_untracked_file(git_repo: Path) -> None:
     (git_repo / "new.py").write_text("new = 2\n")
 
     assert diff(before, snapshot(git_repo)) == ["new.py"]
+
+
+def test_fingerprint_hashes_untracked_files_from_repository_root(git_repo: Path) -> None:
+    subdir = git_repo / "pkg"
+    subdir.mkdir()
+    outside = git_repo / "outside.txt"
+    outside.write_text("before\n")
+
+    before = fingerprint(subdir)
+    outside.write_text("after\n")
+
+    assert fingerprint(subdir) != before
 
 
 def test_diff_reports_mode_change_on_dirty_file(git_repo: Path) -> None:

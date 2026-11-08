@@ -1,24 +1,25 @@
 # AgentDispatch
 
-Маршрутизация coding-задач между Claude Code и omp. Start anywhere. Dispatch anywhere.
-
-Агент, в котором вы работаете, вызывает один MCP tool `dispatch`. AgentDispatch собирает компактный Task Package, спрашивает у Jev (judgment-модель TypeSafe), какой исполнитель подходит, запускает выбранный CLI в вашей рабочей копии и возвращает структурированный результат. Jev только принимает решение; запуск, guards, таймауты и телеметрия живут в обычном коде.
+Маршрутизация по умолчанию детерминированно выбирает исполнителя уровня `balanced`; Jev и `claude_local` остаются опциональными роутерами.
 
 ```text
 Claude Code ─┐
-omp ──────────┘──→ MCP `dispatch` ──→ демон agent-dispatch ──→ Jev (choice) ──→ guards ──→ исполнитель
+omp ──────────┘──→ MCP `dispatch` ──→ демон agent-dispatch ──→ static capability selector ──→ исполнитель
                                                                       claude | omp/<model>
 ```
+
 
 ## Что внутри
 
 - `agent-dispatch serve`: локальный демон (HTTP на `127.0.0.1:7433`, SQLite-телеметрия, очередь задач). Переживает смерть агента, который его вызвал.
 - `agent-dispatch mcp`: stdio MCP-сервер, тонкий прокси в демон. Поднимает демон сам, если тот не запущен.
 - Tools: `route` (только решение), `dispatch` (решение + запуск), `dispatch_to` (явный исполнитель), `status`, `executors` (кто доступен сейчас, кто на лимите и до какого времени).
-- У `route` и `dispatch` есть необязательный `max_capability` (`fast`, `balanced` или `strong`). Он ограничивает выбор роутера сверху, не закрепляя конкретного исполнителя; `dispatch_to` и цепочки эскалации потолок игнорируют.
+- `route` и `dispatch` используют `balanced` без дополнительного LLM-вызова. Параметр `capability` позволяет явно выбрать `fast`, `balanced` или `strong`; `max_capability` остаётся верхним потолком и не меняет прежнюю семантику.
+- Jev и `claude_local` остаются opt-in. Jev получает task state только для cwd под `router.external.trusted_roots`; неизвестные проекты закрыты fail-closed, `prod: true` всегда пропускает роутеры.
 - Guards в коде: недоступный исполнитель, исчерпанный лимит (до объявленного сброса, на весь аккаунт), правило «только ревью» (`routing.review_only`), лимит глубины делегирования (`max_hops`), лимит сабагентов на задачу (`max_children`), низкая уверенность Jev, таймаут, отмена.
 - Escalation chains из конфига: `omp/luna → omp/terra → omp/sol → claude`, `omp/x5-code-large → omp/x5-small-coder`.
-- Телеметрия каждого решения и результата, экспорт в JSONL для анализа routing accuracy.
+- Временный transport retry ограничен числом попыток и временем, разрешён только до первого ответа и при неизменённой рабочей копии; после исчерпания не происходит escalation только из-за transport ошибки.
+- Телеметрия каждого решения и результата, экспорт в JSONL для анализа routing accuracy и outcome-aware метрик.
 
 ## Установка
 
@@ -31,13 +32,14 @@ uv sync
 uv tool install .            # команда agent-dispatch появится в PATH
 ```
 
-Ключ OpenRouter для Jev положите в `~/.config/agent-dispatch/env` (права 600):
+Ключ OpenRouter нужен только при явном `router.backend: jev`; для этого backend
+задачи отправляются наружу лишь если `router.external.trusted_roots` содержит
+реальный путь cwd (или явно включён `allow_unknown_projects`). По умолчанию
+неизвестные проекты блокируются до сериализации task state.
 
 ```text
 OPENROUTER_API_KEY=sk-or-v1-...
 ```
-
-Ключи читаются только из этого файла или из окружения демона. В окружение дочерних CLI они не попадают.
 
 Проверьте окружение:
 
@@ -137,17 +139,16 @@ AgentDispatch не обязателен для каждого запроса: э
 
 ## Как принимается решение
 
-1. Task Package: `task`, `cwd`, `context`, `files`, `constraints`, `success_criteria`. Режим `context_mode` (`prompt`, `prompt+summary`, `full`) задаёт, сколько контекста уходит исполнителю. История чата не передаётся никогда.
-2. Кандидаты: включённые исполнители минус недоступные минус исполнитель того же типа, что и вызывающий агент (только на hop 0).
-3. Один запрос к Jev. Несущий вопрос это `capability`: какого уровня работы требует задача (`fast`, `balanced`, `strong`). Имена моделей Jev не показываются. Рядом идут `judgment` (нужно ли разрешать компромиссы, а не просто исполнять), `corporate_data` (данные не должны покидать периметр; спрашивается, только если есть исполнитель с `corporate: true`), `difficulty`, `task_type`, `risk`, `ambiguity`, `decomposable`.
-4. Исполнителя подбирает код: `corporate` сужает пул до внутреннего периметра, `judgment` отдаёт задачу рассуждающему агенту, дальше выбирается кандидат нужного `tier` (при отсутствии такого берётся ближайший вверх, затем вниз), при равенстве побеждает тот, кто идёт в конфиге выше.
-5. Post-guards: `confidence >= autonomous_confidence` это `autonomous`, между ним и `min_confidence` это `advisory` (решение выполняется, но помечено как слабое), ниже `min_confidence` или отрыв меньше `min_margin` → `fallback_executor`. Это имя или упорядоченный список: берётся первый доступный кандидат из списка, остальные стоят в резерве; если недоступны все, остаётся лучший кандидат роутера с предупреждением.
-6. Если `routing.explore_share > 0`, пригодные решения Jev детерминированно делятся по хешу `task_id`. В arm `explore` запускается статический кандидат тира `balanced`; мнение Jev и оба выбора остаются в телеметрии. Guards уже отфильтровали кандидатов и имеют приоритет.
-7. Запуск адаптера в рабочем каталоге. `changed_files` считаются по снимкам `git status` до и после с отпечатками содержимого файлов, а не со слов агента: повторная правка уже грязного файла тоже видна.
-   Если вызывающий передал `verify` (команды проверки, обычно тесты затронутой области), демон запускает их сам после исполнителя. Упавшая команда значит «не сделано», какой бы `tests` ни написал исполнитель: результат `partial`, задача эскалируется (`verification_failed`). Подробнее в разделе «Проверка результата».
-8. Результат нормализуется в `ExecutionResult`: `status` (`completed | partial | failed | needs_context | needs_escalation`), `summary`, `changed_files`, `tests`, `confidence`, `usage`.
+1. Task Package: `task`, `cwd`, `context`, `files`, `constraints`, `success_criteria`; история чата не передаётся.
+2. Кандидаты: включённые исполнители минус недоступные, source-agent и review-only ограничения.
+3. Static router выбирает capability `balanced` через `routing.capability.select`, учитывая доступность, квоты, корпоративный периметр и `max_capability`; явный `capability` меняет baseline, не меняя смысл потолка `max_capability`.
+4. Перед внешним Jev/OpenRouter вызовом локальный preflight требует realpath cwd внутри `router.external.trusted_roots`; неизвестные проекты блокируются по умолчанию. `prod` всегда блокирует внешние роутеры.
+5. Post-guards применяют confidence/margin и `fallback_executor`.
+6. `routing.explore_share` опционально сравнивает Jev со статическим balanced arm.
+7. Запускается выбранный адаптер в рабочем каталоге; `changed_files` считаются по снимкам git.
+8. Результат нормализуется в `ExecutionResult`.
 
-Если Jev недоступен, работает `claude_local` (выбор исполнителя по описаниям через `claude -p`), а если и он недоступен, `fallback_executor`.
+При явном `router.backend: jev` сначала вызывается Jev, затем при отказе `claude_local`, затем `fallback_executor`.
 
 Почему не спрашивать у Jev имя модели: вендорские описания моделей неразличимы, и распределение получается плоским. На одних и тех же 20 размеченных задачах выбор по имени исполнителя давал среднюю уверенность 0.93 при 4 кандидатах и 0.35-0.60 при 10, а вопрос о capability даёт 0.975 и не зависит от числа моделей (проверено на 3 и на 11 кандидатах: 0.932 против 0.934). Добавление модели больше не ухудшает маршрутизацию.
 
@@ -293,6 +294,17 @@ agent-dispatch dispatch --kind review "Проверь незакоммиченн
 ## Конфигурация
 
 `~/.config/agent-dispatch/config.yaml` мержится с [`agent_dispatch/config_default.yaml`](agent_dispatch/config_default.yaml) по ключам. Порядок исполнителей внутри тира задаёт пользовательский файл, а не `config_default.yaml`: `load_settings` сохраняет этот порядок. Старый конфиг с adapter codex/opencode не загружается и сообщает о необходимости `agent-dispatch migrate-config`. Пример полного файла: [`config.example.yaml`](config.example.yaml).
+По умолчанию `router.backend: static`: внешний роутер не вызывается. Для Jev задайте явный trusted root:
+
+```yaml
+router:
+  backend: jev
+  external:
+    trusted_roots: [~/src]
+    allow_unknown_projects: false
+```
+
+Перед отправкой task state обе стороны realpath-проверяются на containment; симлинк cwd наружу не проходит. `prod: true` всегда блокирует внешние роутеры.
 
 Добавить новую модель omp это только конфиг:
 

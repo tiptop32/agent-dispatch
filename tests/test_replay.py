@@ -32,6 +32,7 @@ from evals.replay.harness import (
     git_acceptance,
     load,
     load_decisions,
+    outcome_metrics,
     perimeter_violations,
     post_review,
     recommendations,
@@ -626,6 +627,50 @@ def _task(
         parent_task_id=parent_task_id,
         git_common_dir=git_common_dir,
     )
+
+
+def test_outcome_metrics_are_observed_and_policy_grouped():
+    tasks = [
+        _task(
+            "a" * 32,
+            "completed",
+            result={
+                **_result("completed", meta={"routing_policy_version": "static-v1"}),
+                "verification": {"result": "passed", "commands": []},
+                "usage": {"cost_usd": 0.2},
+            },
+        ),
+        _task(
+            "b" * 32,
+            "failed",
+            result=_result(
+                "failed",
+                error="sequence_number regressed",
+                meta={
+                    "routing_policy_version": "static-v1",
+                    "failure_class": "transport_error",
+                    "retry_count": 1,
+                },
+            ),
+        ),
+    ]
+
+    report = outcome_metrics(tasks)
+
+    assert report["policies"]["static-v1"] == {
+        "n": 2,
+        "verified_successes": 1,
+        "verified_success_rate": 0.5,
+        "observed_completed_rate": 0.5,
+        "cost_usd": 0.2,
+        "cost_per_verified_success_usd": 0.2,
+        "median_latency_ms": 60000,
+        "retry_count": 1,
+        "retry_rate": 0.5,
+        "escalation_rate": 0.0,
+        "transport_error_rate": 0.5,
+        "wasted_dispatches": 1,
+    }
 
 
 def test_delegations_follow_the_escalation_chain_to_its_outcome():

@@ -18,6 +18,8 @@ class ProcessOutcome:
     #: Сколько секунд CLI молчал (stdout и stderr) к моменту жёсткого таймаута.
     #: Отличает агента, работавшего до конца, от зависшего. None без таймаута.
     last_output_age_s: float | None = None
+    #: Configured hard timeout, retained for machine-readable diagnostics.
+    timeout_seconds: float | None = None
 
 
 async def run_cli(
@@ -130,6 +132,7 @@ async def run_cli(
             except TimeoutError:
                 if idle_limit is not None and time.monotonic() - last_output_at >= idle_limit:
                     stalled = True
+                    last_output_age_s = round(time.monotonic() - last_output_at, 1)
                     await terminate_group()
                     break
         await wait_for_io()
@@ -155,4 +158,5 @@ async def run_cli(
         stalled=stalled,
         idle_seconds=idle_limit,
         last_output_age_s=last_output_age_s,
+        timeout_seconds=timeout_seconds,
     )

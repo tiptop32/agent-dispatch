@@ -124,13 +124,25 @@ def fingerprint(cwd: str | Path) -> str:
     поэтому сравнивается содержимое.
     """
     digest = hashlib.sha256()
-    for args in (["diff", "HEAD", "--binary"], ["ls-files", "-o", "--exclude-standard", "-z"]):
+    root = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            env=git_env(),
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+    )
+    for args in (
+        ["diff", "HEAD", "--binary"],
+        ["ls-files", "-o", "--exclude-standard", "--full-name", "-z"],
+    ):
         result = subprocess.run(
-            ["git", *args], cwd=cwd, env=git_env(), capture_output=True, check=True
+            ["git", *args], cwd=root, env=git_env(), capture_output=True, check=True
         )
         digest.update(result.stdout)
         if args[0] == "ls-files":
-            root = Path(cwd)
             for name in filter(None, result.stdout.split(b"\0")):
                 digest.update(_path_state(root, os.fsdecode(name)).encode("ascii"))
     return digest.hexdigest()

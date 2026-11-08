@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from agent_dispatch.executors.health import classify_failure
+from agent_dispatch.executors.health import (
+    classify_failure,
+    classify_failure_kind,
+    retry_eligible,
+)
 from agent_dispatch.executors.omp import OmpAdapter
 from agent_dispatch.models import ExecutionResult
 
@@ -464,3 +468,78 @@ def test_omp_maxcost_notice_is_not_an_executor_failure():
     )
     assert omp_error(_omp_fixture("maxcost.ndjson")) is None
     assert classify_failure(_failed("exit code 3", summary=notice)) is None
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (_failed("sequence_number regressed"), "transport_error"),
+        (_failed("websocket transport error: connection closed"), "transport_error"),
+        (_failed("connection reset by peer"), "transport_error"),
+        (_failed("429 Too Many Requests"), "rate_limit"),
+        (_failed("You've hit your weekly limit"), "quota_exceeded"),
+        (_failed("timeout", changed_files=[]), "timeout"),
+        (_failed("stalled: no output for 3s"), "stream_stalled"),
+        (_failed("invalid api key"), "configuration_error"),
+        (_failed("unrecognized task failure"), "task_failed"),
+    ],
+)
+def test_internal_failure_taxonomy_is_stable(result, expected):
+    assert classify_failure_kind(result) == expected
+
+
+def test_retry_requires_transient_transport_and_unchanged_workspace():
+    result = _failed("sequence_number regressed")
+    assert retry_eligible(
+        result,
+        workspace_unchanged=True,
+        attempt=0,
+        max_attempts=2,
+        elapsed_seconds=1,
+        max_elapsed_seconds=10,
+    )
+    assert not retry_eligible(
+        result,
+        workspace_unchanged=False,
+        attempt=0,
+        max_attempts=2,
+    )
+    assert not retry_eligible(
+        _failed("sequence_number regressed", changed_files=["a.py"]),
+        workspace_unchanged=True,
+        attempt=0,
+        max_attempts=2,
+    )
+    assert not retry_eligible(
+        _failed("timeout"),
+        workspace_unchanged=True,
+        attempt=0,
+        max_attempts=2,
+    )
+    assert not retry_eligible(
+        result,
+        workspace_unchanged=True,
+        attempt=2,
+        max_attempts=2,
+    )
+
+
+def test_internal_failure_taxonomy_covers_cancellation_and_verification():
+    cancelled = _failed("cancelled")
+    assert classify_failure_kind(cancelled) == "cancelled"
+    verified = ExecutionResult(
+        status="partial",
+        executor="x",
+        model=None,
+        summary="work",
+        meta={"verification_failed": True},
+    )
+    assert classify_failure_kind(verified) == "verification_failed"
+
+
+@pytest.mark.parametrize(
+    "error",
+    ["sequence_number regressed", "connection reset by peer", "websocket transport error"],
+)
+def test_transport_messages_keep_legacy_network_kind(error):
+    assert classify_failure(_failed(error)) == "network"

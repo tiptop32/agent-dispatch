@@ -23,6 +23,8 @@ from .claude_local import ClaudeLocalRouter
 from .exploration import STATIC_BASELINE_TIER
 from .guards import fallback_choice, post_guards, single_candidate_decision
 from .jev import JevRouter
+from .preflight import external_router_allowed
+from .static import StaticRouter
 
 
 def _apply_capability_ceiling(
@@ -132,6 +134,8 @@ async def decide_with_fallback(
     events: list[GuardEvent] = []
     for router in routers:
         try:
+            if isinstance(router, JevRouter) and not external_router_allowed(req, settings):
+                raise RouterError("external router denied: cwd is not a configured trusted project")
             decision = await router.decide(req, candidates)
             decision = _apply_capability_ceiling(req, decision, candidates, settings)
             final, post_events = post_guards(
@@ -191,6 +195,8 @@ async def decide_with_fallback(
 
 
 def build_routers(settings: Settings, client: httpx.AsyncClient) -> list[Router]:
+    if settings.router.backend == "static":
+        return [StaticRouter(settings)]
     local = ClaudeLocalRouter(settings)
     if settings.router.backend == "claude_local":
         return [local]

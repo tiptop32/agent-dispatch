@@ -14,6 +14,10 @@ stderr или ошибка из отчёта CLI, туда не попадает
 У omp (`-p --mode json`) поля `httpStatus` нет: адаптер извлекает `errorMessage`
 последнего ассистентского хода с ошибкой (`omp_error`) или берёт stderr, а ход
 без единого ответа модели помечает строкой `omp: no model response`.
+
+`classify_failure` сохраняет старые виды для cooldown/replay, а
+`classify_failure_kind` возвращает стабильную внутреннюю таксономию для
+диагностики и безопасного допуска повтора.
 """
 
 from __future__ import annotations
@@ -27,10 +31,51 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_dispatch.models import ExecutionResult
 
-FailureKind = Literal["quota", "capacity", "auth", "network"]
+LegacyFailureKind = Literal["quota", "capacity", "auth", "network"]
+InternalFailureKind = Literal[
+    "transport_error",
+    "rate_limit",
+    "quota_exceeded",
+    "timeout",
+    "stream_stalled",
+    "verification_failed",
+    "task_failed",
+    "cancelled",
+    "configuration_error",
+]
+FailureKind = Literal[
+    "quota",
+    "capacity",
+    "auth",
+    "network",
+    "transport_error",
+    "rate_limit",
+    "quota_exceeded",
+    "timeout",
+    "stream_stalled",
+    "verification_failed",
+    "task_failed",
+    "cancelled",
+    "configuration_error",
+]
 FailureScope = Literal["group", "executor"]
 
-_ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
+# Internal kinds are separate from legacy cooldown kinds for replay compatibility.
+_INTERNAL_KINDS = frozenset(
+    {
+        "transport_error",
+        "rate_limit",
+        "quota_exceeded",
+        "timeout",
+        "stream_stalled",
+        "verification_failed",
+        "task_failed",
+        "cancelled",
+        "configuration_error",
+    }
+)
+
+_ERROR_PATTERNS: tuple[tuple[LegacyFailureKind, re.Pattern[str]], ...] = (
     (
         "quota",
         re.compile(
@@ -70,14 +115,94 @@ _ERROR_PATTERNS: tuple[tuple[FailureKind, re.Pattern[str]], ...] = (
         re.compile(
             r"^omp: no model response"
             r"|couldn't connect to .+\(connection refused\)"
+            r"|connection (?:reset|closed|aborted|dropped)(?: by peer)?"
+            r"|websocket[^\n]*(?:transport|closed|reset|error)"
+            r"|sequence[_ ]number\s+regressed"
             r"|TLS certificate verification failed",
             re.IGNORECASE,
         ),
     ),
 )
 
+_RATE_LIMIT = re.compile(
+    r"rate[ _-]limit|too many requests|\b429\b|throttl(?:ed|ing)", re.IGNORECASE
+)
+_TRANSPORT_ERROR = re.compile(
+    r"sequence[_ ]number\s+regressed"
+    r"|connection\s+(?:reset|closed|aborted|dropped)(?:\s+by\s+peer)?"
+    r"|websocket[^\n]*(?:transport|closed|reset|error)"
+    r"|transport\s+error",
+    re.IGNORECASE,
+)
 
-def classify_failure(result: ExecutionResult) -> FailureKind | None:
+
+def classify_internal_failure(result: ExecutionResult) -> InternalFailureKind | None:
+    """Return the stable failure taxonomy used by retry and diagnostics."""
+    cause = result.meta.get("failure_cause")
+    if cause in _INTERNAL_KINDS:
+        return cause
+    if result.meta.get("verification_failed") or (
+        result.verification is not None and result.verification.result == "failed"
+    ):
+        return "verification_failed"
+    if result.error == "cancelled" or result.meta.get("cancelled"):
+        return "cancelled"
+    if result.status not in ("failed", "partial"):
+        return None
+    error = result.error or ""
+    if result.meta.get("timed_out") or error == "timeout":
+        return "timeout"
+    if result.meta.get("stalled") or error.startswith("stalled:"):
+        return "stream_stalled"
+    if _TRANSPORT_ERROR.search(error):
+        return "transport_error"
+    if result.meta.get("configuration_error") or error.startswith(
+        ("cannot start ", "cwd is not a git repository:")
+    ):
+        return "configuration_error"
+    legacy = classify_failure(result)
+    if legacy == "network":
+        return "transport_error"
+    if legacy in ("quota", "capacity"):
+        return (
+            "rate_limit" if legacy == "capacity" or _RATE_LIMIT.search(error) else "quota_exceeded"
+        )
+    if legacy == "auth":
+        return "configuration_error"
+    return "task_failed"
+
+
+classify_failure_kind = classify_internal_failure
+
+
+def retry_eligible(
+    result: ExecutionResult,
+    *,
+    workspace_unchanged: bool,
+    attempt: int,
+    max_attempts: int,
+    elapsed_seconds: float = 0.0,
+    max_elapsed_seconds: float | None = None,
+) -> bool:
+    """Admission predicate for a bounded, state-safe transport retry.
+
+    This helper does not rerun anything. Callers must re-check workspace state
+    immediately before reusing the same executor/session.
+    """
+    if classify_internal_failure(result) != "transport_error":
+        return False
+    if not workspace_unchanged or result.changed_files:
+        return False
+    if attempt < 0 or max_attempts <= 0 or attempt >= max_attempts:
+        return False
+    if elapsed_seconds < 0:
+        return False
+    return max_elapsed_seconds is None or (
+        max_elapsed_seconds >= 0 and elapsed_seconds < max_elapsed_seconds
+    )
+
+
+def classify_failure(result: ExecutionResult) -> LegacyFailureKind | None:
     """Вид сбоя исполнителя или None, если сбой относится к задаче.
 
     `partial` судится только с `meta.cli_error`: адаптер omp так помечает ход,
@@ -129,7 +254,7 @@ def omp_error(ndjson: str) -> str | None:
 _MODEL_LIMIT = re.compile(r"hit your (?:opus|sonnet|haiku|fable)\b", re.IGNORECASE)
 
 
-def failure_scope(kind: FailureKind, error: str) -> FailureScope:
+def failure_scope(kind: LegacyFailureKind, error: str) -> FailureScope:
     """Кого выводить из ротации: одного исполнителя или всех с его лимитом.
 
     Лимит, авторизация и сеть общие для аккаунта: у `claude/opus` и
@@ -276,7 +401,7 @@ RESET_GRACE = timedelta(seconds=60)
 
 
 def cooldown_seconds(
-    kind: FailureKind,
+    kind: LegacyFailureKind,
     error: str,
     now: datetime,
     *,

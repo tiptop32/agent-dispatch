@@ -31,6 +31,7 @@ def settings():
     return Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
+            "router": {"external": {"allow_unknown_projects": True}},
             "routing": {"fallback_executor": "omp"},
             "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
         }

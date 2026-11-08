@@ -193,8 +193,17 @@ class OmpAdapter(BaseExecutorAdapter):
             )
         elif not responded and raw is None and not changed and result.status == "partial":
             # Код 0, но ни одного ответа модели: omp молча вышел, когда запрос
-            # к провайдеру не вернулся. Это сбой исполнителя, а не задачи.
-            result = result.model_copy(update={"status": "failed", "error": self.NO_RESPONSE})
+            # к провайдеру не вернулся. Сессия не успела выполнить модель, поэтому
+            # ограниченный retry после проверки рабочей копии безопасен.
+            result = result.model_copy(
+                update={
+                    "status": "failed",
+                    "error": self.NO_RESPONSE,
+                    "meta": {**result.meta, "transport_before_output": True},
+                }
+            )
+        if not responded and result.status in ("failed", "partial") and not changed:
+            result.meta["transport_before_output"] = True
         if usage is not None:
             result = result.model_copy(update={"usage": usage})
         if session:

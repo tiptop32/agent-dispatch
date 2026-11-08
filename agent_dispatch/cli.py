@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import typer
 
@@ -128,6 +128,7 @@ def _request(
     constraints: list[str] | None,
     *,
     executor: str | None = None,
+    capability: Literal["fast", "balanced", "strong"] | None = None,
     max_capability: str | None = None,
     wait: int = 1800,
     timeout: int | None = None,
@@ -145,6 +146,7 @@ def _request(
         constraints=constraints or [],
         source_agent=SourceAgent.cli,
         executor=executor,
+        capability=capability,
         max_capability=max_capability,
         wait_seconds=wait,
         timeout_seconds=timeout,
@@ -200,6 +202,7 @@ def route(
     context: str | None = typer.Option(None),
     files: list[str] | None = typer.Option(None, "--file"),  # noqa: B008
     constraints: list[str] | None = typer.Option(None, "--constraint"),  # noqa: B008
+    capability: str | None = typer.Option(None, "--capability"),
     max_capability: str | None = typer.Option(None, "--max-capability"),
     kind: str = typer.Option(
         "task", help="task changes code; review reads the working copy and reports findings."
@@ -216,6 +219,7 @@ def route(
             files,
             constraints,
             kind=kind,
+            capability=capability,
             max_capability=max_capability,
             prod=prod,
         ),
@@ -242,6 +246,7 @@ def dispatch(
     files: list[str] | None = typer.Option(None, "--file"),  # noqa: B008
     constraints: list[str] | None = typer.Option(None, "--constraint"),  # noqa: B008
     executor: str | None = typer.Option(None),
+    capability: str | None = typer.Option(None, "--capability"),
     max_capability: str | None = typer.Option(None, "--max-capability"),
     wait: int = typer.Option(1800, min=0),
     timeout: int | None = typer.Option(None, min=1),
@@ -268,6 +273,7 @@ def dispatch(
                 files,
                 constraints,
                 executor=executor,
+                capability=capability,
                 max_capability=max_capability,
                 wait=wait,
                 timeout=timeout,

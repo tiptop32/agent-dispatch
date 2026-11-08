@@ -653,6 +653,81 @@ def delegations(tasks: list[Task]) -> dict:
     }
 
 
+def outcome_metrics(tasks: list[Task]) -> dict:
+    """Сводка наблюдаемых исходов для будущего outcome-aware routing.
+
+    Контрфактические результаты не моделируются: метрики используют только
+    фактически запущенные задачи и явную проверку `verification.result`.
+    Старые записи без policy version попадают в `legacy`.
+    """
+    groups: dict[str, list[Task]] = {}
+    for task in tasks:
+        if guard_refusal(task) or task.result is None:
+            continue
+        policy = str(task.result.meta.get("routing_policy_version", "legacy"))
+        groups.setdefault(policy, []).append(task)
+
+    def summarize(members: list[Task]) -> dict:
+        finished = [task for task in members if task.status in FINAL_STATUSES]
+        verified = [
+            task
+            for task in finished
+            if task.status == "completed"
+            and task.result is not None
+            and task.result.verification is not None
+            and task.result.verification.result == "passed"
+        ]
+        costs = [
+            task.result.usage.cost_usd
+            for task in finished
+            if task.result and task.result.usage and task.result.usage.cost_usd is not None
+        ]
+        latency = [task.duration_ms for task in finished if task.duration_ms >= 0]
+        retries = sum(
+            int(task.result.meta.get("retry_count", 0)) for task in finished if task.result
+        )
+        escalated = sum(
+            bool(task.result and task.result.meta.get("escalated_to")) for task in finished
+        )
+        transport = sum(
+            task.result.meta.get("failure_class") == "transport_error"
+            for task in finished
+            if task.result
+        )
+        median_latency = median(latency) if latency else None
+        if median_latency is not None and float(median_latency).is_integer():
+            median_latency = int(median_latency)
+        return {
+            "n": len(finished),
+            "verified_successes": len(verified),
+            "verified_success_rate": round(len(verified) / len(finished), 3) if finished else None,
+            "observed_completed_rate": round(
+                sum(task.status == "completed" for task in finished) / len(finished), 3
+            )
+            if finished
+            else None,
+            "cost_usd": round(sum(costs), 4),
+            "cost_per_verified_success_usd": round(sum(costs) / len(verified), 4)
+            if verified
+            else None,
+            "median_latency_ms": round(median_latency, 1) if median_latency is not None else None,
+            "retry_count": retries,
+            "retry_rate": round(retries / len(finished), 3) if finished else None,
+            "escalation_rate": round(escalated / len(finished), 3) if finished else None,
+            "transport_error_rate": round(transport / len(finished), 3) if finished else None,
+            "wasted_dispatches": sum(
+                not _has_work(task) and task.status in FINAL_STATUSES for task in finished
+            ),
+        }
+
+    return {
+        "policies": {policy: summarize(members) for policy, members in sorted(groups.items())},
+        "note": (
+            "verified success requires dispatcher-run verification; no counterfactuals are inferred"
+        ),
+    }
+
+
 @dataclass
 class Acceptance:
     """Что стало с дифом исполнителя в рабочей копии вызывающего.
@@ -1691,6 +1766,27 @@ def render(report: dict) -> str:
             lines.append(
                 "  outcomes: "
                 + ", ".join(f"{outcome} {count}" for outcome, count in info["outcomes"].items())
+            )
+    if "outcomes" in report:
+        lines.append("outcome-aware metrics (observed only):")
+        for policy, info in report["outcomes"]["policies"].items():
+            cost = (
+                info["cost_per_verified_success_usd"]
+                if info["cost_per_verified_success_usd"] is not None
+                else "n/a"
+            )
+            latency = info["median_latency_ms"] if info["median_latency_ms"] is not None else "n/a"
+            retries = info["retry_rate"] if info["retry_rate"] is not None else "n/a"
+            escalations = info["escalation_rate"] if info["escalation_rate"] is not None else "n/a"
+            transport = (
+                info["transport_error_rate"] if info["transport_error_rate"] is not None else "n/a"
+            )
+            lines.append(
+                f"  {policy}: n {info['n']}, "
+                f"verified success {_pct(info['verified_success_rate'])}, "
+                f"cost/success ${cost}, median latency {latency} ms, "
+                f"retries {retries}, escalations {escalations}, "
+                f"transport errors {transport}"
             )
     if "recommendations" in report:
         lines.append("recommended actions:")

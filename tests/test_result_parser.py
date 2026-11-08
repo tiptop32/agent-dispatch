@@ -86,9 +86,19 @@ def test_normalize_nonzero_exit_is_failed_with_error_and_stdout_tails():
 
 
 def test_normalize_timeout_is_failed_with_timeout_error():
-    result = normalize(None, outcome(timed_out=True), None, "omp", None)
+    result = normalize(
+        None,
+        outcome(timed_out=True, last_output_age_s=4.5, timeout_seconds=30),
+        None,
+        "omp",
+        None,
+    )
     assert result.status == "failed"
     assert result.error == "timeout"
+    assert result.meta["failure_cause"] == "timeout"
+    assert result.meta["timeout_type"] == "task_deadline"
+    assert result.meta["last_activity_age_s"] == 4.5
+    assert result.meta["timeout_seconds"] == 30
 
 
 def test_normalize_timeout_with_changed_files_is_partial():
@@ -103,7 +113,58 @@ def test_normalize_stalled_is_failed_with_idle_error():
     result = normalize(None, outcome(stalled=True, idle_seconds=0.5), None, "omp", None)
     assert result.status == "failed"
     assert result.error.startswith("stalled: no output for")
+    assert result.meta["failure_cause"] == "stream_stalled"
+    assert result.meta["timeout_type"] == "stream_stalled"
     assert result.meta["idle_timeout_seconds"] == 0.5
+
+
+def test_normalize_timeout_has_machine_readable_timing_without_output():
+    result = normalize(
+        None,
+        outcome(
+            timed_out=True,
+            duration_ms=1234,
+            last_output_age_s=4.2,
+            timeout_seconds=10,
+            stdout="task output that stays in the summary",
+        ),
+        None,
+        "omp",
+        None,
+    )
+    assert result.meta == {
+        "exit_code": 0,
+        "duration_ms": 1234,
+        "last_output_age_s": 4.2,
+        "last_activity_age_s": 4.2,
+        "timeout_seconds": 10,
+        "failure_cause": "timeout",
+        "timeout_type": "task_deadline",
+        "timed_out": True,
+    }
+    assert "prompt" not in result.meta
+
+
+def test_normalize_stall_has_machine_readable_timing_without_output():
+    result = normalize(
+        None,
+        outcome(
+            stalled=True,
+            idle_seconds=2.5,
+            duration_ms=2500,
+            last_output_age_s=2.5,
+            stdout="task output that stays in the summary",
+        ),
+        None,
+        "omp",
+        None,
+    )
+    assert result.meta["failure_cause"] == "stream_stalled"
+    assert result.meta["stalled"] is True
+    assert result.meta["idle_timeout_seconds"] == 2.5
+    assert result.meta["last_output_age_s"] == 2.5
+    assert result.meta["duration_ms"] == 2500
+    assert "prompt" not in result.meta
 
 
 def test_normalize_git_changed_files_override_agent_files():

@@ -35,7 +35,19 @@ class DispatchClient:
         if response.status_code == 401:
             raise DaemonUnavailable("token rejected, restart the daemon")
         if response.is_error:
-            raise RuntimeError(f"{response.status_code}: {response.text}")
+            detail: object = response.text
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and isinstance(payload.get("detail"), dict):
+                data = payload["detail"]
+                code = data.get("code", "request_failed")
+                message = data.get("message", "request failed")
+                retryable = data.get("retryable")
+                action = data.get("next_action")
+                detail = f"{code}: {message}; retryable={retryable}; next_action={action}"
+            raise RuntimeError(f"{response.status_code}: {detail}")
         return response
 
     async def health(self) -> dict:

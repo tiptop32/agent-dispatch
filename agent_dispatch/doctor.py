@@ -329,8 +329,14 @@ async def _daemon_check(settings: Settings) -> Check:
 
 async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
     checks = [_config_check(), _install_check()]
-    if settings.router.backend == "claude_local":
-        checks.append(Check(name="env", ok=True, detail="not required for claude_local"))
+    if settings.router.backend in {"static", "claude_local"}:
+        checks.append(
+            Check(
+                name="env",
+                ok=True,
+                detail=f"not required for {settings.router.backend}",
+            )
+        )
     else:
         key_name = settings.router.jev.api_key_env
         key = settings.secret(key_name)
@@ -357,9 +363,13 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
                 detail=availability.version or error + _trapped_secret_hint(settings, error),
             )
         )
+    if settings.router.backend == "static":
+        checks.append(Check(name="router", ok=True, detail="static: no network call"))
+        return checks
     if not online:
         checks.append(Check(name="jev", ok=True, detail="skipped (use --online)"))
         return checks
+    probe = DispatchRequest(task="ping", cwd=".", source_agent=SourceAgent.cli)
 
     started = time.monotonic()
     candidates = settings.enabled_executors()
@@ -370,9 +380,7 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
                 if settings.router.backend == "claude_local"
                 else JevRouter(settings, client)
             )
-            decision = await router.decide(
-                DispatchRequest(task="ping", cwd=".", source_agent=SourceAgent.cli), candidates
-            )
+            decision = await router.decide(probe, candidates)
         elapsed = time.monotonic() - started
         router_name = settings.router.backend
         detail = f"ok executor={decision.executor} {elapsed:.1f}s"

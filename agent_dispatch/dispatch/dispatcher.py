@@ -24,7 +24,13 @@ from agent_dispatch.dispatch.task_package import (
 from agent_dispatch.executors import workspace, worktree
 from agent_dispatch.executors.base import ExecutorAdapter, RunContext
 from agent_dispatch.executors.env import child_env
-from agent_dispatch.executors.health import classify_failure, cooldown_seconds, failure_scope
+from agent_dispatch.executors.health import (
+    classify_failure,
+    classify_internal_failure,
+    cooldown_seconds,
+    failure_scope,
+    retry_eligible,
+)
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     FINAL_STATUSES,
@@ -514,13 +520,26 @@ class Dispatcher:
             self._events.pop(task_id, None)
 
     async def _guard_failure(self, record: TaskRecord, guard: GuardEvent) -> None:
+        next_action = {
+            GuardReason.max_children: "wait for the listed tasks with status before retrying",
+            GuardReason.unavailable: "call executors or wait for cooldown before retrying",
+            GuardReason.budget: "wait for the configured budget window or change policy",
+            GuardReason.perimeter: (
+                "use an in-perimeter executor or mark the data policy explicitly"
+            ),
+        }.get(guard.reason, "inspect the guard detail before retrying")
         result = ExecutionResult(
             status="failed",
             executor="",
             model=None,
             summary="",
             error=guard.detail,
-            meta={"guard": guard.reason.value},
+            meta={
+                "guard": guard.reason.value,
+                "error_code": guard.reason.value,
+                "retryable": guard.reason in {GuardReason.router_unavailable},
+                "next_action": next_action,
+            },
         )
         record.status, record.result, record.finished_at = TaskStatus.failed, result, self._now()
         await self.storage.add_event(record.task_id, "guard", guard.model_dump(mode="json"))
@@ -599,6 +618,7 @@ class Dispatcher:
             decision = decision.model_copy(
                 update={"router": RouterKind.fallback, "reason": GuardReason.escalated}
             )
+        decision.meta.setdefault("routing_policy_version", f"{decision.router.value}-v1")
         record.decision = decision
         # Решение должно быть видно в status, пока задача ждёт semaphore.
         await self.storage.update_task(record)
@@ -835,6 +855,12 @@ class Dispatcher:
             {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
         )
         before = await self._review_fingerprint(req) if review else None
+        retry_count = 0
+        retry_started = time.monotonic()
+        try:
+            retry_fingerprint = await asyncio.to_thread(workspace.fingerprint, ctx.cwd)
+        except (OSError, subprocess.CalledProcessError):
+            retry_fingerprint = None
         result = await self._call_adapter(adapter, ctx, decision)
         if ctx.resume_session and self._resume_failed(result):
             # Сессию не нашли или CLI другой версии не понял флаги: один раз
@@ -847,6 +873,51 @@ class Dispatcher:
             ctx = await self._build_context(record, decision, tree, resume=False)
             result = await self._call_adapter(adapter, ctx, decision)
             result.meta["resume_failed"] = True
+        max_attempts = int(getattr(self.settings.execution, "transport_retry_attempts", 1))
+        max_elapsed = float(getattr(self.settings.execution, "transport_retry_max_seconds", 60))
+        backoff = float(getattr(self.settings.execution, "transport_retry_backoff_seconds", 1.0))
+        while result.meta.get("transport_before_output") and retry_fingerprint is not None:
+            try:
+                unchanged = (
+                    await asyncio.to_thread(workspace.fingerprint, ctx.cwd) == retry_fingerprint
+                )
+            except (OSError, subprocess.CalledProcessError):
+                unchanged = False
+            if not retry_eligible(
+                result,
+                workspace_unchanged=unchanged,
+                attempt=retry_count,
+                max_attempts=max_attempts,
+                elapsed_seconds=time.monotonic() - retry_started,
+                max_elapsed_seconds=max_elapsed,
+            ):
+                break
+            remaining = max_elapsed - (time.monotonic() - retry_started)
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(backoff * (2**retry_count), remaining))
+            if time.monotonic() - retry_started >= max_elapsed:
+                break
+            retry_count += 1
+            await self.storage.add_event(
+                task_id,
+                "retry",
+                {
+                    "attempt": retry_count,
+                    "failure_class": "transport_error",
+                    "executor": decision.executor,
+                },
+            )
+            result = await self._call_adapter(
+                adapter,
+                ctx.model_copy(
+                    update={"resume_session": result.meta.get("session_id") or ctx.resume_session}
+                ),
+                decision,
+            )
+        if retry_count:
+            result.meta["retry_count"] = retry_count
+            result.meta["retry_failure_class"] = classify_internal_failure(result)
         if not review and report_recovery.needs_report(result):
             result = await self._recover_report(record, decision, adapter, ctx, result)
         if review:
@@ -1341,6 +1412,9 @@ class Dispatcher:
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
     ) -> None:
         """Вывести исполнителя из ротации, если он упал на сбое, не связанном с задачей."""
+        internal = classify_internal_failure(result)
+        if internal is not None:
+            result.meta.setdefault("failure_class", internal)
         kind = classify_failure(result)
         if kind is None:
             return
@@ -1423,6 +1497,11 @@ class Dispatcher:
             return None
         reason = should_escalate(result)
         if reason is None:
+            return None
+        if classify_internal_failure(result) == "transport_error":
+            # Один безопасный retry уже выполнен выше. Более дорогой executor не
+            # исправит обрыв websocket и может наложиться на скрытую работу.
+            result.meta["escalation_suppressed"] = "transport_error"
             return None
         failure = result.meta.get("executor_failure")
         if failure:
@@ -1564,6 +1643,14 @@ class Dispatcher:
         plan: EscalationPlan | None = None,
     ) -> None:
         """Записать результат, при необходимости эскалировать, разбудить ожидающих."""
+        result.meta.setdefault(
+            "routing_policy_version",
+            decision.meta.get("routing_policy_version", f"{decision.router.value}-v1"),
+        )
+        failure_class = classify_internal_failure(result)
+        if failure_class is not None:
+            result.meta.setdefault("failure_class", failure_class)
+            result.meta.setdefault("error_code", failure_class)
         if record.request.prod or decision.meta.get("perimeter") == "prod":
             # Отчёт продовой задачи читают вызывающий и следующие звенья: явные
             # секреты маскируются до записи и до передачи в эскалацию.

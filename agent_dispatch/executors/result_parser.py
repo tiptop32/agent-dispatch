@@ -34,9 +34,22 @@ def normalize(
     model: str | None,
 ) -> ExecutionResult:
     meta = {"exit_code": outcome.exit_code, "duration_ms": outcome.duration_ms}
+    last_output_age = getattr(outcome, "last_output_age_s", None)
+    if last_output_age is not None:
+        meta["last_output_age_s"] = last_output_age
+    timeout_seconds = getattr(outcome, "timeout_seconds", None)
+    if timeout_seconds is not None:
+        meta["timeout_seconds"] = timeout_seconds
     if getattr(outcome, "stalled", False):
         seconds = getattr(outcome, "idle_seconds", None) or 0
-        meta["idle_timeout_seconds"] = seconds
+        meta.update(
+            {
+                "failure_cause": "stream_stalled",
+                "timeout_type": "stream_stalled",
+                "stalled": True,
+                "idle_timeout_seconds": seconds,
+            }
+        )
         return ExecutionResult(
             status="failed",
             executor=executor,
@@ -47,8 +60,12 @@ def normalize(
             meta=meta,
         )
     if outcome.timed_out:
+        meta.update(
+            {"failure_cause": "timeout", "timeout_type": "task_deadline", "timed_out": True}
+        )
+        if last_output_age is not None:
+            meta["last_activity_age_s"] = last_output_age
         if changed_files:
-            meta["timed_out"] = True
             return ExecutionResult(
                 status="partial",
                 executor=executor,

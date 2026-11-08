@@ -53,6 +53,7 @@ async def test_run_cli_idle_watchdog_stalls_silent_process(tmp_path: Path) -> No
     assert outcome.stalled is True
     assert outcome.timed_out is False
     assert outcome.exit_code is None
+    assert outcome.last_output_age_s is not None
     assert outcome.duration_ms < 5000
 
 

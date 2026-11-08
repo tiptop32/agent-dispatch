@@ -94,7 +94,11 @@ def _configure(
         # пользовательская запись подменяет только команду CLI.
         lines.append(f'    command: "{command}"')
     (tmp_config_dir / "config.yaml").write_text(
-        f"router:\n  backend: {backend}\n  claude_local:\n    command: {claude_command!r}\n"
+        (
+            f"router:\n  backend: {backend}\n"
+            "  external:\n    allow_unknown_projects: true\n"
+            f"  claude_local:\n    command: {claude_command!r}\n"
+        )
         + "executors:\n"
         + "\n".join(lines)
         + "\n"

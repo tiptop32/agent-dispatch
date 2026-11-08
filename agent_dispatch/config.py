@@ -58,8 +58,16 @@ class ClaudeLocalSettings(_ConfigModel):
     model: str | None = None
 
 
+class ExternalRouterSettings(_ConfigModel):
+    """Local policy for sending task state to an external router."""
+
+    trusted_roots: list[Path] = Field(default_factory=list)
+    allow_unknown_projects: bool = False
+
+
 class RouterSettings(_ConfigModel):
-    backend: Literal["jev", "claude_local"] = "jev"
+    backend: Literal["static", "jev", "claude_local"] = "static"
+    external: ExternalRouterSettings = Field(default_factory=ExternalRouterSettings)
     jev: JevSettings = Field(default_factory=JevSettings)
     claude_local: ClaudeLocalSettings = Field(default_factory=ClaudeLocalSettings)
 
@@ -166,6 +174,11 @@ class ExecutionSettings(_ConfigModel):
     #: Запуск правки кончился без блока отчёта, но с изменёнными файлами: демон
     #: продолжает ту же сессию коротким «дай отчёт» с этим пределом; 0 отключает.
     report_recovery_timeout_seconds: int = Field(300, ge=0)
+    #: Повтор только для transport ошибки до первого ответа и неизменённой
+    #: рабочей копии; 0 выключает. Повтор не заменяет escalation.
+    transport_retry_attempts: int = Field(1, ge=0)
+    transport_retry_max_seconds: int = Field(60, ge=0)
+    transport_retry_backoff_seconds: float = Field(1.0, ge=0, allow_inf_nan=False)
 
 
 class ExecutorSettings(_ConfigModel):

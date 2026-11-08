@@ -34,6 +34,40 @@ class FeedbackRequest(BaseModel):
 MAX_WAIT_SECONDS = 600
 
 
+def _error_detail(
+    code: str, message: str, *, retryable: bool, next_action: str
+) -> dict[str, object]:
+    return {
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+        "next_action": next_action,
+    }
+
+
+def _followup_error_detail(message: str) -> dict[str, object]:
+    if "is still " in message:
+        return _error_detail(
+            "task_in_progress",
+            message,
+            retryable=False,
+            next_action="call status(task_id, wait_seconds) and do not dispatch again",
+        )
+    if "not in the working copy" in message:
+        return _error_detail(
+            "worktree_not_integrated",
+            message,
+            retryable=False,
+            next_action="apply the reported patch or branch, then dispatch a new task",
+        )
+    return _error_detail(
+        "followup_not_allowed",
+        message,
+        retryable=False,
+        next_action="inspect the previous task result before retrying",
+    )
+
+
 def to_view(record: TaskRecord) -> TaskView:
     path = Path(record.log_path)
     try:
@@ -121,7 +155,7 @@ def build_router() -> APIRouter:
         except KeyError:
             raise HTTPException(404, "task not found") from None
         except FollowupError as exc:
-            raise HTTPException(409, str(exc)) from None
+            raise HTTPException(409, detail=_followup_error_detail(str(exc))) from None
         record = await deps.dispatcher.wait(
             record.task_id, min(body.wait_seconds, MAX_WAIT_SECONDS)
         )
@@ -147,8 +181,16 @@ def build_router() -> APIRouter:
             record = await deps.dispatcher.cancel(task_id)
         except KeyError:
             raise HTTPException(404, "task not found") from None
-        except ValueError:
-            raise HTTPException(409, "task already finished") from None
+        except ValueError as exc:
+            raise HTTPException(
+                409,
+                detail=_error_detail(
+                    "task_already_finished",
+                    str(exc) or "task already finished",
+                    retryable=False,
+                    next_action="use followup for a finished task",
+                ),
+            ) from None
         return to_view(record)
 
     @router.post("/tasks/{task_id}/feedback")

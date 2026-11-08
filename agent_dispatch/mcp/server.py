@@ -139,6 +139,10 @@ def _route_lines(decision: RouteDecision) -> list[str]:
 
 #: Поля `result.meta`, которые компактный ответ показывает вызывающему.
 _META_LINES = (
+    "error_code",
+    "retryable",
+    "next_action",
+    "failure_class",
     "warning",
     "resume_failed",
     "cooldown_until",
@@ -224,8 +228,8 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
         if result.error:
             lines.append(f"error: {result.error[:500]}")
         for key in _META_LINES:
-            if value := result.meta.get(key):
-                lines.append(f"{key}: {value}")
+            if key in result.meta:
+                lines.append(f"{key}: {result.meta[key]}")
         if summary:
             if len(summary) > 800:
                 summary = summary[:800] + " …"
@@ -281,6 +285,7 @@ def build_server(
         constraints: list[str] | None = None,
         success_criteria: list[str] | None = None,
         context_mode: str = "prompt+summary",
+        capability: Literal["fast", "balanced", "strong"] | None = None,
         max_capability: Literal["fast", "balanced", "strong"] | None = None,
         kind: str = "task",
         prod: bool = False,
@@ -298,6 +303,7 @@ def build_server(
                     constraints=constraints or [],
                     success_criteria=success_criteria or [],
                     context_mode=ContextMode(context_mode),
+                    capability=capability,
                     max_capability=max_capability,
                     kind=kind,
                     prod=prod,
@@ -325,6 +331,7 @@ def build_server(
         allow_escalation: bool,
         wait_seconds: int | None,
         timeout_seconds: int | None,
+        capability: Literal["fast", "balanced", "strong"] | None,
         max_capability: Literal["fast", "balanced", "strong"] | None,
         verbose: bool,
         kind: str = "task",
@@ -345,6 +352,7 @@ def build_server(
                 success_criteria=success_criteria or [],
                 context_mode=ContextMode(context_mode),
                 executor=executor,
+                capability=capability,
                 allow_escalation=allow_escalation,
                 wait_seconds=wait,
                 timeout_seconds=timeout_seconds,
@@ -378,6 +386,7 @@ def build_server(
         allow_escalation: bool = True,
         wait_seconds: int | None = None,
         timeout_seconds: int | None = None,
+        capability: Literal["fast", "balanced", "strong"] | None = None,
         max_capability: Literal["fast", "balanced", "strong"] | None = None,
         kind: str = "task",
         verify: list[str] | None = None,
@@ -397,6 +406,7 @@ def build_server(
             allow_escalation,
             wait_seconds,
             timeout_seconds,
+            capability,
             max_capability,
             verbose,
             kind,
@@ -445,6 +455,7 @@ def build_server(
             allow_escalation,
             wait_seconds,
             timeout_seconds,
+            None,
             None,
             verbose,
             kind,

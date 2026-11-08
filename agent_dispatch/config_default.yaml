@@ -10,7 +10,11 @@ mcp:
   wait_seconds: 50
 
 router:
-  backend: jev
+  backend: static
+  external:
+    # External Jev/OpenRouter receives task text only for explicitly trusted roots.
+    trusted_roots: []
+    allow_unknown_projects: false
   jev:
     base_url: https://openrouter.ai/api/alpha/decisions
     model: typesafe/jev-1.13
@@ -62,7 +66,10 @@ execution:
   keep_worktrees: false
   idle_timeout_seconds: 900
   verify_timeout_seconds: 600 # предел на каждую команду verify из запроса
-  report_recovery_timeout_seconds: 300 # дозапрос отчёта в той же сессии, если работа есть, а блока нет; 0 выключает
+  report_recovery_timeout_seconds: 300 # дозапрос отчёта в той же сессии, если работа есть, а блок нет; 0 выключает
+  transport_retry_attempts: 1 # только безопасный transport retry до первого ответа; 0 выключает
+  transport_retry_max_seconds: 60
+  transport_retry_backoff_seconds: 1.0
 
 executors:
   claude:

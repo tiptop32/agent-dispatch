@@ -22,6 +22,7 @@ from .harness import (
     feedback_summary,
     load,
     load_decisions,
+    outcome_metrics,
     perimeter_violations,
     post_review,
     recommendations,
@@ -120,6 +121,7 @@ def main() -> int:
     )
     report["children_refusals"] = children_refusals(tasks, settings.routing.max_children)
     report["delegations"] = delegations(tasks)
+    report["outcomes"] = outcome_metrics(tasks)
     report["timeouts"] = timeouts(tasks)
     report["post_review"] = post_review(tasks)
     report["feedback"] = feedback_summary(tasks)
