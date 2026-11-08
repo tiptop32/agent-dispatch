@@ -608,3 +608,34 @@ def test_doctor_exits_zero_when_all_checks_are_green(tmp_config_dir):
     _mock_health(settings, _state())
     result = runner.invoke(app, ["doctor"])
     assert result.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_jev_without_trusted_roots_fails_before_any_probe(tmp_config_dir):
+    settings = _configure(tmp_config_dir, key="test-key")
+    settings.router.external.allow_unknown_projects = False
+    checks = await run_checks(settings, online=True)
+    assert checks[-1].name == "router-external" and not checks[-1].ok
+    assert "trusted_roots" in checks[-1].detail
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_jev_online_probe_runs_from_a_trusted_root(tmp_config_dir, tmp_path):
+    settings = _configure(tmp_config_dir, key="test-key")
+    settings.router.external.allow_unknown_projects = False
+    settings.router.external.trusted_roots = [tmp_path / "missing", tmp_path]
+    respx.post(settings.router.jev.base_url).mock(
+        return_value=httpx.Response(200, json=json.loads(JEV_RESPONSE.read_text()))
+    )
+    checks = await run_checks(settings, online=True)
+    assert checks[-1].name == "jev" and checks[-1].ok, checks[-1]
+
+
+@pytest.mark.asyncio
+async def test_explore_share_without_jev_backend_warns(tmp_config_dir):
+    settings = _configure(tmp_config_dir, backend="static")
+    settings.routing.explore_share = 0.2
+    checks = await run_checks(settings)
+    warning = next(c for c in checks if c.name == "explore-share")
+    assert warning.ok and warning.warning and "no effect" in warning.detail

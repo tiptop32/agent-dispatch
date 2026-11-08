@@ -347,6 +347,15 @@ def test_worktrees_clean_with_delete_branches_removes_orphan_branches(
     assert worktree.list_branches(git_repo, "agent-dispatch") == []
 
 
+def test_worktrees_from_non_git_directory_explains_all_option(tmp_config_dir, tmp_path):
+    result = runner.invoke(app, ["worktrees", "--cwd", str(tmp_path), "--clean"])
+
+    output = result.output + getattr(result, "stderr", "")
+    assert result.exit_code == 2
+    assert "not a git repository" in output
+    assert "--all" in output
+
+
 def test_worktrees_reports_an_empty_repository(tmp_config_dir, git_repo):
     result = runner.invoke(app, ["worktrees", "--cwd", str(git_repo)])
 

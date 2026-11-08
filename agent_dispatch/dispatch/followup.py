@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from agent_dispatch.dispatch.task_package import FOLLOWUP_SUMMARY_LIMIT, Followup
 from agent_dispatch.models import FINAL_STATUSES, DispatchRequest, FollowupRequest, TaskRecord
 
@@ -13,8 +15,18 @@ from agent_dispatch.models import FINAL_STATUSES, DispatchRequest, FollowupReque
 VERIFY_TAIL_LIMIT = 1500
 
 
+FollowupErrorCode = Literal["task_in_progress", "no_executor_run", "worktree_not_integrated"]
+
+
 class FollowupError(ValueError):
-    """Продолжить задачу нельзя: она ещё идёт или её работы нет в рабочей копии."""
+    """Продолжить задачу нельзя: она ещё идёт или её работы нет в рабочей копии.
+
+    `code` машинный: API отдаёт его вызывающему, не разбирая текст сообщения.
+    """
+
+    def __init__(self, message: str, *, code: FollowupErrorCode):
+        super().__init__(message)
+        self.code: FollowupErrorCode = code
 
 
 def continued_link(chain: list[TaskRecord]) -> TaskRecord:
@@ -26,10 +38,14 @@ def continued_link(chain: list[TaskRecord]) -> TaskRecord:
     """
     last = chain[-1]
     if last.status not in FINAL_STATUSES:
-        raise FollowupError(f"task {last.task_id} is still {last.status.value}")
+        raise FollowupError(
+            f"task {last.task_id} is still {last.status.value}", code="task_in_progress"
+        )
     ran = [link for link in chain if _reached_executor(link)]
     if not ran:
-        raise FollowupError(f"task {last.task_id} never reached an executor")
+        raise FollowupError(
+            f"task {last.task_id} never reached an executor", code="no_executor_run"
+        )
     link = ran[-1]
     meta = link.result.meta if link.result else {}
     # Работа вне рабочей копии: патч, ветка или оставшееся дерево (сбой
@@ -40,7 +56,8 @@ def continued_link(chain: list[TaskRecord]) -> TaskRecord:
         where = meta.get("patch") or meta.get("branch") or meta.get("worktree")
         raise FollowupError(
             f"work of task {link.task_id} is not in the working copy (integrated: false): "
-            f"apply {where} first or dispatch a new task"
+            f"apply {where} first or dispatch a new task",
+            code="worktree_not_integrated",
         )
     return link
 

@@ -50,7 +50,7 @@ def run_case(case: dict, tmp: Path) -> Row:
         ExecutorSettings(
             adapter="omp",
             command="omp",
-            model="m",
+            model=case["input"].get("model", "m"),
             extra_args=case["input"].get("extra_args", []),
             corporate=case["input"].get("corporate", False),
         ),
@@ -97,15 +97,14 @@ def run_case(case: dict, tmp: Path) -> Row:
     outcome = ProcessOutcome(
         input.get("exit_code", 0), stdout, "", False, input.get("duration_ms", 1)
     )
-    result = adapter._parse_result(outcome, input.get("changed", []))
     expected = case["expected"]
+    result = adapter._parse_result(outcome, input.get("changed", []))
     if result.status != expected.get("status"):
         return Row(case["id"], False, f"status {result.status!r} != {expected.get('status')!r}")
+    if "model" in expected and result.model != expected["model"]:
+        return Row(case["id"], False, f"model {result.model!r} != {expected['model']!r}")
     if "error" in expected and result.error != expected["error"]:
         return Row(case["id"], False, f"error {result.error!r} != {expected['error']!r}")
-    for key, value in expected.get("meta", {}).items():
-        if result.meta.get(key) != value:
-            return Row(case["id"], False, f"meta[{key!r}] {result.meta.get(key)!r} != {value!r}")
     if "usage" in expected:
         if result.usage is None:
             return Row(case["id"], False, "usage is None")

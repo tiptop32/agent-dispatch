@@ -71,6 +71,10 @@ class BaseExecutorAdapter:
     #: имеет смысл только для таких: CLI, который печатает всё одним куском в
     #: конце, он убивал бы на любой задаче длиннее лимита.
     streams_output: bool = True
+    #: Адаптер помечает `meta.transport_before_output`, когда запуск оборвался до
+    #: первого ответа модели. Только для таких диспетчер снимает отпечаток копии
+    #: под ограниченный повтор транспорта.
+    reports_transport_before_output: bool = False
 
     def __init__(
         self, name: str, settings: ExecutorSettings, base_env: dict[str, str] | None = None

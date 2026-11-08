@@ -228,8 +228,14 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
         if result.error:
             lines.append(f"error: {result.error[:500]}")
         for key in _META_LINES:
-            if key in result.meta:
-                lines.append(f"{key}: {result.meta[key]}")
+            value = result.meta.get(key)
+            # Пустые значения (`branch: ''`, None) не печатаются: вызывающий
+            # перечитывает ответ на каждом ходе. `retryable: False` значим и остаётся.
+            if value is None or value == "" or value == [] or value == {}:
+                continue
+            if key == "error_code" and value == result.meta.get("failure_class"):
+                continue  # тот же код, что и в failure_class
+            lines.append(f"{key}: {value}")
         if summary:
             if len(summary) > 800:
                 summary = summary[:800] + " …"

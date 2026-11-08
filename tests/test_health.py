@@ -543,3 +543,39 @@ def test_internal_failure_taxonomy_covers_cancellation_and_verification():
 )
 def test_transport_messages_keep_legacy_network_kind(error):
     assert classify_failure(_failed(error)) == "network"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "MCP server mcphub failed: connection closed",
+        "MCP server x failed: websocket error while connecting",
+        "agent note: we fixed the transport error in reconnect()",
+    ],
+)
+def test_transport_words_after_a_prefix_are_not_an_executor_failure(error):
+    # Сбой MCP-сервера или слова агента не выводят группу omp/* из ротации.
+    assert classify_failure(_failed(error)) is None
+    assert classify_failure_kind(_failed(error)) == "task_failed"
+
+
+def test_provider_prefixed_transport_line_is_network():
+    error = "Codex websocket transport error: stream closed"
+    assert classify_failure(_failed(error)) == "network"
+    assert classify_failure_kind(_failed(error)) == "transport_error"
+
+
+def test_partial_without_cli_error_is_never_transport_error():
+    # Задача про websocket закончилась partial без ошибки CLI: это работа, а
+    # не обрыв транспорта, иначе эскалация no_result была бы подавлена.
+    result = ExecutionResult(
+        status="partial",
+        executor="x",
+        model=None,
+        summary="",
+        error="websocket closed",
+    )
+    assert classify_failure_kind(result) == "task_failed"
+    assert classify_failure_kind(result.model_copy(update={"meta": {"cli_error": True}})) == (
+        "transport_error"
+    )

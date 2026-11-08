@@ -327,6 +327,16 @@ async def _daemon_check(settings: Settings) -> Check:
     return Check(name="daemon", ok=True, detail=f"running pid {state.pid} port {state.port}")
 
 
+def _external_probe_cwd(settings: Settings) -> str | None:
+    """Каталог, из которого внешний роутер примет пробу, или None."""
+    policy = settings.router.external
+    for root in policy.trusted_roots:
+        path = root.expanduser()
+        if path.is_dir():
+            return str(path)
+    return "." if policy.allow_unknown_projects else None
+
+
 async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
     checks = [_config_check(), _install_check()]
     if settings.router.backend in {"static", "claude_local"}:
@@ -363,13 +373,44 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
                 detail=availability.version or error + _trapped_secret_hint(settings, error),
             )
         )
+    if settings.routing.explore_share > 0 and settings.router.backend != "jev":
+        checks.append(
+            Check(
+                name="explore-share",
+                ok=True,
+                warning=True,
+                detail=(
+                    f"routing.explore_share={settings.routing.explore_share} has no effect: "
+                    f"the experiment compares Jev decisions, backend is {settings.router.backend}"
+                ),
+            )
+        )
     if settings.router.backend == "static":
         checks.append(Check(name="router", ok=True, detail="static: no network call"))
         return checks
+    probe_cwd = "."
+    if settings.router.backend == "jev":
+        trusted = _external_probe_cwd(settings)
+        if trusted is None:
+            checks.append(
+                Check(
+                    name="router-external",
+                    ok=False,
+                    detail=(
+                        "backend jev, but router.external.trusted_roots has no existing "
+                        "directory and allow_unknown_projects is false: every Jev call is "
+                        "refused and routing falls back to claude_local"
+                    ),
+                )
+            )
+            return checks
+        probe_cwd = trusted
     if not online:
         checks.append(Check(name="jev", ok=True, detail="skipped (use --online)"))
         return checks
-    probe = DispatchRequest(task="ping", cwd=".", source_agent=SourceAgent.cli)
+    # Jev получает состояние задачи только из доверенного корня: проба из `.`
+    # краснела бы при здоровом Jev.
+    probe = DispatchRequest(task="ping", cwd=probe_cwd, source_agent=SourceAgent.cli)
 
     started = time.monotonic()
     candidates = settings.enabled_executors()

@@ -7,6 +7,8 @@ from pathlib import Path
 from agent_dispatch.config import Settings
 from agent_dispatch.models import DispatchRequest
 
+EXTERNAL_ROUTER_DENIED = "external router denied: cwd is not a configured trusted project"
+
 
 def _real_directory(value: str | Path) -> Path | None:
     try:

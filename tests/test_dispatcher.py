@@ -261,6 +261,8 @@ async def test_max_hops_guard(tmp_path, git_repo):
     _, _, a, d = await _make(tmp_path, max_hops=1)
     out = await d.wait((await d.submit(_req(git_repo, hop=1))).task_id, WAIT)
     assert out.result and out.result.meta["guard"] == "max_hops" and not a["omp"].calls
+    # Глубина со временем не меняется: повтор того же запроса бесполезен.
+    assert out.result.meta["retryable"] is False
 
 
 @pytest.mark.asyncio
@@ -297,6 +299,8 @@ async def test_max_children_guard(tmp_path, git_repo):
     )
     assert refused.result.meta["guard"] == "max_children"
     assert refused.result.error == "sibling count 2 >= 2"
+    # Отказ снимается, когда дети закончат: вызывающий вправе повторить позже.
+    assert refused.result.meta["retryable"] is True
     assert retried.result.error == "sibling count 2 >= 2"
 
 

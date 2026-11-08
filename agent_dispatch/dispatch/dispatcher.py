@@ -537,7 +537,9 @@ class Dispatcher:
             meta={
                 "guard": guard.reason.value,
                 "error_code": guard.reason.value,
-                "retryable": guard.reason in {GuardReason.router_unavailable},
+                # Эти отказы снимаются сами: остывание, завершение детей, новые сутки.
+                "retryable": guard.reason
+                in {GuardReason.unavailable, GuardReason.max_children, GuardReason.budget},
                 "next_action": next_action,
             },
         )
@@ -855,12 +857,19 @@ class Dispatcher:
             {"executor": decision.executor, "hop": req.hop, "cwd": req.cwd},
         )
         before = await self._review_fingerprint(req) if review else None
+        max_attempts = self.settings.execution.transport_retry_attempts
+        max_elapsed = float(self.settings.execution.transport_retry_max_seconds)
+        backoff = self.settings.execution.transport_retry_backoff_seconds
         retry_count = 0
         retry_started = time.monotonic()
-        try:
-            retry_fingerprint = await asyncio.to_thread(workspace.fingerprint, ctx.cwd)
-        except (OSError, subprocess.CalledProcessError):
-            retry_fingerprint = None
+        retry_fingerprint: str | None = None
+        # Отпечаток всей рабочей копии стоит `git diff --binary` и чтения всех
+        # неотслеживаемых файлов: снимаем его, только если повтор вообще возможен.
+        if max_attempts > 0 and getattr(adapter, "reports_transport_before_output", False):
+            try:
+                retry_fingerprint = await asyncio.to_thread(workspace.fingerprint, ctx.cwd)
+            except (OSError, subprocess.CalledProcessError):
+                retry_fingerprint = None
         result = await self._call_adapter(adapter, ctx, decision)
         if ctx.resume_session and self._resume_failed(result):
             # Сессию не нашли или CLI другой версии не понял флаги: один раз
@@ -873,9 +882,6 @@ class Dispatcher:
             ctx = await self._build_context(record, decision, tree, resume=False)
             result = await self._call_adapter(adapter, ctx, decision)
             result.meta["resume_failed"] = True
-        max_attempts = int(getattr(self.settings.execution, "transport_retry_attempts", 1))
-        max_elapsed = float(getattr(self.settings.execution, "transport_retry_max_seconds", 60))
-        backoff = float(getattr(self.settings.execution, "transport_retry_backoff_seconds", 1.0))
         while result.meta.get("transport_before_output") and retry_fingerprint is not None:
             try:
                 unchanged = (
@@ -1498,9 +1504,12 @@ class Dispatcher:
         reason = should_escalate(result)
         if reason is None:
             return None
-        if classify_internal_failure(result) == "transport_error":
-            # Один безопасный retry уже выполнен выше. Более дорогой executor не
-            # исправит обрыв websocket и может наложиться на скрытую работу.
+        retried = bool(result.meta.get("retry_count"))
+        if retried and classify_internal_failure(result) == "transport_error":
+            # Безопасный повтор того же исполнителя уже был и снова оборвался на
+            # транспорте: более дорогой исполнитель обрыв не исправит. Без
+            # повтора (выключен, долгий первый запуск, правки в копии, адаптер
+            # без `transport_before_output`) эскалация идёт как раньше.
             result.meta["escalation_suppressed"] = "transport_error"
             return None
         failure = result.meta.get("executor_failure")

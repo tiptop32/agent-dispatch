@@ -469,7 +469,8 @@ def worktrees(
         # Ветки без каталога остаются от `integrate: branch`, их тоже надо показать.
         orphans = worktree.list_branches(cwd, prefix)
     except worktree.WorktreeError as error:
-        raise typer.BadParameter(str(error), param_hint="--cwd") from error
+        detail = f"{error}; use --all to inspect AgentDispatch worktrees from any directory"
+        raise typer.BadParameter(detail, param_hint="--cwd") from error
     if not trees and not orphans:
         typer.echo("no agent-dispatch worktrees or branches")
         return

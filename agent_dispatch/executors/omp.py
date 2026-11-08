@@ -25,6 +25,7 @@ class OmpAdapter(BaseExecutorAdapter):
     #: omp печатает события по ходу работы: на жёстком таймауте и при зависании
     #: `meta.last_output_age_s` отличает агента, работавшего до конца, от висящего.
     streams_output = True
+    reports_transport_before_output = True
 
     #: Оверлей диспетчера из репозитория omp-setup: `retry.maxRetries: 1`.
     #: Повторами по умолчанию (до 10 с паузами) занимается эскалация диспетчера,

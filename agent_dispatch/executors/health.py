@@ -75,6 +75,16 @@ _INTERNAL_KINDS = frozenset(
     }
 )
 
+#: Строка ошибки транспорта CLI: с начала строки, после необязательного
+#: `error:` и одного слова провайдера. Общая для `network` и `transport_error`.
+_TRANSPORT_LINE = (
+    r"(?m:^[ \t]*(?:error:[ \t]*)?(?:[\w.-]+[ \t]+)?"
+    r"(?:connection[ \t]+(?:reset|closed|aborted|dropped)(?:[ \t]+by[ \t]+peer)?"
+    r"|websocket\b[^\n]*?(?:transport|closed|reset|error)"
+    r"|sequence[_ ]number[ \t]+regressed"
+    r"|transport[ \t]+error))"
+)
+
 _ERROR_PATTERNS: tuple[tuple[LegacyFailureKind, re.Pattern[str]], ...] = (
     (
         "quota",
@@ -115,10 +125,12 @@ _ERROR_PATTERNS: tuple[tuple[LegacyFailureKind, re.Pattern[str]], ...] = (
         re.compile(
             r"^omp: no model response"
             r"|couldn't connect to .+\(connection refused\)"
-            r"|connection (?:reset|closed|aborted|dropped)(?: by peer)?"
-            r"|websocket[^\n]*(?:transport|closed|reset|error)"
-            r"|sequence[_ ]number\s+regressed"
-            r"|TLS certificate verification failed",
+            r"|TLS certificate verification failed"
+            # Обрывы транспорта только с начала строки (допустимы `error:` и одно
+            # слово провайдера, `Codex websocket transport error`): фраза после
+            # префикса `MCP server x failed: connection closed` это сбой
+            # MCP-сервера, и исполнитель с ним работает.
+            rf"|{_TRANSPORT_LINE}",
             re.IGNORECASE,
         ),
     ),
@@ -126,13 +138,6 @@ _ERROR_PATTERNS: tuple[tuple[LegacyFailureKind, re.Pattern[str]], ...] = (
 
 _RATE_LIMIT = re.compile(
     r"rate[ _-]limit|too many requests|\b429\b|throttl(?:ed|ing)", re.IGNORECASE
-)
-_TRANSPORT_ERROR = re.compile(
-    r"sequence[_ ]number\s+regressed"
-    r"|connection\s+(?:reset|closed|aborted|dropped)(?:\s+by\s+peer)?"
-    r"|websocket[^\n]*(?:transport|closed|reset|error)"
-    r"|transport\s+error",
-    re.IGNORECASE,
 )
 
 
@@ -154,8 +159,6 @@ def classify_internal_failure(result: ExecutionResult) -> InternalFailureKind | 
         return "timeout"
     if result.meta.get("stalled") or error.startswith("stalled:"):
         return "stream_stalled"
-    if _TRANSPORT_ERROR.search(error):
-        return "transport_error"
     if result.meta.get("configuration_error") or error.startswith(
         ("cannot start ", "cwd is not a git repository:")
     ):

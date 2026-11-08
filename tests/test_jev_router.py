@@ -205,6 +205,7 @@ async def test_unsure_corporate_answer_below_the_threshold_does_not_narrow_the_p
     s = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
+            "router": {"external": {"allow_unknown_projects": True}},
             "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
             "routing": {"fallback_executor": "omp", "corporate_min_confidence": 0.5},
         }
@@ -238,6 +239,7 @@ async def test_confident_corporate_answer_still_narrows_the_perimeter_at_the_sam
     s = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
+            "router": {"external": {"allow_unknown_projects": True}},
             "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
             "routing": {"fallback_executor": "omp", "corporate_min_confidence": 0.5},
         }
@@ -271,6 +273,7 @@ async def test_corporate_perimeter_off_does_not_ask_the_question():
     s = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
+            "router": {"external": {"allow_unknown_projects": True}},
             "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
             "routing": {"fallback_executor": "omp", "corporate_perimeter": False},
         }
@@ -308,6 +311,7 @@ async def test_corporate_perimeter_off_ignores_the_answer():
     s = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
+            "router": {"external": {"allow_unknown_projects": True}},
             "executors": {"omp": {"adapter": "omp", "model": "agent-lb/luna"}},
             "routing": {"fallback_executor": "omp", "corporate_perimeter": False},
         }
@@ -586,6 +590,7 @@ async def test_corporate_question_is_asked_when_corporate_executors_are_cooling(
     s = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
+            "router": {"external": {"allow_unknown_projects": True}},
             "routing": {"fallback_executor": ["external"]},
             "executors": {
                 "external": {"adapter": "omp", "model": "agent-lb/luna", "tier": "fast"},

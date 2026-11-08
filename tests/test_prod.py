@@ -27,6 +27,7 @@ from agent_dispatch.models import (
     RouteDecision,
     RouterKind,
 )
+from agent_dispatch.routing.base import RouterError
 from agent_dispatch.routing.capability import perimeter_required
 from agent_dispatch.routing.jev import JevRouter
 from agent_dispatch.telemetry.storage import Storage
@@ -299,10 +300,13 @@ async def test_daemon_restart_keeps_the_requirement(tmp_path, git_repo, corporat
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_jev_does_not_ask_about_corporate_data_for_prod():
+async def test_jev_refuses_prod_before_any_network_call():
+    # Прод не уходит внешнему роутеру даже при `allow_unknown_projects`: отказ
+    # живёт в JevRouter и срабатывает до сериализации состояния задачи.
     settings = Settings.model_validate(
         {
             "secrets": {"OPENROUTER_API_KEY": "k"},
+            "router": {"external": {"allow_unknown_projects": True}},
             "routing": {"fallback_executor": "external"},
             "executors": {
                 "external": {"adapter": "omp", "model": "sol", "tier": "fast"},
@@ -310,25 +314,16 @@ async def test_jev_does_not_ask_about_corporate_data_for_prod():
             },
         }
     )
-    answer = {
-        "capability": {
-            "type": "choice",
-            "choice": "fast",
-            "probabilities": {"fast": 1},
-            "confidence": 0.9,
-        }
-    }
     route = respx.post(settings.router.jev.base_url).mock(
-        return_value=httpx.Response(200, json={"answers": answer})
+        return_value=httpx.Response(200, json={"answers": {}})
     )
     candidates = {"internal": settings.executors["internal"]}
     async with httpx.AsyncClient() as client:
-        decision = await JevRouter(settings, client).decide(
-            DispatchRequest(task="x", cwd=".", prod=True), candidates
-        )
-    body = json.loads(route.calls[0].request.content)
-    assert "corporate_data" not in body["questions"]
-    assert decision.executor == "internal" and decision.meta["perimeter"] == "prod"
+        with pytest.raises(RouterError, match="external router denied"):
+            await JevRouter(settings, client).decide(
+                DispatchRequest(task="x", cwd=".", prod=True), candidates
+            )
+    assert not route.called
 
 
 @pytest.mark.asyncio

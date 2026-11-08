@@ -45,26 +45,20 @@ def _error_detail(
     }
 
 
-def _followup_error_detail(message: str) -> dict[str, object]:
-    if "is still " in message:
-        return _error_detail(
-            "task_in_progress",
-            message,
-            retryable=False,
-            next_action="call status(task_id, wait_seconds) and do not dispatch again",
-        )
-    if "not in the working copy" in message:
-        return _error_detail(
-            "worktree_not_integrated",
-            message,
-            retryable=False,
-            next_action="apply the reported patch or branch, then dispatch a new task",
-        )
+#: Что делать вызывающему при каждом отказе follow-up (`FollowupError.code`).
+_FOLLOWUP_NEXT_ACTION = {
+    "task_in_progress": "call status(task_id, wait_seconds) and do not dispatch again",
+    "worktree_not_integrated": "apply the reported patch or branch, then dispatch a new task",
+    "no_executor_run": "inspect the previous task result before retrying",
+}
+
+
+def _followup_error_detail(exc: FollowupError) -> dict[str, object]:
     return _error_detail(
-        "followup_not_allowed",
-        message,
+        exc.code,
+        str(exc),
         retryable=False,
-        next_action="inspect the previous task result before retrying",
+        next_action=_FOLLOWUP_NEXT_ACTION[exc.code],
     )
 
 
@@ -155,7 +149,7 @@ def build_router() -> APIRouter:
         except KeyError:
             raise HTTPException(404, "task not found") from None
         except FollowupError as exc:
-            raise HTTPException(409, detail=_followup_error_detail(str(exc))) from None
+            raise HTTPException(409, detail=_followup_error_detail(exc)) from None
         record = await deps.dispatcher.wait(
             record.task_id, min(body.wait_seconds, MAX_WAIT_SECONDS)
         )

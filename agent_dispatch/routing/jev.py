@@ -18,7 +18,7 @@ from .capability import (
     select,
     tiers_present,
 )
-from .preflight import external_router_allowed
+from .preflight import EXTERNAL_ROUTER_DENIED, external_router_allowed
 from .questions import build_questions, build_state, parse_answers
 
 
@@ -61,10 +61,10 @@ class JevRouter:
     async def decide(
         self, req: DispatchRequest, candidates: dict[str, ExecutorSettings]
     ) -> RouteDecision:
-        if self.settings.router.backend == "jev" and not external_router_allowed(
-            req, self.settings
-        ):
-            raise RouterError("external router denied: cwd is not a configured trusted project")
+        # Единственная проверка перед отправкой состояния задачи наружу: её
+        # проходят и dispatch, и `doctor --online`.
+        if not external_router_allowed(req, self.settings):
+            raise RouterError(EXTERNAL_ROUTER_DENIED)
         cfg = self.settings.router.jev
         api_key = self.settings.secret(cfg.api_key_env)
         if not api_key:

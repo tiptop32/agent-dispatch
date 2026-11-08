@@ -502,3 +502,24 @@ async def test_dispatch_tools_pass_review_base(tmp_path):
     await call(settings(tmp_path), "dispatch", args)
     for sent in request.calls:
         assert '"review_base":"abc1234"' in sent.request.content.decode()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compact_output_skips_empty_meta_and_duplicate_error_code(tmp_path):
+    failed = view(status="failed", summary="")
+    failed.result.meta = {
+        "branch": "",
+        "patch": None,
+        "error_code": "task_failed",
+        "failure_class": "task_failed",
+        "retryable": False,
+    }
+    respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(200, json=failed.model_dump(mode="json"))
+    )
+    text = (await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})).content[0].text
+    assert "failure_class: task_failed" in text
+    assert "error_code" not in text
+    assert "branch:" not in text and "patch:" not in text
+    assert "retryable: False" in text

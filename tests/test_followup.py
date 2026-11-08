@@ -222,8 +222,9 @@ async def test_followup_refuses_running_unknown_and_never_run_tasks(tmp_path, gi
         (await dispatcher.submit(_req(git_repo, executor="missing"))).task_id,
     )
     assert refused.status == TaskStatus.failed
-    with pytest.raises(FollowupError, match="never reached an executor"):
+    with pytest.raises(FollowupError, match="never reached an executor") as never:
         await dispatcher.followup(refused.task_id, FollowupRequest(message="x"))
+    assert never.value.code == "no_executor_run"
 
     gate = asyncio.Event()
 
@@ -233,8 +234,9 @@ async def test_followup_refuses_running_unknown_and_never_run_tasks(tmp_path, gi
     adapters["omp"].on_execute = wait_gate
     running = await dispatcher.submit(_req(git_repo))
     await asyncio.wait_for(adapters["omp"].started.wait(), WAIT)
-    with pytest.raises(FollowupError, match="is still"):
+    with pytest.raises(FollowupError, match="is still") as still:
         await dispatcher.followup(running.task_id, FollowupRequest(message="x"))
+    assert still.value.code == "task_in_progress"
     gate.set()
     await _done(dispatcher, running.task_id)
 
@@ -249,8 +251,9 @@ async def test_followup_refuses_work_that_is_not_in_the_working_copy(tmp_path, g
     first = await _done(dispatcher, (await dispatcher.submit(_req(git_repo))).task_id)
     assert first.result.meta["integrated"] is False
 
-    with pytest.raises(FollowupError, match="not in the working copy"):
+    with pytest.raises(FollowupError, match="not in the working copy") as kept:
         await dispatcher.followup(first.task_id, FollowupRequest(message="more"))
+    assert kept.value.code == "worktree_not_integrated"
 
 
 @pytest.mark.asyncio

@@ -122,3 +122,33 @@ async def test_static_backend_honors_explicit_capability(tmp_path: Path) -> None
             routers,
         )
     assert decision.executor == "fast"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_untrusted_jev_falls_back_through_decide_with_fallback(tmp_path: Path) -> None:
+    # Отказ preflight живёт в JevRouter: путь dispatch получает RouterError и
+    # обычный fallback, не дойдя до сети.
+    route = respx.post("https://router.invalid/decide").respond(200, json={})
+    settings = Settings.model_validate(
+        {
+            "router": {"backend": "jev", "jev": {"base_url": "https://router.invalid/decide"}},
+            "routing": {"fallback_executor": "balanced"},
+            # Два кандидата: с одним decide_with_fallback не зовёт роутер вовсе.
+            "executors": {
+                "balanced": {"adapter": "omp", "model": "m", "tier": "balanced"},
+                "strong": {"adapter": "claude", "tier": "strong"},
+            },
+            "secrets": {"OPENROUTER_API_KEY": "test-key"},  # pragma: allowlist secret
+        }
+    )
+    async with httpx.AsyncClient() as client:
+        decision, events = await decide_with_fallback(
+            DispatchRequest(task="unknown project", cwd=str(tmp_path)),
+            settings.enabled_executors(),
+            settings,
+            [JevRouter(settings, client)],
+        )
+    assert not route.called
+    assert decision.router == RouterKind.fallback
+    assert any("external router denied" in event.detail for event in events)
