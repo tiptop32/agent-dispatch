@@ -1,0 +1,6 @@
+# Continue the started work
+Continue the unfinished implementation from task {{ from_task }} instead of starting over.
+Its changes are carried into your workspace when possible. Inspect the current files before editing; if patch application failed, the workspace is clean and you must reconstruct the missing work.
+{% if error %}Previous interruption: {{ error }}
+{% endif %}Previous attempt summary:
+{{ summary or "(empty)" }}

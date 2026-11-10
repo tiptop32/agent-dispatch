@@ -24,12 +24,15 @@ from evals.replay.harness import (
     acceptance,
     added_lines,
     agent_lb_costs,
+    caller_bytes,
     children_refusals,
     cost_drift,
     delegations,
     exploration_comparison,
     feedback_summary,
+    fix_round,
     git_acceptance,
+    handoff,
     load,
     load_decisions,
     outcome_metrics,
@@ -38,8 +41,10 @@ from evals.replay.harness import (
     recommendations,
     render,
     replay,
+    review_stages,
     router_vs_static,
     timeouts,
+    watchdog,
 )
 
 SCHEMA = Path(__file__).parent.parent / "agent_dispatch" / "telemetry" / "schema.sql"
@@ -164,6 +169,54 @@ def test_recommendations_prioritize_observed_waste_and_missing_instrumentation()
         "exploration.sample_size",
     ]
     assert "2/10" in items[0]["evidence"]
+
+
+@pytest.mark.parametrize("busy_seconds,expected", [(0, 0), (180, 1)])
+def test_replay_command_respects_busy_cooldown(
+    tmp_path, monkeypatch, capsys, busy_seconds, expected
+):
+    import sys
+
+    from agent_dispatch.config import load_settings
+    from evals.replay import __main__ as replay_main
+
+    db = _db(
+        tmp_path,
+        [
+            (
+                "busy",
+                "omp/sol",
+                "10:00",
+                "10:01",
+                1,
+                None,
+                _result("failed", error="429 ConcurrencyLimitModel"),
+            ),
+            ("next", "omp/sol", "10:02", "10:03", 1, None, _result("completed")),
+        ],
+    )
+    settings = load_settings()
+    settings.routing.busy_cooldown_seconds = busy_seconds
+    monkeypatch.setattr(replay_main, "load_settings", lambda: settings)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "replay",
+            "--db",
+            str(db),
+            "--no-git",
+            "--json",
+            "--agent-lb-db",
+            str(tmp_path / "missing"),
+        ],
+    )
+
+    assert replay_main.main() == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["busy_cooldown_seconds"] == busy_seconds
+    assert report["executor_failures"][0]["kind"] == "model_busy"
+    assert len(report["avoidable_runs"]) == expected
 
 
 def test_replay_counts_runs_sent_to_an_executor_that_was_down(tmp_path):
@@ -414,6 +467,39 @@ def test_replay_reports_queue_wait_by_limit_group_from_slot_events_only(tmp_path
     assert "queue wait by limit group (slot events only):" in text
     assert "codex: 1 over 60 s of 2, avg 60.0 s, max 90.0 s" in text
     assert "no slot events yet" not in text
+
+
+def test_replay_skips_executor_slot_events_in_group_queue_metrics(tmp_path):
+    db = _db(
+        tmp_path,
+        [("a" * 32, "codex/sol", "10:00", "10:01", 1, None, _result("completed"))],
+    )
+    _slot_event(db, "a" * 32, "codex", 45.0, queue_fallback=True)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "insert into events (task_id, ts, kind, payload_json) values (?, ?, ?, ?)",
+            (
+                "a" * 32,
+                "2026-09-23T10:00:00+00:00",
+                "slot",
+                json.dumps(
+                    {
+                        "executor": "codex/sol",
+                        "limit_group": "codex",
+                        "executor_wait_seconds": 300,
+                        "inherited_from": None,
+                        "queue_fallback": False,
+                    }
+                ),
+            ),
+        )
+
+    report = replay(load(db))
+
+    assert report["queue_wait_by_limit_group"]["codex"]["samples"] == 1
+    assert report["queue_wait_by_limit_group"]["codex"]["avg_seconds"] == 45
+    assert report["queue_policy"]["samples"] == 1
+    assert report["queue_policy"]["switched"] == 1
 
 
 def test_replay_says_when_there_are_no_slot_events(tmp_path):
@@ -1697,3 +1783,308 @@ def test_post_review_counts_a_chain_with_two_failed_reviews_once():
 
     assert report["verdicts"]["fail"] == 2
     assert report["review_failed"] == {"escalated": 1, "completed": 1, "not_completed": 0}
+
+
+def test_caller_bytes_joins_full_ancestry_and_reports_root_coverage(tmp_path):
+    root = _task("root", "partial", executor="omp/free")
+    escalation = _task("escalation", "completed", parent="root")
+    followup = replace(_task("followup", "completed"), followup_of="escalation")
+    review = replace(_task("review", "completed", parent_task_id="followup"), kind="review")
+    other = _task("other", "completed", executor="omp/free")
+    missing = _task("missing", "completed")
+    path = tmp_path / "mcp_responses.jsonl"
+    rows = [
+        {
+            "ts": "2026-09-23T10:00:00Z",
+            "tool": "status",
+            "task_id": task_id,
+            "bytes": size,
+            "verbose": False,
+        }
+        for task_id, size in [
+            ("root", 10),
+            ("escalation", 20),
+            ("followup", 30),
+            ("review", 40),
+            ("other", 300),
+        ]
+    ]
+    rows += [
+        {"task_id": None, "bytes": 900, "tool": "route"},
+        {"task_id": "outside", "bytes": 900},
+        {"task_id": "root", "bytes": True},
+        {"task_id": "root", "bytes": -1},
+        {"task_id": "root", "bytes": "secret"},
+        {"task_id": ["root"], "bytes": 5},
+        ["secret"],
+    ]
+    path.write_text("\n".join(json.dumps(row) for row in rows) + '\n{"secret":\n')
+
+    report = caller_bytes([review, followup, missing, escalation, other, root], path)
+
+    assert report["roots"] == 3
+    assert report["measured"] == 2
+    assert report["coverage"] == pytest.approx(2 / 3)
+    assert report["bytes"] == 400
+    assert report["median_bytes"] == 200
+    assert report["p90_bytes"] == 280
+    assert report["by_executor"]["omp/free"]["measured"] == 2
+    assert report["by_executor"]["omp/free"]["median_bytes"] == 200
+    assert "secret" not in json.dumps(report)
+    assert caller_bytes([root], tmp_path / "absent")["coverage"] == 0
+    assert caller_bytes([], path)["coverage"] is None
+    later = root.created_at + timedelta(days=1)
+    assert (
+        caller_bytes([root, replace(followup, created_at=later), escalation], path, since=later)[
+            "roots"
+        ]
+        == 0
+    )
+
+
+def test_watchdog_and_handoff_measure_downstream_outcomes_not_review_completion():
+    idle = _task(
+        "idle",
+        "failed",
+        executor="omp/free",
+        result=_result(
+            "failed", meta={"watchdog": {"reason": "idle", "idle_s": 310, "tool_open": False}}
+        ),
+    )
+    looping = _task(
+        "loop",
+        "failed",
+        result=_result(
+            "failed", meta={"watchdog": {"reason": "looping", "repeats": 6, "tool_open": True}}
+        ),
+    )
+    tool_idle = _task(
+        "tool",
+        "failed",
+        result=_result(
+            "failed", meta={"watchdog": {"reason": "idle", "idle_s": 910, "tool_open": True}}
+        ),
+    )
+    resumed = replace(_task("resumed", "completed", executor="omp/free"), followup_of="idle")
+    transferred = _task(
+        "transfer",
+        "failed",
+        parent="loop",
+        result=_result(
+            "failed",
+            meta={"handoff": {"from_task": "loop", "mode": "patch", "apply_failed": False}},
+        ),
+    )
+    completed = _task("done", "completed", parent="transfer")
+    rejected = _task(
+        "rejected",
+        "failed",
+        parent="tool",
+        result=_result(
+            "failed", meta={"handoff": {"from_task": "tool", "mode": "patch", "apply_failed": True}}
+        ),
+    )
+    review = replace(_task("review", "completed", parent_task_id="rejected"), kind="review")
+    in_place = _task(
+        "inplace",
+        "completed",
+        result=_result("completed", meta={"handoff": {"from_task": "idle", "mode": "in_place"}}),
+    )
+    legacy = _task(
+        "old", "failed", result=_result("failed", meta={"watchdog": "secret", "handoff": []})
+    )
+    tasks = [
+        idle,
+        looping,
+        tool_idle,
+        resumed,
+        transferred,
+        completed,
+        rejected,
+        review,
+        in_place,
+        legacy,
+    ]
+
+    watch = watchdog(tasks)
+    assert (watch["count"], watch["idle"], watch["looping"]) == (3, 2, 1)
+    assert (watch["tool_open"], watch["tool_closed"]) == (2, 1)
+    assert watch["completed_followup_same_executor"] == 1
+    assert handoff(tasks) == {
+        "count": 3,
+        "completed": 2,
+        "not_completed": 1,
+        "in_flight": 0,
+        "apply_failed": 1,
+        "by_mode": {"in_place": 1, "patch": 2},
+    }
+
+
+def test_fix_round_counts_verdicts_and_only_measured_costs():
+    rounds = [
+        {
+            "round": 1,
+            "trigger": "review_failed",
+            "stage": "omp/free",
+            "verdict": "pass",
+            "usage": {"cost_usd": 0.2},
+        },
+        {
+            "round": 2,
+            "trigger": "verification_failed",
+            "stage": None,
+            "verdict": "fail",
+            "usage": {"cost_usd": 0.4},
+        },
+        {
+            "round": 3,
+            "trigger": "review_failed",
+            "stage": "omp/paid",
+            "verdict": "skipped",
+            "usage": None,
+        },
+    ]
+    task = _task("fix", "partial", result=_result("partial", meta={"fix_rounds": rounds}))
+    next_link = _priced("next", "paid", 2)
+    next_link.escalated_from = "fix"
+    # Unrelated escalation belongs in the comparison, but its unknown price is not zero.
+    unknown = _task("unknown", "failed", parent="other")
+    legacy = _task("old", "completed", result=_result("completed", meta={"fix_rounds": "secret"}))
+
+    report = fix_round([task, next_link, unknown, legacy])
+
+    assert (report["rounds"], report["recovered"], report["failed"], report["skipped"]) == (
+        3,
+        1,
+        1,
+        1,
+    )
+    assert report["recovered_share"] == pytest.approx(1 / 3)
+    assert report["round_cost"] == {"samples": 2, "cost_usd": 0.6, "avg_usd": 0.3}
+    assert report["escalation_link_cost"] == {"samples": 1, "cost_usd": 2, "avg_usd": 2}
+    assert fix_round([])["recovered_share"] is None
+
+
+def test_review_stages_use_unique_work_denominators_and_final_round_outcomes():
+    tasks = []
+
+    def work(task_id, entries):
+        stages = []
+        for index, (reviewer, verdict, cost, round_number) in enumerate(entries):
+            child_id = f"{task_id}-{index}"
+            stages.append(
+                {"by": reviewer, "verdict": verdict, "task_id": child_id, "round": round_number}
+            )
+            child = _priced(child_id, reviewer, cost)
+            tasks.append(replace(child, kind="review", executor=reviewer, parent_task_id=task_id))
+        tasks.append(
+            _task(task_id, "completed", result=_result("completed", meta={"review_stages": stages}))
+        )
+
+    work("stopped", [("omp/free", "fail", 0, 0)])
+    work(
+        "paid-fail",
+        [("omp/free", "pass", 0, 0), ("omp/paid", "fail", 1, 0), ("omp/paid", "fail", 1, 1)],
+    )
+    work(
+        "recovered",
+        [("omp/free", "fail", 0, 0), ("omp/free", "pass", 0, 1), ("omp/paid", "pass", 1, 1)],
+    )
+    work("paid-unknown", [("omp/free", "pass", 0, 0), ("omp/paid", "unknown", 1, 0)])
+    tasks.append(
+        _task(
+            "legacy",
+            "completed",
+            result=_result("completed", meta={"review": {"by": "omp/paid", "verdict": "fail"}}),
+        )
+    )
+    tasks.append(
+        _task(
+            "malformed",
+            "completed",
+            result=_result(
+                "completed", meta={"review_stages": [None, "secret", {"by": [], "verdict": []}]}
+            ),
+        )
+    )
+
+    report = review_stages(tasks)
+
+    assert report["works"] == 4
+    assert report["by_stage"]["1"]["pass"] == 3
+    assert report["by_stage"]["1"]["fail"] == 2
+    assert report["by_stage"]["2"]["fail"] == 2
+    assert report["free_rejection"] == {"works": 4, "rejected": 1, "share": 0.25}
+    assert report["by_reviewer"]["omp/paid"]["reached"] == 3
+    assert report["by_reviewer"]["omp/paid"]["fail_share"] == pytest.approx(1 / 3)
+    assert report["paid"] == {
+        "reached": 3,
+        "failed": 1,
+        "fail_share": 1 / 3,
+        "baseline_fail_share": 0.43,
+    }
+    assert "secret" not in json.dumps(report)
+    assert review_stages([])["paid"]["fail_share"] is None
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_replay_command_outputs_new_sections(tmp_path, monkeypatch, capsys, as_json):
+    import sys
+
+    from evals.replay.__main__ import main
+
+    db = _db(
+        tmp_path,
+        [
+            (
+                "root",
+                "omp/sol",
+                "10:00",
+                "10:01",
+                1,
+                None,
+                _result("failed", meta={"watchdog": {"reason": "idle", "tool_open": True}}),
+            ),
+        ],
+    )
+    (tmp_path / "mcp_responses.jsonl").write_text(
+        json.dumps(
+            {
+                "ts": "2026-09-23T10:00:00Z",
+                "tool": "status",
+                "task_id": "root",
+                "bytes": 123,
+                "verbose": False,
+            }
+        )
+        + "\n"
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "replay",
+            "--db",
+            str(db),
+            "--no-git",
+            "--agent-lb-db",
+            str(tmp_path / "missing"),
+            *(["--json"] if as_json else []),
+        ],
+    )
+
+    assert main() == 0
+    text = capsys.readouterr().out
+    if as_json:
+        report = json.loads(text)
+        assert report["caller_bytes"]["median_bytes"] == 123
+        assert report["watchdog"]["idle"] == 1
+        assert report["handoff"]["count"] == 0
+        assert report["fix_round"]["rounds"] == 0
+        assert report["review_stages"]["works"] == 0
+    else:
+        assert "caller bytes (MCP responses): 1 of 1 roots" in text
+        assert "watchdog: 1, idle 1" in text
+        assert "handoff: 0 transferred" in text
+        assert "fix rounds: 0" in text
+        assert "review stages: 0 works" in text

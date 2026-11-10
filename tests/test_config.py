@@ -20,7 +20,6 @@ def test_defaults_without_user_files_are_working(tmp_config_dir: Path) -> None:
     assert settings.server.port == 7433
     assert settings.routing.fallback_executor == "omp/sol"
     assert settings.routing.explore_share == 0.0
-    assert settings.execution.idle_timeout_seconds == 900
     # codex и opencode ушли из дефолтов; их адаптеры остались для старых строк БД.
     assert set(settings.enabled_executors()) == {
         "claude",

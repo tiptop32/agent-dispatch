@@ -10,6 +10,7 @@ from agent_dispatch.executors.base import BaseExecutorAdapter, RunContext
 from agent_dispatch.executors.health import omp_error
 from agent_dispatch.executors.process import ProcessOutcome, run_cli
 from agent_dispatch.executors.result_parser import extract_result_block, normalize, tail
+from agent_dispatch.executors.watchdog import OmpWatchdog
 from agent_dispatch.models import ExecutionResult, Usage
 
 
@@ -117,12 +118,25 @@ class OmpAdapter(BaseExecutorAdapter):
         ctx = ctx.model_copy(update={"env": env})
         # stdin=None даёт DEVNULL в run_cli: без TTY omp ждёт EOF на stdin даже
         # с промптом в аргументе и висит до таймаута (факты Task 1).
+        watchdog = OmpWatchdog(
+            ctx.idle_timeout_seconds, ctx.watchdog_tool_idle_seconds, ctx.watchdog_repeat_limit
+        )
+
+        async def run_stream(*args, **kwargs):
+            return await run_cli(
+                *args,
+                **kwargs,
+                on_line=watchdog.on_line,
+                watchdog=watchdog,
+                watchdog_interval_seconds=ctx.watchdog_interval_seconds,
+            )
+
         return await self._execute_common(
             ctx,
             self.build_argv(ctx),
             stdin=None,
             parse_result=self._parse_result,
-            run_cli_fn=run_cli,
+            run_cli_fn=run_stream,
         )
 
     def _parse_result(self, outcome: ProcessOutcome, changed: list[str]) -> ExecutionResult:
@@ -165,7 +179,7 @@ class OmpAdapter(BaseExecutorAdapter):
         # успевший дойти отчёт агента, поэтому разбираем поток как успешный выход.
         parsed = replace(outcome, exit_code=0) if outcome.exit_code == 3 else outcome
         result = normalize(raw, parsed, changed, self.name, self.settings.model)
-        if stop_error:
+        if stop_error and not outcome.stalled and not outcome.timed_out:
             # Сообщение хода с ошибкой пишет сам CLI о провайдере (badkey, down,
             # TLS), а не агент: `health.classify_failure` узнаёт его и остужает.
             update: dict = {"error": omp_error(outcome.stdout) or tail(outcome.stderr)}

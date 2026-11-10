@@ -6,6 +6,10 @@ server:
   max_concurrent_reviews: 1   # корневые ревью в собственной ёмкости: долгие задачи их не блокируют, лишние ревью ждут
   data_dir: ~/.local/share/agent-dispatch
 
+# Overrides by resolved limit_group; omitted groups use the server default.
+limit_groups: {}
+# Example: limit_groups: {"omp:copilot-x5": {max_concurrent: 6}}
+
 mcp:
   wait_seconds: 50
 
@@ -47,6 +51,8 @@ routing:
   # Вместе с ним остывают все, у кого тот же limit_group (claude/*;
   # у omp — провайдер из model: omp:agent-lb, omp:copilot-x5).
   quota_cooldown_seconds: 3600
+  # занятость модели / лимит параллельности ключа: только этот исполнитель; 0 выключает
+  busy_cooldown_seconds: 120
   # источник -> адаптеры, которым он отдаёт только ревью (kind: review), не задачи.
   # codex остаётся валидным источником для старых задач в БД.
   review_only:
@@ -64,9 +70,13 @@ execution:
   branch_prefix: agent-dispatch
   integrate: apply            # apply: патч в рабочую копию; branch: только ветка; manual: ничего не трогать
   keep_worktrees: false
-  idle_timeout_seconds: 900
+  idle_timeout_seconds: 300
+  watchdog_interval_seconds: 300 # период проверки прогресса потока
+  watchdog_tool_idle_seconds: 900 # молчание при открытом инструменте
+  watchdog_repeat_limit: 6        # одинаковых завершённых вызовов подряд; 0 отключает
   verify_timeout_seconds: 600 # предел на каждую команду verify из запроса
   report_recovery_timeout_seconds: 300 # дозапрос отчёта в той же сессии, если работа есть, а блок нет; 0 выключает
+  review_fix_rounds: 1 # общий бюджет правок после verify или ревью; 0 выключает
   transport_retry_attempts: 1 # только безопасный transport retry до первого ответа; 0 выключает
   transport_retry_max_seconds: 60
   transport_retry_backoff_seconds: 1.0
@@ -74,6 +84,7 @@ execution:
 executors:
   claude:
     adapter: claude
+    max_concurrent: null  # CLI calls only, including reviews; null leaves the executor uncapped
     command: claude
     extra_args: ["--permission-mode", "acceptEdits", "--allowedTools", "Bash,Edit,Write,Read,Glob,Grep"]
     enabled: true
@@ -118,8 +129,8 @@ executors:
     tier: balanced
     corporate: true  # copilot-x5: корпоративный периметр данных
     description: "omp с X5 Airun Code Large через copilot-x5: корпоративные данные не уходят за периметр"
-    # review_by: omp/sol  # ревью законченной правки до интеграции, fail эскалирует
-    # perimeter_review_by: omp/x5-code-large  # ревью задач под периметром и prod: только corporate, можно себя
+    # review_by: [omp/x5-small, omp/sol] # ступени по порядку, строка тоже допустима
+    # perimeter_review_by: [omp/x5-small, omp/x5-code-large] # только corporate, можно себя
   # Модели периметра берутся только из реестра внутренних моделей AI-Run:
   # https://instructions.x5.ru/airun/reestr-vnutrennikh-modeley, статус https://stats.airun.x5.ru/.
   omp/x5-small:

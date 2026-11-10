@@ -13,12 +13,15 @@ from pathlib import Path
 
 from agent_dispatch.config import Settings
 from agent_dispatch.dispatch import followup, redact, report_recovery, verify
+from agent_dispatch.dispatch.concurrency import ExecutorConcurrency
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import (
     Followup,
     build_task_package,
+    render_handoff_prompt,
     render_prompt,
     render_report_prompt,
+    render_review_fix_prompt,
     rewrite_repo_prefix,
 )
 from agent_dispatch.executors import workspace, worktree
@@ -138,6 +141,7 @@ class Dispatcher:
         self._semaphore = asyncio.Semaphore(settings.server.max_concurrent_tasks)
         # Семафор группы создаётся при первой задаче этой группы.
         self._group_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._executor_concurrency = ExecutorConcurrency(settings, storage)
         # Ёмкость ревью отдельная: долгая корневая задача не должна оставлять
         # ревью без слота, и лишние ревью не должны вытеснять задачи. Максимум
         # корневых CLI-процессов демона из-за этого равен сумме двух пределов.
@@ -155,7 +159,7 @@ class Dispatcher:
 
     def _notify(self, task_id: str) -> None:
         """Разбудить того, кто ждёт эту задачу в `wait`."""
-        event = self._events.get(task_id)
+        event = self._events.pop(task_id, None)
         if event is not None:
             event.set()
 
@@ -755,10 +759,17 @@ class Dispatcher:
         ]
 
     def _group_semaphore(self, executor: str) -> asyncio.Semaphore:
-        return self._group_semaphores.setdefault(
-            self.settings.limit_group(executor),
-            asyncio.Semaphore(self.settings.server.max_concurrent_per_group),
-        )
+        group = self.settings.limit_group(executor)
+        semaphore = self._group_semaphores.get(group)
+        if semaphore is None:
+            configured = self.settings.limit_groups.get(group)
+            limit = (
+                configured.max_concurrent
+                if configured is not None
+                else self.settings.server.max_concurrent_per_group
+            )
+            semaphore = self._group_semaphores[group] = asyncio.Semaphore(limit)
+        return semaphore
 
     async def _acquire_group(
         self, record: TaskRecord, decision: RouteDecision, names: list[str]
@@ -778,7 +789,7 @@ class Dispatcher:
             # the availability check and reservation are atomic and FIFO-safe.
             unavailable = self.availability.unavailable()
             for name in backups:
-                if name in unavailable:
+                if name in unavailable or self._executor_concurrency.busy(name):
                     continue
                 semaphore = self._group_semaphore(name)
                 if not semaphore.locked():
@@ -848,7 +859,23 @@ class Dispatcher:
             await self.storage.add_event(
                 task_id, "worktree", {"path": str(tree.path), "branch": tree.branch}
             )
+        stat_snapshot = None
+        if not review:
+            with contextlib.suppress(OSError, subprocess.CalledProcessError):
+                stat_snapshot = await asyncio.to_thread(
+                    workspace.DiffStatSnapshot, tree.path if tree is not None else req.cwd
+                )
+        handoff, inherited_files = await self._initialize_handoff(record, tree)
         ctx = await self._build_context(record, decision, tree)
+        if handoff.get("apply_failed"):
+            ctx = ctx.model_copy(
+                update={
+                    "prompt": (
+                        "Handoff patch application failed; workspace starts clean from HEAD.\n\n"
+                        f"{ctx.prompt}"
+                    )
+                }
+            )
         record.status, record.started_at = TaskStatus.running, self._now()
         await self.storage.update_task(record)
         await self.storage.add_event(
@@ -924,15 +951,16 @@ class Dispatcher:
         if retry_count:
             result.meta["retry_count"] = retry_count
             result.meta["retry_failure_class"] = classify_internal_failure(result)
+        if handoff:
+            result.meta["handoff"] = handoff
+            result.changed_files = sorted(set(inherited_files) | set(result.changed_files))
         if not review and report_recovery.needs_report(result):
             result = await self._recover_report(record, decision, adapter, ctx, result)
         if review:
             await self._check_review_wrote_nothing(req, before, result)
         await self._note_executor_failure(record, decision, result)
-        if not review and req.verify and result.status in ("completed", "partial"):
-            await self._verify(record, result, tree)
-        if not review and await self._wants_review(record, decision, result):
-            await self._review_work(record, decision, result, tree)
+        if not review:
+            result = await self._verify_and_review(record, decision, adapter, ctx, result, tree)
         # Ревью, после которого изменилась рабочая копия, не эскалируется:
         # иначе вызывающий получил бы ответ следующего ревьюера без
         # предупреждения о правках первого.
@@ -941,6 +969,15 @@ class Dispatcher:
             if review and result.meta.get("warning")
             else await self._plan_escalation(record, decision, result)
         )
+        if stat_snapshot is not None:
+            try:
+                result.meta["diff_stat"] = await asyncio.to_thread(
+                    stat_snapshot.diff_stat, result.changed_files
+                )
+            except (OSError, subprocess.CalledProcessError):
+                result.meta["diff_stat_unavailable"] = True
+            finally:
+                stat_snapshot.close()
         if tree is not None:
             # Работу, которую переделает следующий исполнитель, в рабочую
             # копию не переносим: он стартует с HEAD, и его патч лёг бы
@@ -1017,6 +1054,147 @@ class Dispatcher:
                 # только артефакты проверки, а не отменяет результат исполнителя.
                 result.meta["verify_artifacts_kept"] = f"discard failed: {exc}"
 
+    async def _verify_and_review(
+        self,
+        record: TaskRecord,
+        decision: RouteDecision,
+        adapter: ExecutorAdapter,
+        ctx: RunContext,
+        result: ExecutionResult,
+        tree: worktree.Worktree | None,
+    ) -> ExecutionResult:
+        """Verify, then review each stage; repairs share one budget across stages."""
+        req = record.request
+        rounds = 0
+        stages: list[str] | None = None
+        stage_index = 0
+        pending: dict[str, object] | None = None
+        if req.verify and result.status in ("completed", "partial"):
+            await self._verify(record, result, tree)
+        while True:
+            verification_failed = bool(
+                result.verification and result.verification.result == "failed"
+            )
+            if verification_failed:
+                trigger, stage = "verification_failed", None
+                commands = result.verification.commands
+                feedback = "Verification failed."
+                if commands:
+                    failed = commands[-1]
+                    feedback += (
+                        f"\n$ {failed.command}\n{failed.failure_reason}\n{failed.output_tail}"
+                    )
+            elif stages is None:
+                if not await self._wants_review(record, decision, result):
+                    if pending is not None:
+                        pending["verdict"] = "pass" if result.status == "completed" else "unknown"
+                    break
+                configured = self.settings.executors[decision.executor]
+                perimeter = await self._lineage_perimeter(record) is not None
+                chosen = configured.perimeter_review_by if perimeter else configured.review_by
+                stages = [chosen] if isinstance(chosen, str) else list(chosen or [])
+                if perimeter and not stages:
+                    self._note_review(
+                        result, "", None, "skipped", reason="perimeter: no corporate reviewer"
+                    )
+                    result.meta.setdefault("review_stages", []).append(
+                        {**result.meta["review"], "round": rounds}
+                    )
+                if not stages:
+                    if pending is not None:
+                        pending["verdict"] = "pass"
+                    break
+                continue
+            elif stage_index >= len(stages):
+                if pending is not None:
+                    pending["verdict"] = "pass"
+                break
+            else:
+                stage = stages[stage_index]
+                await self._review_work(record, decision, result, tree, stage)
+                review = result.meta["review"]
+                result.meta.setdefault("review_stages", []).append({**review, "round": rounds})
+                verdict = review["verdict"]
+                if pending is not None:
+                    pending["verdict"] = verdict
+                    pending = None
+                if verdict != "fail":
+                    stage_index += 1
+                    continue
+                trigger = "review_failed"
+                feedback = f"Review by {stage} failed:\n{review.get('summary', '')}"
+            if pending is not None:
+                pending["verdict"] = "fail"
+                pending = None
+            session = result.meta.get("session_id") or ctx.resume_session
+            if not isinstance(session, str) or not session:
+                break
+            if rounds >= self.settings.execution.review_fix_rounds:
+                break
+            links = await self._escalation_links(record)
+            if await self._budget_stop(links, result) is not None:
+                break
+            rounds += 1
+            prod = await self._lineage_perimeter(record) == "prod"
+            task = req.task
+            if tree is not None:
+                with contextlib.suppress(worktree.WorktreeError):
+                    root = await asyncio.to_thread(worktree.repo_root, req.cwd)
+                    task = rewrite_repo_prefix(task, str(root), str(tree.path)) or task
+            prompt = render_review_fix_prompt(
+                self.settings.executors[decision.executor].adapter, feedback, prod=prod, task=task
+            )
+            fix_ctx = ctx.model_copy(update={"prompt": prompt, "resume_session": session})
+            fixed = await self._call_adapter(adapter, fix_ctx, decision)
+            await self._note_executor_failure(record, decision, fixed)
+            if fixed.meta.get("parse_error") == "no result block":
+                fixed.meta.setdefault("session_id", session)
+            if report_recovery.needs_report(fixed):
+                fixed = await self._recover_report(record, decision, adapter, fix_ctx, fixed)
+            usage = fixed.usage.model_dump() if fixed.usage else None
+            files = list(dict.fromkeys([*result.changed_files, *fixed.changed_files]))
+            meta = dict(result.meta)
+            for key in (
+                "timed_out",
+                "stalled",
+                "watchdog",
+                "last_output_age_s",
+                "cli_error",
+                "parse_error",
+                "transport_before_output",
+                "executor_failure",
+                "cooldown_until",
+                "retry_count",
+                "retry_failure_class",
+                "escalation_suppressed",
+            ):
+                meta.pop(key, None)
+            if fixed.status == "completed":
+                meta.pop("review", None)
+            meta.update(fixed.meta)
+            pending = {
+                "round": rounds,
+                "trigger": trigger,
+                "stage": stage,
+                "verdict": "unknown",
+                "usage": usage,
+            }
+            meta.setdefault("fix_rounds", []).append(pending)
+            result = fixed.model_copy(
+                update={
+                    "changed_files": files,
+                    "usage": report_recovery._usage(result.usage, fixed.usage),
+                    "verification": None if fixed.status == "completed" else result.verification,
+                    "meta": meta,
+                }
+            )
+            if result.status != "completed":
+                pending["verdict"] = "fail"
+                break
+            if req.verify:
+                await self._verify(record, result, tree)
+        return result
+
     async def _wants_review(
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
     ) -> bool:
@@ -1047,41 +1225,10 @@ class Dispatcher:
         decision: RouteDecision,
         result: ExecutionResult,
         tree: worktree.Worktree | None,
+        reviewer: str,
     ) -> None:
-        """Отдать законченную правку на ревью `review_by` до интеграции.
-
-        Ревью — обычная задача-потомок: её видно в `status`, её цена входит в
-        `tree_cost` цепочки, а guard'ы (глубина, периметр, бюджет) судят её как
-        любую вложенную задачу. Ревьюер получает только задачу и диф: заметки
-        вызывающего и рассуждения исполнителя в его контекст не попадают.
-        Отказ, сбой или срыв срока ревью работу не держат: итог `skipped`.
-        `fail` делает результат `partial`, дальше работает эскалация.
-
-        Задача под периметром (своим, предка или `prod`) идёт только к
-        `perimeter_review_by`. Без него ревью `skipped`, а внешний `review_by`
-        не ставится вовсе: отказ guard'а `_perimeter_refusal` остаётся вторым
-        рубежом, а не единственным.
-        """
+        """Run one automatic review stage in its own child task."""
         req, task_id = record.request, record.task_id
-        configured = self.settings.executors[decision.executor]
-        if await self._lineage_perimeter(record) is not None:
-            reviewer = configured.perimeter_review_by or ""
-            reviewer_settings = self.settings.executors.get(reviewer)
-            if reviewer_settings is None or not reviewer_settings.corporate:
-                # Внешний `review_by` не вызывался, поэтому и в `by` его нет.
-                self._note_review(
-                    result,
-                    reviewer,
-                    None,
-                    "skipped",
-                    reason="perimeter: no corporate reviewer",
-                )
-                return
-        elif configured.review_by:
-            reviewer = configured.review_by
-        else:
-            # Только `perimeter_review_by`: задачу вне периметра не ревьюят.
-            return
         cwd, base, task = req.cwd, None, req.task
         scope = ""
         if tree is not None:
@@ -1126,6 +1273,7 @@ class Dispatcher:
             root_agent=record.root_agent,
             review_base=base,
         )
+        request._automatic_review = True
         timeout = self.settings.timeout_for(reviewer)
         # `submit` создаёт воркер ревью до своего конца (событие `git` пишется
         # после): отмена посреди него оставила бы ревьюера без хозяина. Поэтому
@@ -1265,12 +1413,23 @@ class Dispatcher:
         )
         return merged
 
-    @staticmethod
     async def _call_adapter(
-        adapter: ExecutorAdapter, ctx: RunContext, decision: RouteDecision
+        self, adapter: ExecutorAdapter, ctx: RunContext, decision: RouteDecision
     ) -> ExecutionResult:
         try:
-            return await adapter.execute(ctx)
+            async with self._executor_concurrency.slot(ctx.task_id, decision.executor):
+                if decision.executor in self.availability.unavailable():
+                    return ExecutionResult(
+                        status="failed",
+                        executor=decision.executor,
+                        model=None,
+                        summary="",
+                        error=(
+                            "executor became unavailable while waiting for a slot: "
+                            f"{decision.executor}"
+                        ),
+                    )
+                return await adapter.execute(ctx)
         except Exception as exc:
             return ExecutionResult(
                 status="failed",
@@ -1353,6 +1512,9 @@ class Dispatcher:
             cwd=str(tree.path) if tree else req.cwd,
             timeout_seconds=timeout,
             idle_timeout_seconds=self.settings.execution.idle_timeout_seconds or None,
+            watchdog_interval_seconds=self.settings.execution.watchdog_interval_seconds,
+            watchdog_tool_idle_seconds=self.settings.execution.watchdog_tool_idle_seconds,
+            watchdog_repeat_limit=self.settings.execution.watchdog_repeat_limit,
             env=child_env(
                 self.settings,
                 {
@@ -1434,6 +1596,7 @@ class Dispatcher:
             self._now(),
             failure_seconds=routing.failure_cooldown_seconds,
             quota_seconds=routing.quota_cooldown_seconds,
+            busy_seconds=routing.busy_cooldown_seconds,
             recheck=configured is not None and configured.limit_reset == "recheck",
         )
         members = self._limit_group(decision.executor, failure_scope(kind, error))
@@ -1496,12 +1659,53 @@ class Dispatcher:
         await self.storage.delete_cooldowns(names)
         return cleared
 
+    @staticmethod
+    def _handoff_reason(result: ExecutionResult) -> str | None:
+        if not result.changed_files:
+            return None
+        if result.error == "timeout" or result.meta.get("timed_out"):
+            return "timeout"
+        if (result.error or "").startswith("stalled:") or result.meta.get("stalled"):
+            return "stalled"
+        return None
+
+    async def _initialize_handoff(
+        self, record: TaskRecord, tree: worktree.Worktree | None
+    ) -> tuple[dict[str, object], list[str]]:
+        previous = (
+            await self.storage.get_task(record.escalated_from) if record.escalated_from else None
+        )
+        if (
+            record.request.kind != "task"
+            or previous is None
+            or previous.result is None
+            or self._handoff_reason(previous.result) is None
+        ):
+            return {}, []
+        inherited = previous.result
+        meta: dict[str, object] = {
+            "from_task": previous.task_id,
+            "mode": "patch" if tree is not None else "in_place",
+            "apply_failed": False,
+        }
+        if tree is not None:
+            patch = inherited.meta.get("patch")
+            try:
+                if not isinstance(patch, str) or not patch:
+                    raise worktree.WorktreeError("parent patch is unavailable")
+                await asyncio.to_thread(worktree.apply_patch, tree.path, Path(patch))
+            except (worktree.WorktreeError, OSError) as exc:
+                meta["apply_failed"] = str(exc)
+                return meta, []
+        return meta, list(inherited.changed_files)
+
     async def _plan_escalation(
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
     ) -> EscalationPlan | None:
         if not record.request.allow_escalation:
             return None
-        reason = should_escalate(result)
+        handoff_reason = self._handoff_reason(result) if record.request.kind == "task" else None
+        reason = handoff_reason or should_escalate(result)
         if reason is None:
             return None
         retried = bool(result.meta.get("retry_count"))
@@ -1529,20 +1733,22 @@ class Dispatcher:
             decision.executor, self.settings, tried, unavailable, corporate_only=corporate_only
         )
         # Переадресация роутеру остаётся: `_prepare` сузит её выбор до периметра.
-        reroute = nxt is None and bool(failure)
+        reroute = nxt is None and bool(failure) and handoff_reason is None
         if corporate_only and nxt is None and not reroute:
             if next_executor(decision.executor, self.settings, tried, unavailable) is not None:
                 # Внешние звенья пропущены, а корпоративных не осталось.
                 result.meta["escalation_stopped"] = "perimeter"
         plan = EscalationPlan(reason=reason, tried=tried, executor=nxt, reroute=reroute)
         if not plan.hands_off:
-            return plan
+            return None if handoff_reason else plan
         stop = await self._budget_stop(links, result)
         if stop is None:
             return plan
         # Звено, которое бюджет всё равно не пустит, не должно удерживать
         # работу (`integration_held`): цепочка кончается здесь, работа
         # интегрируется, как у любой исчерпанной цепочки.
+        if handoff_reason:
+            return None
         return EscalationPlan(reason=f"{reason}; {stop}", tried=tried)
 
     async def _lineage_perimeter(
@@ -1702,16 +1908,31 @@ class Dispatcher:
             # Звено follow-up продолжает упавшую попытку, а не задачу до неё:
             # иначе следующий исполнитель видел бы устаревший отчёт.
             update["followup_of"] = record.task_id
-        review = result.meta.get("review") or {}
-        if review.get("verdict") == "fail":
-            # Следующее звено стартует с HEAD и должно знать, что ревьюер
-            # нашёл у прошлой попытки, иначе повторит ту же ошибку.
-            note = f"Review of the previous attempt by {review['by']}: {review.get('summary', '')}"
+        if self._handoff_reason(result):
+            note = render_handoff_prompt(record.task_id, result.summary, result.error)
             if record.request.context_mode == ContextMode.prompt:
-                # В режиме `prompt` раздел Context не рендерится.
                 update["task"] = f"{record.request.task}\n\n{note}"
             else:
                 context = record.request.context
+                update["context"] = f"{context}\n\n{note}" if context else note
+        reviews = [
+            stage
+            for stage in result.meta.get("review_stages", [])
+            if stage.get("verdict") == "fail"
+        ]
+        review = result.meta.get("review") or {}
+        if not reviews and review.get("verdict") == "fail":
+            reviews = [review]
+        if reviews:
+            note = "\n\n".join(
+                f"Review of the previous attempt by {review['by']}: {review.get('summary', '')}"
+                for review in reviews
+            )
+            if record.request.context_mode == ContextMode.prompt:
+                task = update.get("task", record.request.task)
+                update["task"] = f"{task}\n\n{note}"
+            else:
+                context = update.get("context", record.request.context)
                 update["context"] = f"{context}\n\n{note}" if context else note
         child = await self.submit(
             record.request.model_copy(update=update),

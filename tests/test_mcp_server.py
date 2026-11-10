@@ -487,7 +487,6 @@ async def test_compact_output_shows_the_review(tmp_path, review, line):
     r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
     lines = r.content[0].text.splitlines()
     assert line in lines
-    assert "more" not in r.content[0].text.split("summary:")[0]
 
 
 @pytest.mark.asyncio

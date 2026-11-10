@@ -5,7 +5,7 @@ from enum import StrEnum
 from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 
 class _Model(BaseModel):
@@ -121,6 +121,8 @@ class DispatchRequest(_Model):
     #: эскалация, переадресация, follow-up, вложенные задачи) остаётся у
     #: исполнителей `corporate: true`, даже при `routing.corporate_perimeter: false`.
     prod: bool = False
+    #: Только демон ставит этот маркер; публичный ввод с таким ключом запрещён.
+    _automatic_review: bool = PrivateAttr(default=False)
 
     @field_validator("files")
     @classmethod

@@ -84,7 +84,7 @@ def followup_request(
             "root_agent": body.root_agent,
             "hop": body.hop,
         }
-    return previous.model_copy(
+    request = previous.model_copy(
         update={
             **caller,
             "task": body.message,
@@ -97,6 +97,8 @@ def followup_request(
             "workspace_mode": "in_place",
         }
     )
+    request._automatic_review = False
+    return request
 
 
 def describe(previous: TaskRecord, original: TaskRecord, *, resumed: bool) -> Followup:

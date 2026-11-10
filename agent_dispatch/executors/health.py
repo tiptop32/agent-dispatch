@@ -31,8 +31,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_dispatch.models import ExecutionResult
 
-LegacyFailureKind = Literal["quota", "capacity", "auth", "network"]
+LegacyFailureKind = Literal["quota", "capacity", "auth", "network", "model_busy"]
 InternalFailureKind = Literal[
+    "model_busy",
     "transport_error",
     "rate_limit",
     "quota_exceeded",
@@ -44,6 +45,7 @@ InternalFailureKind = Literal[
     "configuration_error",
 ]
 FailureKind = Literal[
+    "model_busy",
     "quota",
     "capacity",
     "auth",
@@ -63,6 +65,7 @@ FailureScope = Literal["group", "executor"]
 # Internal kinds are separate from legacy cooldown kinds for replay compatibility.
 _INTERNAL_KINDS = frozenset(
     {
+        "model_busy",
         "transport_error",
         "rate_limit",
         "quota_exceeded",
@@ -86,6 +89,14 @@ _TRANSPORT_LINE = (
 )
 
 _ERROR_PATTERNS: tuple[tuple[LegacyFailureKind, re.Pattern[str]], ...] = (
+    (
+        "model_busy",
+        re.compile(
+            r"(?m:^[ \t]*(?:error:[ \t]*)?(?:429\b[^\n]*?)?"
+            r"(?:ConcurrencyLimitModel\b|Parallel processed requests limit exceed\b))",
+            re.IGNORECASE,
+        ),
+    ),
     (
         "quota",
         re.compile(
@@ -164,6 +175,8 @@ def classify_internal_failure(result: ExecutionResult) -> InternalFailureKind | 
     ):
         return "configuration_error"
     legacy = classify_failure(result)
+    if legacy == "model_busy":
+        return "model_busy"
     if legacy == "network":
         return "transport_error"
     if legacy in ("quota", "capacity"):
@@ -264,7 +277,7 @@ def failure_scope(kind: LegacyFailureKind, error: str) -> FailureScope:
     `claude/haiku` один лимит, и после отказа одного второй откажет так же.
     Перегружена же конкретная модель, соседняя может работать.
     """
-    if kind == "capacity" or _MODEL_LIMIT.search(error):
+    if kind in ("capacity", "model_busy") or _MODEL_LIMIT.search(error):
         return "executor"
     return "group"
 
@@ -410,6 +423,7 @@ def cooldown_seconds(
     *,
     failure_seconds: int,
     quota_seconds: int,
+    busy_seconds: int = 120,
     local_tz: tzinfo | None = None,
     recheck: bool = False,
 ) -> float:
@@ -427,6 +441,8 @@ def cooldown_seconds(
     """
     if failure_seconds <= 0:
         return 0
+    if kind == "model_busy":
+        return busy_seconds
     if kind != "quota":
         return failure_seconds
     reset = parse_reset(error, now, local_tz)

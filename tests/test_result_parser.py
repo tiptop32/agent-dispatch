@@ -110,9 +110,19 @@ def test_normalize_timeout_with_changed_files_is_partial():
 
 
 def test_normalize_stalled_is_failed_with_idle_error():
-    result = normalize(None, outcome(stalled=True, idle_seconds=0.5), None, "omp", None)
+    result = normalize(
+        None,
+        outcome(
+            stalled=True,
+            idle_seconds=0.5,
+            watchdog={"reason": "idle", "idle_s": 0.5, "tool_open": False},
+        ),
+        None,
+        "omp",
+        None,
+    )
     assert result.status == "failed"
-    assert result.error.startswith("stalled: no output for")
+    assert result.error.startswith("stalled: idle")
     assert result.meta["failure_cause"] == "stream_stalled"
     assert result.meta["timeout_type"] == "stream_stalled"
     assert result.meta["idle_timeout_seconds"] == 0.5
@@ -388,3 +398,28 @@ def test_normalize_coerces_non_string_changed_files_items():
     assert result.status == "completed" and "parse_error" not in result.meta
     assert result.changed_files == ["a.py", "7", '{"path": "b.py"}']
     assert result.meta["coerced"] == ["changed_files: dict, int -> str"]
+
+
+@pytest.mark.parametrize(
+    "watchdog",
+    [
+        {"reason": "idle", "idle_s": 301.2, "tool_open": False},
+        {"reason": "looping", "repeats": 6, "tool_open": True},
+    ],
+)
+def test_normalize_watchdog_preserves_reason_and_diagnostics(watchdog):
+    from agent_dispatch.executors.health import classify_failure, classify_internal_failure
+
+    result = normalize(
+        {"status": "completed", "summary": "stale report"},
+        outcome(stalled=True, watchdog=watchdog),
+        ["a.py"],
+        "omp",
+        None,
+    )
+    assert result.status == "failed"
+    assert result.error == f"stalled: {watchdog['reason']}"
+    assert result.changed_files == ["a.py"]
+    assert result.meta["watchdog"] == watchdog
+    assert classify_internal_failure(result) == "stream_stalled"
+    assert classify_failure(result) is None

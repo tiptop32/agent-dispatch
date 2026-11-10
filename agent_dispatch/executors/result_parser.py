@@ -50,13 +50,20 @@ def normalize(
                 "idle_timeout_seconds": seconds,
             }
         )
+        watchdog = getattr(outcome, "watchdog", None)
+        if watchdog is not None:
+            meta["watchdog"] = watchdog
         return ExecutionResult(
             status="failed",
             executor=executor,
             model=model,
             summary=tail(outcome.stdout),
             changed_files=changed_files or [],
-            error=f"stalled: no output for {int(seconds)}s",
+            error=(
+                f"stalled: {watchdog['reason']}"
+                if watchdog
+                else f"stalled: no output for {int(seconds)}s"
+            ),
             meta=meta,
         )
     if outcome.timed_out:

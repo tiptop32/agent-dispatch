@@ -52,7 +52,11 @@ def pre_guards(
         return _event(GuardReason.max_hops, f"hop {req.hop} >= {settings.routing.max_hops}")
     if req.parent_task_id and not parent_exists:
         return _event(GuardReason.unknown_parent, f"parent task not found: {req.parent_task_id}")
-    if req.parent_task_id and sibling_count >= settings.routing.max_children:
+    if (
+        req.parent_task_id
+        and sibling_count >= settings.routing.max_children
+        and not (req.kind == "review" and req._automatic_review)
+    ):
         detail = f"sibling count {sibling_count} >= {settings.routing.max_children}"
         if running_siblings:
             # Слот освободит один из работающих sibling'ов: повторный dispatch

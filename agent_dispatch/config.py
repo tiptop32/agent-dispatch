@@ -110,6 +110,9 @@ class RoutingSettings(_ConfigModel):
     #: исполнитель остывает ровно до сброса. 0 в `failure_cooldown_seconds`
     #: выключает и это.
     quota_cooldown_seconds: int = Field(3600, ge=1)
+    #: Занятость модели или лимит параллельности ключа: только этот исполнитель.
+    #: 0 выключает; общий failure_cooldown_seconds: 0 также выключает.
+    busy_cooldown_seconds: int = Field(120, ge=0)
     #: Источник -> адаптеры, которым он вправе отдать только ревью (`kind: review`),
     #: но не задачу на правку. По умолчанию omp не тратит токены Claude на
     #: работу, которую делает сам, а просит у него только ревью. codex остаётся
@@ -165,15 +168,19 @@ class ExecutionSettings(_ConfigModel):
     #: ветку, и worktree, и файл патча, решает человек.
     integrate: Literal["apply", "manual", "branch"] = "apply"
     keep_worktrees: bool = False
-    #: Убить executor, если он столько секунд ничего не пишет в stdout/stderr;
-    #: 0 отключает. Жёсткий routing.default_timeout_seconds всё равно действует.
-    idle_timeout_seconds: int = Field(900, ge=0)
+    #: Молчание вне инструмента; 0 отключает idle-проверку, не жёсткий таймаут.
+    idle_timeout_seconds: int = Field(300, ge=0)
+    watchdog_interval_seconds: float = Field(300, gt=0, allow_inf_nan=False)
+    watchdog_tool_idle_seconds: float = Field(900, gt=0, allow_inf_nan=False)
+    watchdog_repeat_limit: int = Field(6, ge=0)
     #: Предел на каждую команду `verify` из запроса. Зависшая проверка
     #: считается упавшей.
     verify_timeout_seconds: int = Field(600, ge=1)
     #: Запуск правки кончился без блока отчёта, но с изменёнными файлами: демон
     #: продолжает ту же сессию коротким «дай отчёт» с этим пределом; 0 отключает.
     report_recovery_timeout_seconds: int = Field(300, ge=0)
+    #: Общий бюджет продолжений после провала verify или любой ступени ревью.
+    review_fix_rounds: int = Field(1, ge=0)
     #: Повтор только для transport ошибки до первого ответа и неизменённой
     #: рабочей копии; 0 выключает. Повтор не заменяет escalation.
     transport_retry_attempts: int = Field(1, ge=0)
@@ -196,6 +203,8 @@ class ExecutorSettings(_ConfigModel):
     #: всю группу. По умолчанию у claude это адаптер (один аккаунт на все
     #: модели), у omp — провайдер из `model`.
     limit_group: str | None = None
+    #: Maximum concurrent CLI calls, including reviews; None leaves it uncapped.
+    max_concurrent: int | None = Field(None, ge=1)
     #: `announced` держит исполнителя до сброса, названного в сообщении CLI.
     #: `recheck` для пула аккаунтов за балансировщиком: названный
     #: сброс относится к одному аккаунту, следующий запрос уйдёт на другой,
@@ -206,12 +215,12 @@ class ExecutorSettings(_ConfigModel):
     timeout_seconds: int | None = Field(None, ge=1)
     #: Исполнитель, который демон зовёт на ревью законченной правки этого
     #: исполнителя до интеграции (`Dispatcher._review_work`). `fail` эскалирует.
-    review_by: str | None = None
+    review_by: str | list[str] | None = None
     #: Ревьюер правки задачи под периметром (своим, предка или `prod`) вместо
     #: `review_by`: обязан быть `corporate: true`, может быть самим исполнителем
     #: (второй экземпляр в режиме только чтения с чистым контекстом). Без него
     #: ревью такой задачи `skipped`, внешний `review_by` не зовётся.
-    perimeter_review_by: str | None = None
+    perimeter_review_by: str | list[str] | None = None
 
     @model_validator(mode="after")
     def validate_adapter(self) -> ExecutorSettings:
@@ -235,6 +244,11 @@ class ExecutorSettings(_ConfigModel):
         return self.adapter
 
 
+class LimitGroupSettings(_ConfigModel):
+    #: Overrides server.max_concurrent_per_group for this resolved group name.
+    max_concurrent: int = Field(ge=1)
+
+
 class Settings(_ConfigModel):
     server: ServerSettings = Field(default_factory=ServerSettings)
     mcp: McpSettings = Field(default_factory=McpSettings)
@@ -242,6 +256,7 @@ class Settings(_ConfigModel):
     routing: RoutingSettings = Field(default_factory=RoutingSettings)
     execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
     executors: dict[str, ExecutorSettings] = Field(default_factory=dict)
+    limit_groups: dict[str, LimitGroupSettings] = Field(default_factory=dict)
     escalation: dict[str, list[str]] = Field(default_factory=dict)
     secrets: dict[str, SecretStr] = Field(default_factory=dict)
 
@@ -261,24 +276,19 @@ class Settings(_ConfigModel):
                 if target not in names:
                     raise ValueError(f"escalation.{source}[{index}]: unknown executor {target!r}")
         for name, item in self.executors.items():
-            if item.review_by is None:
-                continue
-            if item.review_by not in names:
-                raise ValueError(f"executors.{name}.review_by: unknown executor {item.review_by!r}")
-            if item.review_by == name:
-                raise ValueError(f"executors.{name}.review_by: an executor cannot review itself")
-        for name, item in self.executors.items():
-            reviewer = item.perimeter_review_by
-            if reviewer is None:
-                continue
-            if reviewer not in names:
-                raise ValueError(
-                    f"executors.{name}.perimeter_review_by: unknown executor {reviewer!r}"
-                )
-            if not self.executors[reviewer].corporate:
-                raise ValueError(
-                    f"executors.{name}.perimeter_review_by: {reviewer!r} is not `corporate: true`"
-                )
+            for field in ("review_by", "perimeter_review_by"):
+                configured = getattr(item, field)
+                reviewers = [configured] if isinstance(configured, str) else configured or []
+                prefix = f"executors.{name}.{field}"
+                if len(reviewers) != len(set(reviewers)):
+                    raise ValueError(f"{prefix}: duplicate reviewers")
+                for reviewer in reviewers:
+                    if reviewer not in names:
+                        raise ValueError(f"{prefix}: unknown executor {reviewer!r}")
+                    if field == "review_by" and reviewer == name:
+                        raise ValueError(f"{prefix}: an executor cannot review itself")
+                    if field == "perimeter_review_by" and not self.executors[reviewer].corporate:
+                        raise ValueError(f"{prefix}: {reviewer!r} is not `corporate: true`")
         return self
 
     def timeout_for(self, executor: str, requested: int | None = None) -> int:

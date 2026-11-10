@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import os
 import sys
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from mcp.server.mcpserver import MCPServer
@@ -174,12 +175,12 @@ def _review_line(review: dict) -> str:
     у `skipped` причина. Полный текст ревью лежит в задаче-потомке."""
     text = f"review: {review.get('verdict')} by {review.get('by')}"
     if review.get("verdict") == "fail":
-        detail = next((line for line in (review.get("summary") or "").splitlines() if line), "")
+        detail = (review.get("summary") or "").strip()
     elif review.get("verdict") == "skipped":
         detail = review.get("reason") or ""
     else:
         detail = ""
-    return f"{text} — {detail[:300]}" if detail else text
+    return f"{text} — {detail[:1500]}" if detail else text
 
 
 def _task_text(view: TaskView, verbose: bool = False) -> str:
@@ -216,6 +217,8 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
             lines.append(f"escalated_to: {escalated_to}")
         if changed:
             lines.append(f"changed_files: {changed}")
+        if stat := result.meta.get("diff_stat"):
+            lines.append(f"diff_stat: {stat['files']} files, +{stat['added']} -{stat['removed']}")
         if result.tests and result.tests.result:
             tests = result.tests.result
             if result.tests.command:
@@ -278,6 +281,25 @@ def build_server(
         state = await result if inspect.isawaitable(result) else result
         return factory(state, wait + 30)
 
+    def response_text(tool: str, task_id: str | None, text: str, verbose: bool) -> str:
+        # Never store prompts, response contents or filesystem error details.
+        try:
+            settings.server.data_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": datetime.now(UTC).isoformat(),
+                "tool": tool,
+                "task_id": task_id,
+                "bytes": len(text.encode("utf-8")),
+                "verbose": verbose,
+            }
+            with (settings.server.data_dir / "mcp_responses.jsonl").open(
+                "a", encoding="utf-8"
+            ) as stream:
+                stream.write(json.dumps(record) + "\n")
+        except OSError:
+            pass  # Local metrics must not affect MCP delivery or log recursively.
+        return text
+
     @server.tool(
         description="Choose the best executor for a task without running it. "
         + KIND_HINT
@@ -316,12 +338,14 @@ def build_server(
                 )
             )
             if verbose:
-                return (
+                text = (
                     f"executor: {decision.executor}\nconfidence: {decision.confidence}\n"
                     f"router: {decision.router}\nreason: {decision.reason}\n\n"
                     f"{decision.model_dump_json(indent=2)}"
                 )
-            return "\n".join([f"executor: {decision.executor}", *_route_lines(decision)])
+            else:
+                text = "\n".join([f"executor: {decision.executor}", *_route_lines(decision)])
+            return response_text("route", None, text, verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
 
@@ -368,7 +392,13 @@ def build_server(
                 review_base=review_base,
                 prod=prod,
             )
-            return _task_text(await client.submit(req), verbose)
+            view = await client.submit(req)
+            return response_text(
+                "dispatch_to" if executor is not None else "dispatch",
+                view.task_id,
+                _task_text(view, verbose),
+                verbose,
+            )
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
 
@@ -519,7 +549,8 @@ def build_server(
                 root_agent=caller.root_agent,
                 hop=caller.hop,
             )
-            return _task_text(await client.followup(task_id, body), verbose)
+            view = await client.followup(task_id, body)
+            return response_text("followup", view.task_id, _task_text(view, verbose), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
 
@@ -528,7 +559,8 @@ def build_server(
         try:
             wait = max(0, wait_seconds)
             client = await get_client(wait)
-            return _task_text(await client.status(task_id, wait), verbose)
+            view = await client.status(task_id, wait)
+            return response_text("status", view.task_id, _task_text(view, verbose), verbose)
         except (DaemonUnavailable, RuntimeError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
 

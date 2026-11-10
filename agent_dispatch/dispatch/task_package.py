@@ -169,6 +169,33 @@ def render_report_prompt(adapter_kind: AdapterKind) -> str:
     )
 
 
+def render_review_fix_prompt(
+    adapter_kind: AdapterKind, feedback: str, *, prod: bool, task: str
+) -> str:
+    return (
+        _templates()
+        .get_template("review_fix.md.j2")
+        .render(
+            feedback=feedback,
+            prod=prod,
+            task=task,
+            result_instructions=result_instructions(adapter_kind),
+        )
+    )
+
+
+def render_handoff_prompt(task_id: str, result_summary: str, error: str | None) -> str:
+    return (
+        _templates()
+        .get_template("handoff_continue.md.j2")
+        .render(
+            from_task=task_id,
+            summary=result_summary[:FOLLOWUP_SUMMARY_LIMIT],
+            error=error,
+        )
+    )
+
+
 def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Settings) -> str:
     env = _templates()
     req = package.request

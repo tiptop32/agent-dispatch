@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""external_review_cmd для плагина planning: ревью через omp/sol демона agent-dispatch.
+
+Контракт плагина (README umputun-cc-thingz, «External review contract»): промпт приходит
+последним аргументом, stdin не читается, находки идут в stdout строками с метками
+CRITICAL / MAJOR / MINOR или «NO ISSUES FOUND», рабочая копия не меняется, код выхода 0
+и при находках.
+
+omp внутри песочницы Claude Code не стартует (пишет в ~/.omp/agent/agent.db), поэтому
+ревьюера запускает демон: `kind: review` (только чтение, in_place), без эскалации, чтобы
+ревью не ушло к claude/opus. Один повтор при обрыве транспорта до ответа.
+
+Переменные: AD_REVIEW_EXECUTOR (по умолчанию omp/sol), AD_REVIEW_WAIT (секунды, 1500),
+AD_DISPATCH (команда CLI, по умолчанию agent-dispatch; подменяется в тестах).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+TAGS = ("CRITICAL", "MAJOR", "MINOR")
+FORMAT_RULE = (
+    "\n\nOutput rule for this review (overrides any other format): put the complete list of "
+    "findings into the `summary` field of your result block, one finding per line, each line "
+    "starting with exactly one of CRITICAL, MAJOR or MINOR, followed by file:line and the fix. "
+    "If there are no findings, `summary` must be exactly: NO ISSUES FOUND. Do not modify files."
+)
+TRANSPORT = re.compile(
+    r"websocket|connection (reset|closed)|stream_incomplete|transport error", re.I
+)
+
+
+def run_once(prompt: str) -> dict:
+    cmd = [
+        os.environ.get("AD_DISPATCH", "agent-dispatch"),
+        "dispatch",
+        "--executor",
+        os.environ.get("AD_REVIEW_EXECUTOR", "omp/sol"),
+        "--kind",
+        "review",
+        "--no-escalation",
+        "--json",
+        "--wait",
+        os.environ.get("AD_REVIEW_WAIT", "1500"),
+        "--cwd",
+        os.getcwd(),
+        prompt + FORMAT_RULE,
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return {"status": "failed", "result": {"error": (out.stderr or out.stdout)[-500:]}}
+
+
+def findings(summary: str) -> list[str]:
+    lines = [line.strip().lstrip("-*• ").strip() for line in summary.splitlines()]
+    tagged = [line for line in lines if line.startswith(TAGS)]
+    if tagged:
+        return tagged
+    if any(line.upper().startswith("NO ISSUES FOUND") for line in lines):
+        return ["NO ISSUES FOUND"]
+    # Ревьюер нарушил формат: не терять находки, а отдать их как MAJOR одной строкой.
+    text = " ".join(line for line in lines if line)
+    return [f"MAJOR reviewer output without severity tags: {text}"] if text else []
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or not sys.argv[-1].strip():
+        print("ad-external-review: prompt is required as the last argument", file=sys.stderr)
+        return 1
+    prompt = sys.argv[-1]
+    view = run_once(prompt)
+    result = view.get("result") or {}
+    if view.get("status") == "failed" and TRANSPORT.search(result.get("error") or ""):
+        view = run_once(prompt)
+        result = view.get("result") or {}
+    if view.get("status") not in ("completed", "partial") or not result.get("summary"):
+        error = result.get("error") or view.get("status") or "no result"
+        print(f"ad-external-review: reviewer failed: {error}", file=sys.stderr)
+        return 1
+    lines = findings(result["summary"])
+    if not lines:
+        print("ad-external-review: empty review", file=sys.stderr)
+        return 1
+    print("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

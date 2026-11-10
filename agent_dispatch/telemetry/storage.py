@@ -64,6 +64,9 @@ class Storage:
     def _task_values(task: TaskRecord) -> dict[str, Any]:
         decision = task.decision
         result = task.result
+        request = task.request.model_dump(mode="json")
+        if task.request._automatic_review:
+            request["_automatic_review"] = True
         return {
             "task_id": task.task_id,
             "parent_task_id": task.parent_task_id,
@@ -75,7 +78,7 @@ class Storage:
             "status": task.status.value,
             "executor": decision.executor if decision else None,
             "model": result.model if result else None,
-            "request_json": task.request.model_dump_json(),
+            "request_json": json.dumps(request),
             "decision_json": decision.model_dump_json() if decision else None,
             "result_json": result.model_dump_json() if result else None,
             "log_path": task.log_path,
@@ -94,6 +97,10 @@ class Storage:
         result = (
             ExecutionResult.model_validate_json(row["result_json"]) if row["result_json"] else None
         )
+        request_data = json.loads(row["request_json"])
+        automatic_review = request_data.pop("_automatic_review", False)
+        request = DispatchRequest.model_validate(request_data)
+        request._automatic_review = automatic_review is True and request.kind == "review"
         return TaskRecord(
             task_id=row["task_id"],
             parent_task_id=row["parent_task_id"],
@@ -101,7 +108,7 @@ class Storage:
             root_agent=row["root_agent"],
             source_agent=row["source_agent"],
             hop=row["hop"],
-            request=DispatchRequest.model_validate_json(row["request_json"]),
+            request=request,
             status=row["status"],
             decision=decision,
             result=result,
@@ -156,10 +163,12 @@ class Storage:
         exclude_escalated: bool = False,
         exclude_task_id: str | None = None,
     ) -> int:
-        """Дети, которым назначен исполнитель; отказанные попытки квоту не занимают."""
+        """Назначенные дети без служебных ступеней ревью и отказанных попыток."""
         query = (
             "SELECT COUNT(*) FROM tasks WHERE parent_task_id=?"
             " AND status != 'cancelled' AND executor IS NOT NULL"
+            " AND NOT (json_extract(request_json, '$.kind') = 'review'"
+            " AND COALESCE(json_extract(request_json, '$._automatic_review'), 0) = 1)"
         )
         params: list[str] = [parent_task_id]
         if exclude_escalated:
@@ -179,6 +188,8 @@ class Storage:
         query = (
             "SELECT task_id FROM tasks WHERE parent_task_id=? AND status='running'"
             " AND executor IS NOT NULL AND escalated_from IS NULL"
+            " AND NOT (json_extract(request_json, '$.kind') = 'review'"
+            " AND COALESCE(json_extract(request_json, '$._automatic_review'), 0) = 1)"
         )
         params: list[str] = [parent_task_id]
         if exclude_task_id is not None:

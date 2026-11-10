@@ -23,6 +23,9 @@ class RunContext(BaseModel):
     cwd: str
     timeout_seconds: float
     idle_timeout_seconds: float | None = None
+    watchdog_interval_seconds: float = 300
+    watchdog_tool_idle_seconds: float = 900
+    watchdog_repeat_limit: int = 6
     env: dict[str, str]
     log_path: Path
     task_id: str

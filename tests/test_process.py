@@ -366,3 +366,28 @@ async def test_run_cli_without_timeout_has_no_output_age(tmp_path: Path) -> None
 
     assert outcome.timed_out is False
     assert outcome.last_output_age_s is None
+
+
+async def test_run_cli_delivers_complete_utf8_stdout_lines(tmp_path: Path) -> None:
+    lines = []
+    outcome = await run_cli(
+        [
+            sys.executable,
+            "-c",
+            "import os,time; "
+            "os.write(1,b'first\\n\\xd0'); time.sleep(0.1); "
+            "os.write(2,b'not a stdout line\\n'); "
+            "os.write(1,b'\\xbf\\xd1\\x80'); time.sleep(0.1); "
+            "os.write(1,b'\\xd0\\xb8\\xd0\\xb2\\xd0\\xb5\\xd1\\x82\\r\\nlast')",
+        ],
+        cwd=tmp_path,
+        env={},
+        stdin=None,
+        timeout_seconds=5,
+        log_path=tmp_path / "lines.log",
+        on_line=lines.append,
+    )
+    assert outcome.exit_code == 0
+    assert lines == ["first", "привет", "last"]
+    assert outcome.stdout == "first\nпривет\r\nlast"
+    assert (tmp_path / "lines.log").read_text().count("привет") == 1

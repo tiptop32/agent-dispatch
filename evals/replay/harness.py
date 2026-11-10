@@ -48,6 +48,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
+from math import isfinite
 from pathlib import Path
 from statistics import median, quantiles
 
@@ -336,8 +337,14 @@ def _queue_wait_by_limit_group(tasks: list[Task]) -> dict[str, dict]:
     waits: dict[str, list[float]] = {}
     for task in tasks:
         for event in task.events:
-            if event["kind"] == "slot":
-                payload = event["payload"]
+            payload = event.get("payload")
+            if (
+                event.get("kind") == "slot"
+                and isinstance(payload, dict)
+                and isinstance(payload.get("limit_group"), str)
+                and isinstance(payload.get("wait_seconds"), (int, float))
+                and not isinstance(payload["wait_seconds"], bool)
+            ):
                 waits.setdefault(payload["limit_group"], []).append(payload["wait_seconds"])
     return {
         group: {
@@ -356,7 +363,12 @@ def _queue_policy(tasks: list[Task]) -> dict:
         event["payload"]
         for task in tasks
         for event in task.events
-        if event["kind"] == "slot" and "queue_fallback" in event["payload"]
+        if event.get("kind") == "slot"
+        and isinstance(event.get("payload"), dict)
+        and "queue_fallback" in event["payload"]
+        and isinstance(event["payload"].get("limit_group"), str)
+        and isinstance(event["payload"].get("wait_seconds"), (int, float))
+        and not isinstance(event["payload"]["wait_seconds"], bool)
     ]
     waits = [slot["wait_seconds"] for slot in slots]
     switched = sum(slot["queue_fallback"] is True for slot in slots)
@@ -377,6 +389,7 @@ def replay(
     cooldown: int = 900,
     *,
     quota_cooldown: int = 3600,
+    busy_cooldown: int = 120,
     limit_group: Callable[[str], str] = default_limit_group,
     review_only: dict[str, list[str]] | None = None,
     local_tz: tzinfo | None = None,
@@ -407,6 +420,7 @@ def replay(
                 task.finished_at,
                 failure_seconds=cooldown,
                 quota_seconds=quota_cooldown,
+                busy_seconds=busy_cooldown,
                 local_tz=local_tz,
                 recheck=recheck(task.executor),
             )
@@ -496,6 +510,7 @@ def replay(
         "tasks": len(tasks),
         "cooldown_seconds": cooldown,
         "quota_cooldown_seconds": quota_cooldown,
+        "busy_cooldown_seconds": busy_cooldown,
         "executor_failures": failures,
         "avoidable_runs": avoidable,
         "avoidable_minutes": round(sum(run["minutes"] for run in avoidable), 1),
@@ -1224,6 +1239,337 @@ def timeouts(tasks: list[Task]) -> dict:
     }
 
 
+def _root_task(task: Task, by_id: dict[str, Task]) -> Task | None:
+    """Follow continuation ancestry before nesting; corrupt cycles have no root."""
+    seen = set()
+    while task.task_id not in seen:
+        seen.add(task.task_id)
+        parent = next(
+            (
+                by_id[key]
+                for key in (task.escalated_from, task.followup_of, task.parent_task_id)
+                if key in by_id
+            ),
+            None,
+        )
+        if parent is None:
+            return task
+        task = parent
+    return None
+
+
+def _byte_summary(values: list[int], roots: int) -> dict:
+    return {
+        "roots": roots,
+        "measured": len(values),
+        "coverage": len(values) / roots if roots else None,
+        "bytes": sum(values),
+        "median_bytes": median(values) if values else None,
+        "p90_bytes": quantiles(values, n=10, method="inclusive")[8] if len(values) >= 2 else None,
+    }
+
+
+def caller_bytes(tasks: list[Task], path: Path, *, since: datetime | None = None) -> dict:
+    """MCP response bytes per root, including reviews and all continuations.
+
+    Only counts and sizes leave this reader: malformed lines, route responses and
+    unmatched task ids never expose their contents. Missing telemetry is not zero
+    consumption; it lowers coverage and stays out of the percentiles.
+    """
+    by_id = {task.task_id: task for task in tasks}
+    root_for = {task.task_id: _root_task(task, by_id) for task in tasks}
+    roots = {
+        root.task_id: root
+        for root in root_for.values()
+        if root is not None and (since is None or root.created_at >= since)
+    }
+    totals: Counter[str] = Counter()
+    available = True
+    invalid = unmatched = unassigned = responses = 0
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    invalid += 1
+                    continue
+                if not isinstance(row, dict):
+                    invalid += 1
+                    continue
+                task_id, size = row.get("task_id"), row.get("bytes")
+                if type(size) is not int or size < 0:
+                    invalid += 1
+                    continue
+                if task_id is None:
+                    unassigned += 1
+                    continue
+                if not isinstance(task_id, str):
+                    invalid += 1
+                    continue
+                root = root_for.get(task_id)
+                if root is None:
+                    unmatched += 1
+                    continue
+                if root.task_id in roots:
+                    totals[root.task_id] += size
+                    responses += 1
+    except OSError:
+        available = False
+    executors = sorted({task.executor for task in roots.values()})
+    return {
+        **_byte_summary(list(totals.values()), len(roots)),
+        "available": available,
+        "responses": responses,
+        "invalid_lines": invalid,
+        "unmatched": unmatched,
+        "unassigned": unassigned,
+        "by_executor": {
+            name: _byte_summary(
+                [size for task_id, size in totals.items() if roots[task_id].executor == name],
+                sum(task.executor == name for task in roots.values()),
+            )
+            for name in executors
+        },
+    }
+
+
+def _meta_rows(task: Task, key: str) -> list[dict]:
+    value = task.result.meta.get(key) if task.result else None
+    return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+
+
+def _downstream(task: Task, tasks: list[Task]) -> list[Task]:
+    """Escalation/follow-up descendants, never independent nested work or reviews."""
+    children: dict[str, list[Task]] = {}
+    for child in tasks:
+        if child.kind == "task":
+            for parent in (child.escalated_from, child.followup_of):
+                if parent:
+                    children.setdefault(parent, []).append(child)
+    found, seen, pending = [], set(), [task]
+    while pending:
+        current = pending.pop()
+        if current.task_id in seen:
+            continue
+        seen.add(current.task_id)
+        found.append(current)
+        pending.extend(children.get(current.task_id, []))
+    return found
+
+
+def watchdog(tasks: list[Task]) -> dict:
+    counts: Counter[str] = Counter()
+    by_reason: dict[str, Counter[str]] = {}
+    for task in tasks:
+        meta = task.result.meta.get("watchdog") if task.result else None
+        if not isinstance(meta, dict) or meta.get("reason") not in ("idle", "looping"):
+            continue
+        reason = meta["reason"]
+        tool_open = meta.get("tool_open")
+        tool = (
+            "tool_open"
+            if tool_open is True
+            else "tool_closed"
+            if tool_open is False
+            else "tool_unknown"
+        )
+        counts.update(("count", reason, tool))
+        by_reason.setdefault(reason, Counter())[tool] += 1
+        if any(
+            child.followup_of and child.executor == task.executor and child.status == "completed"
+            for child in _downstream(task, tasks)
+        ):
+            counts["completed_followup_same_executor"] += 1
+    return {
+        **{
+            key: counts[key]
+            for key in (
+                "count",
+                "idle",
+                "looping",
+                "tool_open",
+                "tool_closed",
+                "tool_unknown",
+                "completed_followup_same_executor",
+            )
+        },
+        "by_reason": {
+            reason: {
+                key: by_reason.get(reason, Counter())[key]
+                for key in ("tool_open", "tool_closed", "tool_unknown")
+            }
+            for reason in ("idle", "looping")
+        },
+    }
+
+
+def handoff(tasks: list[Task]) -> dict:
+    counts: Counter[str] = Counter()
+    modes: Counter[str] = Counter()
+    for task in tasks:
+        meta = task.result.meta.get("handoff") if task.result else None
+        if not isinstance(meta, dict) or meta.get("mode") not in ("patch", "in_place"):
+            continue
+        counts["count"] += 1
+        counts["apply_failed"] += bool(meta.get("apply_failed"))
+        modes[meta["mode"]] += 1
+        downstream = _downstream(task, tasks)
+        outcome = (
+            "completed"
+            if any(item.status == "completed" for item in downstream)
+            else (
+                "in_flight"
+                if any(item.status not in FINAL_STATUSES for item in downstream)
+                else "not_completed"
+            )
+        )
+        counts[outcome] += 1
+    return {
+        **{
+            key: counts[key]
+            for key in (
+                "count",
+                "completed",
+                "not_completed",
+                "in_flight",
+                "apply_failed",
+            )
+        },
+        "by_mode": dict(sorted(modes.items())),
+    }
+
+
+def _known_cost(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value) if isfinite(value) and value >= 0 else None
+    return None
+
+
+def _task_cost(task: Task | None) -> float | None:
+    return (
+        _known_cost(task.result.usage.cost_usd)
+        if (task and task.result and task.result.usage)
+        else None
+    )
+
+
+def _cost_summary(costs: list[float]) -> dict:
+    return {
+        "samples": len(costs),
+        "cost_usd": round(sum(costs), 4),
+        "avg_usd": round(sum(costs) / len(costs), 4) if costs else None,
+    }
+
+
+def fix_round(tasks: list[Task]) -> dict:
+    """Round usage is incremental; task usage already includes it and is not added."""
+    counts: Counter[str] = Counter()
+    costs = []
+    for task in tasks:
+        for row in _meta_rows(task, "fix_rounds"):
+            verdict = row.get("verdict")
+            if verdict not in ("pass", "fail", "skipped", "unknown"):
+                continue
+            counts["rounds"] += 1
+            counts[{"pass": "recovered", "fail": "failed"}.get(verdict, "skipped")] += 1
+            usage = row.get("usage")
+            cost = _known_cost(usage.get("cost_usd")) if isinstance(usage, dict) else None
+            if cost is not None:
+                costs.append(cost)
+    escalation_costs = [
+        cost
+        for task in tasks
+        if task.escalated_from
+        and task.kind == "task"
+        and not guard_refusal(task)
+        and (cost := _task_cost(task)) is not None
+    ]
+    return {
+        **{key: counts[key] for key in ("rounds", "recovered", "failed", "skipped")},
+        "recovered_share": counts["recovered"] / counts["rounds"] if counts["rounds"] else None,
+        "round_cost": _cost_summary(costs),
+        "escalation_link_cost": _cost_summary(escalation_costs),
+    }
+
+
+def review_stages(tasks: list[Task]) -> dict:
+    """Attempts by stage; unique works and final verdicts for policy denominators.
+
+    Free/paid is observed from reviewer usage, never guessed from model names or
+    absent prices. Old single-review metadata is outside the staged cohort.
+    """
+    by_id = {task.task_id: task for task in tasks}
+    stages: dict[int, Counter[str]] = {}
+    reviewers: dict[str, Counter[str]] = {}
+    works = free_works = free_rejected = paid_reached = paid_failed = 0
+    for task in tasks:
+        rows = [
+            row
+            for row in _meta_rows(task, "review_stages")
+            if isinstance(row.get("by"), str)
+            and row["by"]
+            and row.get("verdict") in _REVIEW_VERDICTS
+        ]
+        if not rows:
+            continue
+        works += 1
+        order = list(dict.fromkeys(row["by"] for row in rows))
+        latest = {}
+        free, paid, observed = set(), set(), set()
+        for row in rows:
+            reviewer, verdict = row["by"], row["verdict"]
+            stage = order.index(reviewer) + 1
+            counts = stages.setdefault(stage, Counter())
+            task_id = row.get("task_id")
+            child = by_id.get(task_id) if isinstance(task_id, str) else None
+            if child and child.kind == "review" and child.executor == reviewer:
+                reviewers.setdefault(reviewer, Counter())[verdict] += 1
+                observed.add(reviewer)
+            counts[verdict] += 1
+            latest[reviewer] = verdict
+            cost = _task_cost(child)
+            if cost is not None:
+                (free if cost == 0 else paid).add(reviewer)
+        if free:
+            free_works += 1
+            if order[-1] in free and latest[order[-1]] == "fail":
+                free_rejected += 1
+        # The denominator is every work reaching a paid stage, including unknown
+        # verdicts and successful retries, not just the number of paid failures.
+        if paid:
+            paid_reached += 1
+            paid_failed += any(latest[name] == "fail" for name in paid)
+        for reviewer in observed:
+            reviewers[reviewer]["reached"] += 1
+            reviewers[reviewer]["failed"] += latest[reviewer] == "fail"
+    return {
+        "works": works,
+        "by_stage": {
+            str(stage): {verdict: counts[verdict] for verdict in _REVIEW_VERDICTS}
+            for stage, counts in sorted(stages.items())
+        },
+        "by_reviewer": {
+            name: {
+                **{key: counts[key] for key in (*_REVIEW_VERDICTS, "reached", "failed")},
+                "fail_share": counts["failed"] / counts["reached"] if counts["reached"] else None,
+            }
+            for name, counts in sorted(reviewers.items())
+        },
+        "free_rejection": {
+            "works": free_works,
+            "rejected": free_rejected,
+            "share": free_rejected / free_works if free_works else None,
+        },
+        "paid": {
+            "reached": paid_reached,
+            "failed": paid_failed,
+            "fail_share": paid_failed / paid_reached if paid_reached else None,
+            "baseline_fail_share": 0.43,
+        },
+    }
+
+
 #: Вердикты ревью `review_by` в порядке вывода.
 _REVIEW_VERDICTS = ("pass", "fail", "unknown", "skipped")
 
@@ -1697,6 +2043,60 @@ def render(report: dict) -> str:
             f"no stream {row['no_stream']}, unknown {row['unknown']}, "
             f"avg {row['avg_minutes']} min"
             for name, row in info["by_executor"].items()
+        ]
+    if "caller_bytes" in report:
+        info = report["caller_bytes"]
+        lines.append(
+            f"caller bytes (MCP responses): {info['measured']} of {info['roots']} roots "
+            f"({_pct(info['coverage'])} coverage), median {info['median_bytes']}, "
+            f"p90 {info['p90_bytes']}"
+            + (" (telemetry unavailable)" if not info["available"] else "")
+        )
+        lines += [
+            f"  {name}: {row['measured']} of {row['roots']} roots, "
+            f"median {row['median_bytes']}, p90 {row['p90_bytes']}"
+            for name, row in info["by_executor"].items()
+        ]
+    if "watchdog" in report:
+        info = report["watchdog"]
+        lines.append(
+            f"watchdog: {info['count']}, idle {info['idle']}, looping {info['looping']}, "
+            f"tool open {info['tool_open']}, tool closed {info['tool_closed']}; "
+            f"same-executor completed follow-ups {info['completed_followup_same_executor']}"
+        )
+    if "handoff" in report:
+        info = report["handoff"]
+        lines.append(
+            f"handoff: {info['count']} transferred, completed downstream {info['completed']}, "
+            f"not completed {info['not_completed']}, in flight {info['in_flight']}, "
+            f"apply failed {info['apply_failed']}"
+        )
+    if "fix_round" in report:
+        info = report["fix_round"]
+        lines.append(
+            f"fix rounds: {info['rounds']}, recovered {info['recovered']} "
+            f"({_pct(info['recovered_share'])}), failed {info['failed']}, "
+            f"skipped {info['skipped']}; avg round ${info['round_cost']['avg_usd']}, "
+            f"avg escalation link ${info['escalation_link_cost']['avg_usd']}"
+        )
+    if "review_stages" in report:
+        info = report["review_stages"]
+        free, paid = info["free_rejection"], info["paid"]
+        lines.append(
+            f"review stages: {info['works']} works, free rejection "
+            f"{free['rejected']} of {free['works']} ({_pct(free['share'])}); "
+            f"paid fail {paid['failed']} of {paid['reached']} reached "
+            f"({_pct(paid['fail_share'])}, baseline {_pct(paid['baseline_fail_share'])})"
+        )
+        lines += [
+            f"  stage {stage}: "
+            + ", ".join(f"{verdict} {row[verdict]}" for verdict in _REVIEW_VERDICTS)
+            for stage, row in info["by_stage"].items()
+        ]
+        lines += [
+            f"  {name}: failed {row['failed']} of {row['reached']} works reached "
+            f"({_pct(row['fail_share'])})"
+            for name, row in info["by_reviewer"].items()
         ]
     if "post_review" in report:
         info = report["post_review"]

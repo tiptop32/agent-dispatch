@@ -1,9 +1,13 @@
 import asyncio
+import codecs
 import os
 import signal
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from agent_dispatch.executors.watchdog import OmpWatchdog
 
 
 @dataclass(frozen=True)
@@ -20,6 +24,7 @@ class ProcessOutcome:
     last_output_age_s: float | None = None
     #: Configured hard timeout, retained for machine-readable diagnostics.
     timeout_seconds: float | None = None
+    watchdog: dict | None = None
 
 
 async def run_cli(
@@ -32,6 +37,9 @@ async def run_cli(
     log_path: Path,
     grace_seconds: float = 10.0,
     idle_timeout_seconds: float | None = None,
+    on_line: Callable[[str], None] | None = None,
+    watchdog: OmpWatchdog | None = None,
+    watchdog_interval_seconds: float = 300,
 ) -> ProcessOutcome:
     """Run a CLI process, streaming output and terminating its process group."""
     started_at = time.monotonic()
@@ -58,12 +66,24 @@ async def run_cli(
     async def read_stream(stream: asyncio.StreamReader, chunks: list[bytes], prefix: str) -> None:
         nonlocal last_output_at
         with log_path.open("a") as log_file:
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            pending = ""
             while data := await stream.read(65536):
                 last_output_at = time.monotonic()
                 chunks.append(data)
-                text = data.decode(errors="replace")
+                text = decoder.decode(data)
                 log_file.write(f"{prefix}{text}")
                 log_file.flush()
+                if on_line is not None and not prefix:
+                    pending += text
+                    while "\n" in pending:
+                        line, pending = pending.split("\n", 1)
+                        on_line(line.removesuffix("\r"))
+            final = decoder.decode(b"", final=True)
+            if final:
+                log_file.write(final)
+            if on_line is not None and not prefix and pending + final:
+                on_line((pending + final).removesuffix("\r"))
 
     readers = [
         asyncio.create_task(read_stream(process.stdout, stdout_chunks, "")),
@@ -112,7 +132,11 @@ async def run_cli(
     timed_out = False
     stalled = False
     last_output_age_s: float | None = None
+    watchdog_result = None
+    next_watchdog_at = time.monotonic() + watchdog_interval_seconds
     idle_limit = idle_timeout_seconds if idle_timeout_seconds and idle_timeout_seconds > 0 else None
+    if watchdog is not None:
+        idle_limit = None
     process_wait = asyncio.create_task(process.wait())
     try:
         deadline = time.monotonic() + timeout_seconds
@@ -125,11 +149,26 @@ async def run_cli(
                 await terminate_group()
                 break
             poll = min(remaining, 1.0)
+            if watchdog is not None:
+                poll = min(poll, max(next_watchdog_at - time.monotonic(), 0.001))
             if idle_limit is not None:
                 poll = min(poll, max(idle_limit / 4, 0.001))
             try:
                 await asyncio.wait_for(asyncio.shield(process_wait), timeout=poll)
             except TimeoutError:
+                if watchdog is not None and time.monotonic() >= next_watchdog_at:
+                    next_watchdog_at = time.monotonic() + watchdog_interval_seconds
+                    watchdog_result = watchdog.check()
+                    if watchdog_result is not None:
+                        idle_limit = (
+                            watchdog.tool_idle_seconds
+                            if watchdog_result["tool_open"]
+                            else watchdog.idle_seconds
+                        )
+                        stalled = True
+                        last_output_age_s = round(time.monotonic() - watchdog.last_activity_at, 1)
+                        await terminate_group()
+                        break
                 if idle_limit is not None and time.monotonic() - last_output_at >= idle_limit:
                     stalled = True
                     last_output_age_s = round(time.monotonic() - last_output_at, 1)
@@ -159,4 +198,5 @@ async def run_cli(
         idle_seconds=idle_limit,
         last_output_age_s=last_output_age_s,
         timeout_seconds=timeout_seconds,
+        watchdog=watchdog_result,
     )

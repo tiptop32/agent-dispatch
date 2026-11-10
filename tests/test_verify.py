@@ -43,7 +43,7 @@ async def _make(tmp_path: Path, *, results: dict[str, ExecutionResult] | None = 
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path / "data"),
         routing=RoutingSettings(fallback_executor="omp"),
-        execution=ExecutionSettings(**execution),
+        execution=ExecutionSettings(review_fix_rounds=0, **execution),
         executors={
             "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp"),
             "claude": ExecutorSettings(adapter="claude", description="claude"),

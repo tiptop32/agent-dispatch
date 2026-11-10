@@ -1,7 +1,9 @@
 import hashlib
 import os
+import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 #: Отметки снимка для путей, чьё состояние не сводится к содержимому файла.
@@ -164,3 +166,99 @@ def diff(before: dict[str, str], after: dict[str, str]) -> list[str]:
     changed = {path for path, state in after.items() if before.get(path) != state}
     changed |= before.keys() - after.keys()
     return sorted(changed)
+
+
+class DiffStatSnapshot:
+    """Measure task changes without writing caller files into its Git object store."""
+
+    def __init__(self, cwd: str | Path):
+        self.temp = tempfile.TemporaryDirectory(prefix="agent-dispatch-stat-")
+        self.env = git_env()
+        self.root = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        objects = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-path", "objects"],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        index = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-path", "index"],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        temporary = Path(self.temp.name)
+        (temporary / "objects").mkdir()
+        self.env["GIT_OBJECT_DIRECTORY"] = str(temporary / "objects")
+        self.env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = objects
+        self.env["GIT_INDEX_FILE"] = str(temporary / "index")
+        if Path(index).is_file():
+            shutil.copyfile(index, self.env["GIT_INDEX_FILE"])
+        else:
+            subprocess.run(
+                ["git", "read-tree", "HEAD"],
+                cwd=self.root,
+                env=self.env,
+                capture_output=True,
+                check=True,
+            )
+        self.before = self._tree()
+
+    def _tree(self) -> str:
+        subprocess.run(
+            ["git", "add", "-A", "--", "."],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            check=True,
+        )
+        return subprocess.run(
+            ["git", "write-tree"],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    def diff_stat(self, files: list[str]) -> dict[str, int]:
+        if not files:
+            return {"files": 0, "added": 0, "removed": 0}
+        after = self._tree()
+        raw = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--numstat",
+                "-z",
+                "--no-renames",
+                self.before,
+                after,
+                "--",
+                *[f":(top,literal){name}" for name in files],
+            ],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            check=True,
+        ).stdout
+        rows = [row.split(b"\t", 2) for row in raw.split(b"\0") if row]
+        return {
+            "files": len(rows),
+            "added": sum(int(row[0]) for row in rows if row[0] != b"-"),
+            "removed": sum(int(row[1]) for row in rows if row[1] != b"-"),
+        }
+
+    def close(self) -> None:
+        self.temp.cleanup()

@@ -19,9 +19,7 @@ from agent_dispatch.config import (
 )
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.executors import worktree
-from agent_dispatch.executors.process import ProcessOutcome
 from agent_dispatch.executors.registry import AvailabilityCache
-from agent_dispatch.executors.result_parser import normalize
 from agent_dispatch.models import DispatchRequest, ExecutionResult, TaskStatus
 from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
@@ -569,50 +567,6 @@ async def test_escalated_work_is_held_on_its_branch_and_the_next_executor_integr
     branch = parent.result.meta["branch"]
     assert _git(git_repo, "show", f"{branch}:a.py") == "x = 'half'\n"
     assert Path(parent.result.meta["patch"]).is_file()  # noqa: ASYNC240
-
-
-@pytest.mark.asyncio
-async def test_timed_out_work_with_changed_files_is_partial_and_not_escalated(tmp_path, git_repo):
-    # Таймаут с изменёнными файлами — это partial: эскалации нет, судит
-    # вызывающий по дифу. Результат строится через normalize, как это делают
-    # настоящие адаптеры из ProcessOutcome и git-дифа.
-    settings = Settings(
-        server=ServerSettings(data_dir=tmp_path, max_concurrent_tasks=2),
-        routing=RoutingSettings(fallback_executor="omp"),
-        execution=ExecutionSettings(workspace_mode="worktree"),
-        executors={
-            "omp": ExecutorSettings(adapter="omp", model="agent-lb/luna", description="omp"),
-            "claude": ExecutorSettings(adapter="claude", description="claude"),
-        },
-        escalation={"omp": ["claude"]},
-    )
-    storage = Storage(tmp_path / "db.sqlite")
-    await storage.open()
-    outcome = ProcessOutcome(exit_code=0, stdout="out", stderr="", timed_out=True, duration_ms=12)
-    adapters = {
-        "omp": FakeAdapter(
-            "omp",
-            result=normalize(None, outcome, ["a.py"], "omp", None),
-            on_execute=_writes("x = 'half'\n"),
-        ),
-        "claude": FakeAdapter("claude", on_execute=_writes("x = 'done'\n")),
-    }
-    dispatcher = Dispatcher(
-        settings, storage, adapters, AvailabilityCache(adapters, 60), [FakeRouter()]
-    )
-
-    first = await dispatcher.submit(_req(git_repo))
-    done = await dispatcher.wait(first.task_id, WAIT)
-
-    assert done.status == "partial"
-    assert done.result.error == "timeout"
-    assert done.result.meta["timed_out"] is True
-    # Эскалации нет: звено claude не стартовало, работа легла в рабочую копию.
-    kinds = {event["kind"] for event in await storage.list_events(first.task_id)}
-    assert "escalate" not in kinds
-    assert done.result.meta["integrated"] is True
-    assert "integration_held" not in done.result.meta
-    assert (git_repo / "a.py").read_text() == "x = 'half'\n"
 
 
 @pytest.mark.asyncio

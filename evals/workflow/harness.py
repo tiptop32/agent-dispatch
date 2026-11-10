@@ -102,11 +102,11 @@ def _check_prompt(case: dict[str, Any], prompt: str) -> list[str]:
             failures.append("caller ownership")
         if ownership != f"{TASK_EXECUTOR_OWNERSHIP} {TASK_CALLER_OWNERSHIP}":
             failures.append("task ownership format")
-        if rules != TASK_RULES:
+        if rules is None or not rules.startswith(TASK_RULES):
             failures.append("task no-commit/push rule")
     else:
         review = _section(prompt, "Review only")
-        if review is None or review.split("\n## Working copy", 1)[0] != REVIEW_ONLY:
+        if review is None or not review.startswith(REVIEW_ONLY):
             failures.append("read-only review contract")
         if ownership is None or REVIEW_EXECUTOR_OWNERSHIP not in ownership:
             failures.append("reviewer ownership")
@@ -117,7 +117,7 @@ def _check_prompt(case: dict[str, Any], prompt: str) -> list[str]:
         )
         if ownership != expected:
             failures.append("review ownership format")
-        if rules != REVIEW_RULES:
+        if rules is None or not rules.startswith(REVIEW_RULES):
             failures.append("review no-edit/commit/push rule")
         if "diff --git a/README.md b/README.md" not in prompt:
             failures.append("review package diff")

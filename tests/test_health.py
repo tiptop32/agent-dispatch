@@ -260,8 +260,9 @@ def test_quota_cools_down_until_the_announced_reset():
         ("quota", "You've hit your usage limit. Try again later.", 900, 3600),
         ("capacity", "Selected model is at capacity.", 900, 900),
         ("quota", "You've hit your weekly limit · resets 5am", 0, 0),
+        ("model_busy", "ConcurrencyLimitModel; try again in 2 hours", 900, 120),
     ],
-    ids=["quota-without-reset", "not-a-quota", "mechanism-off"],
+    ids=["quota-without-reset", "not-a-quota", "mechanism-off", "busy-ignores-reset"],
 )
 def test_cooldown_without_a_reset_uses_the_configured_seconds(kind, error, failure, expected):
     assert (
@@ -421,6 +422,7 @@ def test_omp_error_ignores_message_ends_without_an_error_turn():
         ),
         # Живой формат 429 не снят: классифицируем и по слову, и по коду.
         pytest.param("429 Too Many Requests", "quota", id="omp-429"),
+        pytest.param("429 rate limit exceeded", "quota", id="omp-generic-rate-limit"),
     ],
 )
 def test_omp_cli_errors_are_classified(error, expected):
@@ -477,6 +479,7 @@ def test_omp_maxcost_notice_is_not_an_executor_failure():
         (_failed("websocket transport error: connection closed"), "transport_error"),
         (_failed("connection reset by peer"), "transport_error"),
         (_failed("429 Too Many Requests"), "rate_limit"),
+        (_failed('429 {"detail":{"error":"ConcurrencyLimitModel"}}'), "model_busy"),
         (_failed("You've hit your weekly limit"), "quota_exceeded"),
         (_failed("timeout", changed_files=[]), "timeout"),
         (_failed("stalled: no output for 3s"), "stream_stalled"),

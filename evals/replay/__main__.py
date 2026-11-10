@@ -14,12 +14,15 @@ from .harness import (
     GitLocator,
     acceptance,
     agent_lb_costs,
+    caller_bytes,
     children_refusals,
     cost_drift,
     default_limit_group,
     delegations,
     exploration_comparison,
     feedback_summary,
+    fix_round,
+    handoff,
     load,
     load_decisions,
     outcome_metrics,
@@ -28,9 +31,11 @@ from .harness import (
     recommendations,
     render,
     replay,
+    review_stages,
     router_vs_static,
     successor,
     timeouts,
+    watchdog,
 )
 
 
@@ -82,6 +87,11 @@ def main() -> int:
         default=AGENT_LB_DB.expanduser(),
         help="agent-lb store.db to check reported task cost against (read only)",
     )
+    parser.add_argument(
+        "--mcp-responses",
+        type=Path,
+        help="MCP response JSONL (default: mcp_responses.jsonl beside --db)",
+    )
     parser.add_argument("--json", action="store_true", help="print the full JSON report")
     args = parser.parse_args()
     since = None
@@ -105,13 +115,15 @@ def main() -> int:
         new, item = current(name)
         return item.resolved_limit_group(new) if item else default_limit_group(name)
 
-    tasks = load(args.db)
+    all_tasks = load(args.db)
+    tasks = all_tasks
     if since is not None:
         tasks = [task for task in tasks if task.created_at >= since]
     report = replay(
         tasks,
         args.cooldown,
         quota_cooldown=settings.routing.quota_cooldown_seconds,
+        busy_cooldown=settings.routing.busy_cooldown_seconds,
         limit_group=limit_group,
         review_only=settings.routing.review_only,
         recheck=lambda name: bool(current(name)[1]) and current(name)[1].limit_reset == "recheck",
@@ -126,6 +138,13 @@ def main() -> int:
     report["post_review"] = post_review(tasks)
     report["feedback"] = feedback_summary(tasks)
     report["cost_drift"] = _cost_drift(tasks, args.agent_lb_db)
+    report["caller_bytes"] = caller_bytes(
+        all_tasks, args.mcp_responses or args.db.parent / "mcp_responses.jsonl", since=since
+    )
+    report["watchdog"] = watchdog(tasks)
+    report["handoff"] = handoff(tasks)
+    report["fix_round"] = fix_round(tasks)
+    report["review_stages"] = review_stages(tasks)
     # Один locator на прогон: дифы эксперимента судятся второй раз из кэша.
     locator = GitLocator()
     if not args.no_git:
