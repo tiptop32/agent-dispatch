@@ -37,9 +37,8 @@ DEFAULT_OMP_EXECUTORS = (
     "omp/terra",
     "omp/luna",
     "omp/x5-code-large",
-    "omp/x5-small-coder",
-    "omp/copilot-code-flash",
-    "omp/copilot-code-flash-thinking",
+    "omp/x5-small",
+    "omp/x5-large",
 )
 GREEN_MCP_JSON = {
     "mcpServers": {

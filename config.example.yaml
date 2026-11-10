@@ -120,36 +120,30 @@ executors:
     description: "omp с X5 Airun Code Large через copilot-x5: корпоративные данные не уходят за периметр"
     # review_by: omp/sol  # ревью законченной правки до интеграции, fail эскалирует
     # perimeter_review_by: omp/x5-code-large  # ревью задач под периметром и prod: только corporate, можно себя
-  omp/x5-small-coder:
+  # Модели периметра берутся только из реестра внутренних моделей AI-Run:
+  # https://instructions.x5.ru/airun/reestr-vnutrennikh-modeley, статус https://stats.airun.x5.ru/.
+  omp/x5-small:
     adapter: omp
     command: omp
-    model: copilot-x5/x5-airun-small-coder
+    model: copilot-x5/x5-airun-small
     extra_args: []
     enabled: false
     tier: fast
     corporate: true
-    description: "omp с X5 Airun Small Coder через copilot-x5: быстрые мелкие правки внутри периметра"
-  omp/copilot-code-flash:
+    description: "omp с X5 Airun Small (Qwen3.6-35B-A3B, 262k) через copilot-x5: быстрые мелкие правки внутри периметра"
+  omp/x5-large:
     adapter: omp
     command: omp
-    model: copilot-x5/copilot-code-flash
+    model: copilot-x5/x5-airun-large
     extra_args: []
-    enabled: false
-    tier: fast
-    corporate: true
-    description: "omp с Copilot Code Flash через copilot-x5: быстрый корпоративный исполнитель"
-  omp/copilot-code-flash-thinking:
-    adapter: omp
-    command: omp
-    model: copilot-x5/copilot-code-flash
-    extra_args: ["--thinking", "high"]
     enabled: false
     tier: balanced
     corporate: true
-    description: "omp с Copilot Code Flash в режиме рассуждений через copilot-x5: balanced внутри периметра"
+    description: "omp с X5 Airun Large (DeepSeek-V4.1-Flash, 131k) через copilot-x5: обычная работа внутри периметра, резерв x5-code-large"
 
 escalation:
   omp/luna: [omp/terra, omp/sol, claude]
   omp/terra: [omp/sol, claude]
   omp/sol: [claude]
-  omp/x5-code-large: [omp/x5-small-coder]
+  omp/x5-code-large: [omp/x5-large]
+  omp/x5-small: [omp/x5-code-large, omp/x5-large]

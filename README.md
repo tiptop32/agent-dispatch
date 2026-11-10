@@ -17,7 +17,7 @@ omp ──────────┘──→ MCP `dispatch` ──→ демо
 - `route` и `dispatch` используют `balanced` без дополнительного LLM-вызова. Параметр `capability` позволяет явно выбрать `fast`, `balanced` или `strong`; `max_capability` остаётся верхним потолком и не меняет прежнюю семантику.
 - Jev и `claude_local` остаются opt-in. Jev получает task state только для cwd под `router.external.trusted_roots`; неизвестные проекты закрыты fail-closed, `prod: true` всегда пропускает роутеры.
 - Guards в коде: недоступный исполнитель, исчерпанный лимит (до объявленного сброса, на весь аккаунт), правило «только ревью» (`routing.review_only`), лимит глубины делегирования (`max_hops`), лимит сабагентов на задачу (`max_children`), низкая уверенность Jev, таймаут, отмена.
-- Escalation chains из конфига: `omp/luna → omp/terra → omp/sol → claude`, `omp/x5-code-large → omp/x5-small-coder`.
+- Escalation chains из конфига: `omp/luna → omp/terra → omp/sol → claude`, `omp/x5-small → omp/x5-code-large → omp/x5-large`, `omp/x5-code-large → omp/x5-large`.
 - Временный transport retry ограничен числом попыток и временем, разрешён только до первого ответа и при неизменённой рабочей копии; после исчерпания не происходит escalation только из-за transport ошибки.
 - Телеметрия каждого решения и результата, экспорт в JSONL для анализа routing accuracy и outcome-aware метрик.
 

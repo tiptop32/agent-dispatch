@@ -160,12 +160,25 @@ def test_omp_executors_come_from_packaged_config(tmp_config_dir: Path) -> None:
     assert x5.corporate is True
     assert x5.resolved_limit_group("omp/x5-code-large") == "omp:copilot-x5"
     assert sol.resolved_limit_group("omp/sol") == "agent-lb"
-    assert settings.executors["omp/x5-small-coder"].enabled is False
-    assert settings.executors["omp/copilot-code-flash"].tier == "fast"
-    assert settings.executors["omp/copilot-code-flash-thinking"].tier == "balanced"
+    assert settings.executors["omp/x5-small"].enabled is False
+    assert settings.executors["omp/x5-small"].tier == "fast"
+    assert settings.executors["omp/x5-large"].enabled is False
+    assert settings.executors["omp/x5-large"].tier == "balanced"
+    assert settings.escalation["omp/x5-code-large"] == ["omp/x5-large"]
     assert settings.routing.fallback_chain == ["omp/sol"]
     assert settings.routing.review_only == {"omp": ["claude"]}
     assert settings.escalation["omp/luna"] == ["omp/terra", "omp/sol", "claude"]
+
+
+def test_packaged_corporate_executors_use_airun_registry_models(tmp_config_dir: Path) -> None:
+    # Периметр держится только на моделях реестра внутренних моделей AI-Run (x5-airun-*).
+    # Старые алиасы шлюза (copilot-code-flash, x5-airun-small-coder) он принимает, но их нет
+    # ни в реестре, ни в /v1/models: контур за ними не подтверждён.
+    settings = load_settings()
+
+    corporate = {name: ex.model for name, ex in settings.executors.items() if ex.corporate}
+    assert corporate
+    assert all(model.startswith("copilot-x5/x5-airun-") for model in corporate.values()), corporate
 
 
 def test_executors_merge_by_name(tmp_config_dir: Path) -> None:
