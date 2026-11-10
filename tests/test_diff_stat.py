@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -96,3 +97,42 @@ def test_compact_review_keeps_multiline_findings():
     text = _review_line({"verdict": "fail", "by": "rev", "summary": findings})
     assert "first finding" in text and "second finding" in text
     assert len(text.split(" — ", 1)[1]) == 1500
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["in_place", "worktree"])
+async def test_handoff_diff_stat_includes_staged_inherited_lines(tmp_path, git_repo, mode):
+    from agent_dispatch.models import DispatchRequest
+    from tests.test_handoff import interrupted, make_dispatcher
+
+    storage, adapters, dispatcher = await make_dispatcher(
+        tmp_path, mode=mode, results={"first": interrupted()}
+    )
+
+    async def start(ctx):
+        (Path(ctx.cwd) / "a.py").write_text("inherited = 2\n")
+        await asyncio.to_thread(subprocess.run, ["git", "add", "a.py"], cwd=ctx.cwd, check=True)
+
+    async def finish(ctx):
+        (Path(ctx.cwd) / "new.py").write_text("finished = True\n")
+
+    adapters["first"].on_execute = start
+    adapters["second"].on_execute = finish
+    adapters["second"].result = ExecutionResult(
+        status="completed",
+        executor="second",
+        model=None,
+        summary="done",
+        changed_files=["new.py"],
+    )
+    try:
+        first = await dispatcher.submit(
+            DispatchRequest(task="finish", cwd=str(git_repo), executor="first")
+        )
+        done = await dispatcher.wait(first.task_id, 10)
+        assert done.status == "completed"
+        assert done.result.changed_files == ["a.py", "new.py"]
+        assert done.result.meta["diff_stat"] == {"files": 2, "added": 2, "removed": 1}
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()

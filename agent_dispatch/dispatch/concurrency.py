@@ -78,21 +78,25 @@ class ExecutorConcurrency:
         return semaphore is not None and semaphore.locked()
 
     @asynccontextmanager
-    async def slot(self, task_id: str, executor: str) -> AsyncIterator[None]:
+    async def slot(self, task_id: str, executor: str, *, root: bool = False) -> AsyncIterator[None]:
         started = time.monotonic()
         semaphore = self._semaphore(executor)
         inherited_from = None
         lease = None
         if semaphore is not None:
-            ancestors = await self._ancestors(task_id)
-            record = await self.storage.get_task(task_id)
+            # Root admission checks availability and reserves on the same event
+            # loop turn. Do not suspend on storage before acquiring its slot.
+            ancestors = [] if root else await self._ancestors(task_id)
+            record = None if root else await self.storage.get_task(task_id)
             ancestor = next(
                 ((task, held) for task, held in ancestors if held.executor == executor), None
             )
             if ancestor is not None and record is not None and record.request.kind != "review":
                 inherited_from, lease = ancestor
             else:
-                if ancestor is not None and semaphore.locked():
+                holders = {task for task, held in self._active.items() if held.executor == executor}
+                ancestor_ids = {task for task, _ in ancestors}
+                if ancestor is not None and semaphore.locked() and holders <= ancestor_ids:
                     raise RuntimeError(f"executor capacity deadlock: {executor}")
                 sources = {task for task, held in ancestors if held.executor != executor}
                 if semaphore.locked() and sources:
@@ -107,16 +111,17 @@ class ExecutorConcurrency:
             lease.users += 1
             self._active[task_id] = lease
         try:
-            await self.storage.add_event(
-                task_id,
-                "slot",
-                {
-                    "executor": executor,
-                    "limit_group": self.settings.limit_group(executor),
-                    "executor_wait_seconds": round(time.monotonic() - started, 6),
-                    "inherited_from": inherited_from,
-                },
-            )
+            if not root:
+                await self.storage.add_event(
+                    task_id,
+                    "slot",
+                    {
+                        "executor": executor,
+                        "limit_group": self.settings.limit_group(executor),
+                        "executor_wait_seconds": round(time.monotonic() - started, 6),
+                        "inherited_from": inherited_from,
+                    },
+                )
             yield
         finally:
             if lease is not None:

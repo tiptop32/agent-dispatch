@@ -13,7 +13,9 @@ from agent_dispatch.config import (
     Settings,
 )
 from agent_dispatch.dispatch.dispatcher import Dispatcher
+from agent_dispatch.executors.process import ProcessOutcome
 from agent_dispatch.executors.registry import AvailabilityCache
+from agent_dispatch.executors.result_parser import normalize
 from agent_dispatch.models import DispatchRequest, ExecutionResult, TaskStatus, Usage
 from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
@@ -256,17 +258,30 @@ async def test_repair_missing_report_recovers_or_keeps_review_blocker(
 @pytest.mark.asyncio
 async def test_successful_fix_clears_stale_interruption_flags(tmp_path, git_repo):
     storage, adapters, dispatcher = await make_dispatcher(tmp_path)
-    adapters["worker"].result = result(
-        status="partial",
-        error="timeout",
-        meta={
+    initial = normalize(
+        None,
+        ProcessOutcome(
+            exit_code=-15,
+            stdout="partial work",
+            stderr="",
+            timed_out=True,
+            duration_ms=100,
+            timeout_seconds=30,
+        ),
+        ["a.py"],
+        "worker",
+        None,
+    )
+    initial.meta.update(
+        {
             "session_id": "work-session",
-            "timed_out": True,
             "stalled": True,
             "parse_error": "old parse failure",
             "cli_error": True,
-        },
+            "failure_class": "timeout",
+        }
     )
+    adapters["worker"].result = initial
 
     async def work(ctx):
         if len(adapters["worker"].calls) == 2:
@@ -278,6 +293,43 @@ async def test_successful_fix_clears_stale_interruption_flags(tmp_path, git_repo
     done = await dispatcher.wait(task.task_id, 10)
     assert done.task_id == task.task_id and done.status == TaskStatus.completed
     assert not adapters["senior"].calls
-    for key in ("timed_out", "stalled", "parse_error", "cli_error"):
+    for key in (
+        "timed_out",
+        "stalled",
+        "parse_error",
+        "cli_error",
+        "failure_cause",
+        "failure_class",
+        "timeout_type",
+    ):
         assert key not in done.result.meta
     await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repaired", [True, False])
+async def test_verification_fix_verdict_is_not_overwritten_by_review(tmp_path, git_repo, repaired):
+    from evals.replay.harness import fix_round, load
+
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path)
+    adapters["first"].result = result("first", changed_files=[], verdict="fail", meta={})
+
+    async def work(ctx):
+        if repaired and len(adapters["worker"].calls) == 2:
+            (Path(ctx.cwd) / "marker").write_text("ok")
+
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(
+            request(git_repo, verify=["test -f marker"], allow_escalation=False)
+        )
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.result.meta["fix_rounds"][0]["verdict"] == ("pass" if repaired else "fail")
+        assert done.result.verification.result == ("passed" if repaired else "failed")
+        assert bool(adapters["first"].calls) is repaired
+        measured = fix_round(load(tmp_path / "db.sqlite"))
+        assert measured["recovered"] == int(repaired)
+        assert measured["failed"] == int(not repaired)
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()

@@ -111,14 +111,29 @@ async def wait_for_spawn(storage, task_id):
             await asyncio.sleep(0.01)
 
 
+def observe_executor_wait(dispatcher, monkeypatch):
+    waiting = asyncio.Event()
+    original = dispatcher._executor_concurrency.slot
+
+    @asynccontextmanager
+    async def slot(task_id, executor, **kwargs):
+        waiting.set()
+        async with original(task_id, executor, **kwargs):
+            yield
+
+    monkeypatch.setattr(dispatcher._executor_concurrency, "slot", slot)
+    return waiting
+
+
 @pytest.mark.asyncio
-async def test_executor_serializes_roots_and_records_executor_wait(tmp_path):
+async def test_executor_serializes_roots_and_records_executor_wait(tmp_path, monkeypatch):
     async with lab(tmp_path) as (_, storage, adapters, d):
         adapter = adapters[A]
         first = await occupy(d, adapter, directory(tmp_path, "first"))
+        waiting = observe_executor_wait(d, monkeypatch)
         adapter.started = asyncio.Event()
         second = await d.submit(req(directory(tmp_path, "second"), executor=A))
-        await wait_for_spawn(storage, second.task_id)
+        await asyncio.wait_for(waiting.wait(), WAIT)
         await assert_queued(adapter)
         adapter.gate.set()
         assert (await d.wait(first.task_id, WAIT)).status == "completed"
@@ -330,6 +345,106 @@ async def test_nested_self_review_fails_fast_when_parent_holds_only_slot(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_nested_self_review_waits_for_unrelated_holder(tmp_path):
+    executors = {A: ExecutorSettings(adapter="omp", model="provider/a", max_concurrent=2)}
+    executors[B] = ExecutorSettings(adapter="omp", model="other/b")
+    async with lab(tmp_path, executors=executors) as (_, storage, adapters, d):
+        unrelated = await occupy(d, adapters[A], directory(tmp_path, "unrelated"))
+        release = adapters[A].gate
+        adapters[A].gate = None
+        review_started = asyncio.Event()
+        child_submitted = asyncio.Event()
+        children = []
+
+        async def run(ctx):
+            if ctx.cwd == str(tmp_path / "unrelated"):
+                return
+            if ctx.read_only:
+                review_started.set()
+                return
+            child = await d.submit(
+                req(
+                    directory(tmp_path, "repo"),
+                    executor=A,
+                    kind="review",
+                    hop=1,
+                    parent_task_id=ctx.task_id,
+                )
+            )
+            children.append(child)
+            child_submitted.set()
+            await review_started.wait()
+
+        adapters[A].on_execute = run
+        parent = await d.submit(req(directory(tmp_path, "repo"), executor=A))
+        await asyncio.wait_for(child_submitted.wait(), WAIT)
+        await wait_for_spawn(storage, children[0].task_id)
+        await asyncio.sleep(QUEUE_WAIT)
+        assert (await storage.get_task(children[0].task_id)).status == "running"
+        assert not review_started.is_set()
+        release.set()
+        await asyncio.wait_for(review_started.wait(), WAIT)
+        assert (await d.wait(children[0].task_id, WAIT)).status == "completed"
+        assert (await d.wait(parent.task_id, WAIT)).status == "completed"
+        assert (await d.wait(unrelated.task_id, WAIT)).status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "same_group,holder_kind", [(False, "review"), (True, "review"), (False, "task")]
+)
+@pytest.mark.parametrize("wait_window", [0, 0.03])
+async def test_executor_wait_does_not_pin_root_or_group_capacity(
+    tmp_path, same_group, holder_kind, wait_window
+):
+    executors = {
+        A: ExecutorSettings(adapter="omp", model="shared/a", max_concurrent=1),
+        B: ExecutorSettings(adapter="omp", model="shared/b" if same_group else "other/b"),
+    }
+    async with lab(tmp_path, executors=executors, group_capacity=1) as (
+        settings,
+        storage,
+        adapters,
+        d,
+    ):
+        settings.routing.preferred_executor_max_wait_seconds = wait_window
+        d._semaphore = asyncio.Semaphore(2 if holder_kind == "task" else 1)
+        holder = await occupy(d, adapters[A], directory(tmp_path, "holder"), kind=holder_kind)
+        queued = await d.submit(req(directory(tmp_path, "queued"), executor=A))
+        await asyncio.sleep(QUEUE_WAIT)
+        free = await d.submit(req(directory(tmp_path, "free"), executor=B))
+        done = await d.wait(free.task_id, WAIT)
+        assert done.status == "completed"
+        assert (await storage.get_task(queued.task_id)).result is None
+        adapters[A].gate.set()
+        assert (await d.wait(holder.task_id, WAIT)).status == "completed"
+        assert (await d.wait(queued.task_id, WAIT)).status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_group", [False, True])
+async def test_busy_executor_triggers_same_tier_backup_after_window(tmp_path, same_group):
+    executors = {
+        A: ExecutorSettings(adapter="omp", model="shared/a", max_concurrent=1),
+        B: ExecutorSettings(adapter="omp", model="shared/b" if same_group else "other/b"),
+    }
+    async with lab(tmp_path, executors=executors) as (_, storage, adapters, d):
+        holder = await occupy(d, adapters[A], directory(tmp_path, "holder"), kind="review")
+        task = await d.submit(req(directory(tmp_path, "queued")))
+        done = await d.wait(task.task_id, WAIT)
+        assert done.status == "completed" and done.result.executor == B
+        slots = [
+            e["payload"]
+            for e in await storage.list_events(task.task_id)
+            if e["kind"] == "slot" and "queue_fallback" in e["payload"]
+        ]
+        assert slots[-1]["wait_seconds"] >= 0.03
+        assert done.decision.meta["queue_fallback"]["preferred_executor"] == A
+        adapters[A].gate.set()
+        assert (await d.wait(holder.task_id, WAIT)).status == "completed"
+
+
+@pytest.mark.asyncio
 async def test_self_review_reacquires_slot_after_coding_cli_finishes(tmp_path, git_repo):
     executors = {
         A: ExecutorSettings(
@@ -419,7 +534,7 @@ async def test_queue_fallback_skips_executor_saturated_by_review(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_report_recovery_reacquires_executor_slot_for_its_cli(tmp_path):
+async def test_report_recovery_reacquires_executor_slot_for_its_cli(tmp_path, monkeypatch):
     first_dir = directory(tmp_path, "first")
     other_dir = directory(tmp_path, "other")
     first_started, first_release = asyncio.Event(), asyncio.Event()
@@ -455,8 +570,9 @@ async def test_report_recovery_reacquires_executor_slot_for_its_cli(tmp_path):
         first = await d.submit(req(first_dir, executor=A))
         await asyncio.wait_for(first_started.wait(), WAIT)
         adapters[A].started = asyncio.Event()
+        waiting = observe_executor_wait(d, monkeypatch)
         other = await d.submit(req(other_dir, executor=A))
-        await wait_for_spawn(storage, other.task_id)
+        await asyncio.wait_for(waiting.wait(), WAIT)
         await assert_queued(adapters[A])
         first_release.set()
         await asyncio.wait_for(other_started.wait(), WAIT)

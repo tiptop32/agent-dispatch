@@ -77,14 +77,16 @@ def test_untagged_review_is_not_lost(tmp_path: Path) -> None:
     assert out.stdout.startswith("MAJOR reviewer output without severity tags: the parser")
 
 
-def test_transport_failure_retried_once(tmp_path: Path) -> None:
+def test_transport_failure_reported_without_second_dispatch(tmp_path: Path) -> None:
+    # Повтор обрыва делает демон; второй dispatch ушёл бы к исполнителю на остывании.
     views = [
         _view("failed", error="Upstream websocket closed before response.completed"),
         _view("completed", "MINOR x.py:1 ok"),
     ]
     out, calls = _run(tmp_path, views)
-    assert out.returncode == 0 and out.stdout.strip() == "MINOR x.py:1 ok"
-    assert len(calls) == 2
+    assert out.returncode == 1
+    assert "websocket" in out.stderr
+    assert len(calls) == 1
 
 
 def test_other_failure_not_retried_and_exit_nonzero(tmp_path: Path) -> None:

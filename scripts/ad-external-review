@@ -8,7 +8,8 @@ CRITICAL / MAJOR / MINOR или «NO ISSUES FOUND», рабочая копия �
 
 omp внутри песочницы Claude Code не стартует (пишет в ~/.omp/agent/agent.db), поэтому
 ревьюера запускает демон: `kind: review` (только чтение, in_place), без эскалации, чтобы
-ревью не ушло к claude/opus. Один повтор при обрыве транспорта до ответа.
+ревью не ушло к claude/opus. Своего повтора нет: обрыв до ответа демон повторяет сам
+(`execution.transport_retry_*`), а второй dispatch упёрся бы в остывание исполнителя.
 
 Переменные: AD_REVIEW_EXECUTOR (по умолчанию omp/sol), AD_REVIEW_WAIT (секунды, 1500),
 AD_DISPATCH (команда CLI, по умолчанию agent-dispatch; подменяется в тестах).
@@ -18,7 +19,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
 
@@ -28,9 +28,6 @@ FORMAT_RULE = (
     "findings into the `summary` field of your result block, one finding per line, each line "
     "starting with exactly one of CRITICAL, MAJOR or MINOR, followed by file:line and the fix. "
     "If there are no findings, `summary` must be exactly: NO ISSUES FOUND. Do not modify files."
-)
-TRANSPORT = re.compile(
-    r"websocket|connection (reset|closed)|stream_incomplete|transport error", re.I
 )
 
 
@@ -76,9 +73,6 @@ def main() -> int:
     prompt = sys.argv[-1]
     view = run_once(prompt)
     result = view.get("result") or {}
-    if view.get("status") == "failed" and TRANSPORT.search(result.get("error") or ""):
-        view = run_once(prompt)
-        result = view.get("result") or {}
     if view.get("status") not in ("completed", "partial") or not result.get("summary"):
         error = result.get("error") or view.get("status") or "no result"
         print(f"ad-external-review: reviewer failed: {error}", file=sys.stderr)

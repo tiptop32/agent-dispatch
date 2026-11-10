@@ -15,6 +15,7 @@ class OmpWatchdog:
         self.last_activity_at = time.monotonic()
         self.open_tools: dict[str, tuple[object, object]] = {}
         self.last_digest: bytes | None = None
+        self.last_call: str | None = None
         self.repeats = 0
 
     def on_line(self, line: str) -> None:
@@ -38,7 +39,13 @@ class OmpWatchdog:
         if not isinstance(call_id, str):
             return
         if kind == "tool_execution_start":
-            self.open_tools[call_id] = (event.get("toolName"), event.get("args"))
+            call = (event.get("toolName"), event.get("args"))
+            self.open_tools[call_id] = call
+            # Другой вызов (инструмент или аргументы) — выход из петли уже начался: серия
+            # обнуляется сразу, а не только когда этот вызов закончится.
+            if _canonical(call) != self.last_call:
+                self.repeats = 0
+                self.last_digest = None
         elif kind == "tool_execution_end":
             call = self.open_tools.pop(call_id, None)
             if call is None:
@@ -53,6 +60,7 @@ class OmpWatchdog:
             digest = hashlib.sha256(payload.encode()).digest()
             self.repeats = self.repeats + 1 if digest == self.last_digest else 1
             self.last_digest = digest
+            self.last_call = _canonical(call)
 
     def check(self) -> dict | None:
         tool_open = bool(self.open_tools)
@@ -63,3 +71,7 @@ class OmpWatchdog:
         if limit and limit > 0 and idle >= limit:
             return {"reason": "idle", "idle_s": round(idle, 1), "tool_open": tool_open}
         return None
+
+
+def _canonical(call: tuple[object, object]) -> str:
+    return json.dumps(list(call), sort_keys=True, ensure_ascii=False, separators=(",", ":"))

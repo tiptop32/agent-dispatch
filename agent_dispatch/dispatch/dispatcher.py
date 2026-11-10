@@ -142,6 +142,9 @@ class Dispatcher:
         # Семафор группы создаётся при первой задаче этой группы.
         self._group_semaphores: dict[str, asyncio.Semaphore] = {}
         self._executor_concurrency = ExecutorConcurrency(settings, storage)
+        # Root admission reserves the first CLI slot before global capacity;
+        # _call_adapter consumes and releases it before verification/review.
+        self._executor_reservations: dict[str, contextlib.AsyncExitStack] = {}
         # Ёмкость ревью отдельная: долгая корневая задача не должна оставлять
         # ревью без слота, и лишние ревью не должны вытеснять задачи. Максимум
         # корневых CLI-процессов демона из-за этого равен сумме двух пределов.
@@ -755,7 +758,6 @@ class Dispatcher:
             and (item := self.settings.executors[name]).tier == selected.tier
             and (not corporate_only or item.corporate)
             and (not reasoning_only or item.adapter == JUDGMENT_ADAPTER)
-            and self.settings.limit_group(name) != self.settings.limit_group(decision.executor)
         ]
 
     def _group_semaphore(self, executor: str) -> asyncio.Semaphore:
@@ -771,17 +773,45 @@ class Dispatcher:
             semaphore = self._group_semaphores[group] = asyncio.Semaphore(limit)
         return semaphore
 
+    async def _wait_group(
+        self, record: TaskRecord, executor: str
+    ) -> tuple[asyncio.Semaphore, contextlib.AsyncExitStack]:
+        """Reserve CLI and group together, never waiting while owning either."""
+        semaphore = self._group_semaphore(executor)
+        while True:
+            await semaphore.acquire()
+            if not self._executor_concurrency.busy(executor):
+                try:
+                    reservation = contextlib.AsyncExitStack()
+                    await reservation.enter_async_context(
+                        self._executor_concurrency.slot(record.task_id, executor, root=True)
+                    )
+                    return semaphore, reservation
+                except BaseException:
+                    semaphore.release()
+                    raise
+            semaphore.release()
+            async with contextlib.AsyncExitStack() as reservation:
+                await reservation.enter_async_context(
+                    self._executor_concurrency.slot(record.task_id, executor, root=True)
+                )
+                if not semaphore.locked():
+                    await semaphore.acquire()
+                    return semaphore, reservation.pop_all()
+            # Group capacity changed while awaiting the CLI. Release the CLI
+            # before joining the group queue again.
+
     async def _acquire_group(
         self, record: TaskRecord, decision: RouteDecision, names: list[str]
-    ) -> tuple[RouteDecision, asyncio.Semaphore]:
+    ) -> tuple[RouteDecision, asyncio.Semaphore, contextlib.AsyncExitStack]:
         preferred = self._group_semaphore(decision.executor)
         timeout = self.settings.routing.preferred_executor_max_wait_seconds
         backups = await self._queue_backups(record, decision, names) if timeout else []
-        if backups and preferred.locked():
+        if backups and (preferred.locked() or self._executor_concurrency.busy(decision.executor)):
             try:
                 async with asyncio.timeout(timeout):
-                    await preferred.acquire()
-                return decision, preferred
+                    semaphore, reservation = await self._wait_group(record, decision.executor)
+                return decision, semaphore, reservation
             except TimeoutError:
                 pass
             # locked() honours queued waiters. On the single event loop an
@@ -793,16 +823,16 @@ class Dispatcher:
                     continue
                 semaphore = self._group_semaphore(name)
                 if not semaphore.locked():
-                    await semaphore.acquire()
+                    semaphore, reservation = await self._wait_group(record, name)
                     effective = decision.model_copy(deep=True)
                     effective.executor = name
                     effective.meta["queue_fallback"] = {
                         "preferred_executor": decision.executor,
                         "reason": "preferred_group_timeout",
                     }
-                    return effective, semaphore
-        await preferred.acquire()
-        return decision, preferred
+                    return effective, semaphore, reservation
+        semaphore, reservation = await self._wait_group(record, decision.executor)
+        return decision, semaphore, reservation
 
     @contextlib.asynccontextmanager
     async def _capacity(
@@ -820,27 +850,31 @@ class Dispatcher:
 
         started = time.monotonic()
         preferred_executor = decision.executor
-        decision, semaphore = await self._acquire_group(record, decision, names)
+        decision, semaphore, reservation = await self._acquire_group(record, decision, names)
         try:
-            switched = decision.executor != preferred_executor
-            if switched:
-                record.decision = decision
-                await self.storage.update_task(record)
-            async with self._semaphore:
-                await self.storage.add_event(
-                    record.task_id,
-                    "slot",
-                    {
-                        "limit_group": self.settings.limit_group(decision.executor),
-                        "wait_seconds": round(time.monotonic() - started, 6),
-                        "preferred_executor": preferred_executor,
-                        "executor": decision.executor,
-                        "queue_fallback": switched,
-                        "switch_reason": "preferred_group_timeout" if switched else None,
-                    },
-                )
-                yield decision
+            async with reservation:
+                self._executor_reservations[record.task_id] = reservation
+                switched = decision.executor != preferred_executor
+                if switched:
+                    record.decision = decision
+                    await self.storage.update_task(record)
+                async with self._semaphore:
+                    await self.storage.add_event(
+                        record.task_id,
+                        "slot",
+                        {
+                            "limit_group": self.settings.limit_group(decision.executor),
+                            "wait_seconds": round(time.monotonic() - started, 6),
+                            "preferred_executor": preferred_executor,
+                            "executor": decision.executor,
+                            "executor_wait_seconds": round(time.monotonic() - started, 6),
+                            "queue_fallback": switched,
+                            "switch_reason": "preferred_group_timeout" if switched else None,
+                        },
+                    )
+                    yield decision
         finally:
+            self._executor_reservations.pop(record.task_id, None)
             semaphore.release()
 
     async def _run_executor(
@@ -859,13 +893,15 @@ class Dispatcher:
             await self.storage.add_event(
                 task_id, "worktree", {"path": str(tree.path), "branch": tree.branch}
             )
+        handoff, inherited_files = await self._initialize_handoff(record, tree)
         stat_snapshot = None
         if not review:
             with contextlib.suppress(OSError, subprocess.CalledProcessError):
                 stat_snapshot = await asyncio.to_thread(
-                    workspace.DiffStatSnapshot, tree.path if tree is not None else req.cwd
+                    workspace.DiffStatSnapshot,
+                    tree.path if tree is not None else req.cwd,
+                    inherited_files=inherited_files,
                 )
-        handoff, inherited_files = await self._initialize_handoff(record, tree)
         ctx = await self._build_context(record, decision, tree)
         if handoff.get("apply_failed"):
             ctx = ctx.model_copy(
@@ -1075,6 +1111,9 @@ class Dispatcher:
             verification_failed = bool(
                 result.verification and result.verification.result == "failed"
             )
+            if pending is not None and pending["trigger"] == "verification_failed":
+                pending["verdict"] = "fail" if verification_failed else "pass"
+                pending = None
             if verification_failed:
                 trigger, stage = "verification_failed", None
                 commands = result.verification.commands
@@ -1155,6 +1194,10 @@ class Dispatcher:
             files = list(dict.fromkeys([*result.changed_files, *fixed.changed_files]))
             meta = dict(result.meta)
             for key in (
+                "failure_cause",
+                "failure_class",
+                "timeout_type",
+                "error_code",
                 "timed_out",
                 "stalled",
                 "watchdog",
@@ -1417,7 +1460,9 @@ class Dispatcher:
         self, adapter: ExecutorAdapter, ctx: RunContext, decision: RouteDecision
     ) -> ExecutionResult:
         try:
-            async with self._executor_concurrency.slot(ctx.task_id, decision.executor):
+            reserved = self._executor_reservations.pop(ctx.task_id, None)
+            slot = reserved or self._executor_concurrency.slot(ctx.task_id, decision.executor)
+            async with slot:
                 if decision.executor in self.availability.unavailable():
                     return ExecutionResult(
                         status="failed",
@@ -1871,9 +1916,11 @@ class Dispatcher:
             # секреты маскируются до записи и до передачи в эскалацию.
             redact.redact_result(result)
         record.result = result
-        record.status, record.finished_at = TaskStatus(result.status), self._now()
         if plan is not None:
+            # The heir reads its predecessor through storage during startup.
+            await self.storage.update_task(record)
             await self._escalate(record, decision, result, plan)
+        record.status, record.finished_at = TaskStatus(result.status), self._now()
         await self.storage.add_event(
             record.task_id,
             "exit",

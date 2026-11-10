@@ -114,6 +114,39 @@ def test_productive_call_before_next_check_resets_loop_detection(clock):
     assert watchdog.check() is None
 
 
+def test_different_call_started_after_loop_resets_before_it_finishes(clock):
+    # Ревью 2026-11-10 (sol): шесть одинаковых вызовов, затем агент начал другой, долгий вызов.
+    # Проверка до его конца не должна убивать работу как петлю: выход из петли уже начался.
+    watchdog = OmpWatchdog(300, 900, 6)
+    for line in (FIXTURES / "looping.ndjson").read_text().splitlines():
+        watchdog.on_line(line)
+    emit(
+        watchdog,
+        "tool_execution_start",
+        toolCallId="different",
+        toolName="bash",
+        args={"command": "uv run pytest tests -q"},
+    )
+    clock[0] = 300
+    assert watchdog.check() is None
+
+
+def test_same_call_started_again_keeps_loop_evidence(clock):
+    watchdog = OmpWatchdog(300, 900, 6)
+    for line in (FIXTURES / "looping.ndjson").read_text().splitlines():
+        watchdog.on_line(line)
+    last = [json.loads(x) for x in (FIXTURES / "looping.ndjson").read_text().splitlines()]
+    start = next(e for e in reversed(last) if e.get("type") == "tool_execution_start")
+    emit(
+        watchdog,
+        "tool_execution_start",
+        toolCallId="again",
+        toolName=start["toolName"],
+        args=start["args"],
+    )
+    assert watchdog.check()["reason"] == "looping"
+
+
 def test_repeated_bash_failure_ignores_wall_clock_variation(clock):
     watchdog = OmpWatchdog(300, 900, 3)
     for call in range(3):

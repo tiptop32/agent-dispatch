@@ -171,7 +171,7 @@ def diff(before: dict[str, str], after: dict[str, str]) -> list[str]:
 class DiffStatSnapshot:
     """Measure task changes without writing caller files into its Git object store."""
 
-    def __init__(self, cwd: str | Path):
+    def __init__(self, cwd: str | Path, *, inherited_files: list[str] | None = None):
         self.temp = tempfile.TemporaryDirectory(prefix="agent-dispatch-stat-")
         self.env = git_env()
         self.root = subprocess.run(
@@ -214,6 +214,32 @@ class DiffStatSnapshot:
                 check=True,
             )
         self.before = self._tree()
+        if inherited_files:
+            # Only successfully inherited paths use HEAD as their baseline.
+            # Preserve the caller's dirty baseline everywhere else, and never
+            # modify the real index or working tree.
+            subprocess.run(
+                [
+                    "git",
+                    "reset",
+                    "-q",
+                    "HEAD",
+                    "--",
+                    *[f":(top,literal){name}" for name in inherited_files],
+                ],
+                cwd=self.root,
+                env=self.env,
+                capture_output=True,
+                check=True,
+            )
+            self.before = subprocess.run(
+                ["git", "write-tree"],
+                cwd=self.root,
+                env=self.env,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
 
     def _tree(self) -> str:
         subprocess.run(

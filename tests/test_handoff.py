@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 
@@ -268,3 +269,49 @@ async def test_conflicting_handoff_patch_rolls_back_before_child_starts(
     assert done.result.meta["handoff"]["apply_failed"]
     assert done.result.changed_files == []
     assert (git_repo / "a.py").read_text() == "x = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_heir_reads_handoff_before_parent_finalizes(tmp_path, git_repo, monkeypatch):
+    storage, adapters, dispatcher = await make_dispatcher(
+        tmp_path, results={"first": interrupted()}
+    )
+    adapters["first"].on_execute = write_file("x = 2\n")
+    real_submit = dispatcher.submit
+    real_initialize = dispatcher._initialize_handoff
+
+    initialized = asyncio.Event()
+    predecessor_states = []
+
+    async def initialize(record, tree):
+        handoff = await real_initialize(record, tree)
+        if record.escalated_from:
+            predecessor_states.append((await storage.get_task(record.escalated_from)).status)
+            initialized.set()
+        return handoff
+
+    async def submit(request, escalated_from=None):
+        child = await real_submit(request, escalated_from=escalated_from)
+        if escalated_from:
+            await asyncio.wait_for(initialized.wait(), 5)
+        return child
+
+    monkeypatch.setattr(dispatcher, "_initialize_handoff", initialize)
+    monkeypatch.setattr(dispatcher, "submit", submit)
+
+    async def finish(ctx):
+        assert (Path(ctx.cwd) / "a.py").read_text() == "x = 2\n"
+
+    adapters["second"].on_execute = finish
+    try:
+        first = await dispatcher.submit(
+            DispatchRequest(task="finish", cwd=str(git_repo), executor="first")
+        )
+        done = await dispatcher.wait(first.task_id, 10)
+        assert done.status == "completed"
+        assert done.result.meta["handoff"]["from_task"] == first.task_id
+        assert done.result.changed_files == ["a.py"]
+        assert predecessor_states == ["running"]
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
