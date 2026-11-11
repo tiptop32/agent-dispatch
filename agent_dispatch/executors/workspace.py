@@ -182,6 +182,7 @@ class DiffStatSnapshot:
             text=True,
             check=True,
         ).stdout.strip()
+        self.cwd = Path(cwd).resolve()
         objects = subprocess.run(
             ["git", "rev-parse", "--path-format=absolute", "--git-path", "objects"],
             cwd=self.root,
@@ -214,24 +215,34 @@ class DiffStatSnapshot:
                 check=True,
             )
         self.before = self._tree()
+        self.tracked: set[str] = set()
+        if inherited_files:
+            for args in (["ls-files", "-z"], ["ls-tree", "-r", "--name-only", "-z", "HEAD"]):
+                raw = subprocess.run(
+                    ["git", *args], cwd=self.root, env=self.env, capture_output=True, check=True
+                ).stdout
+                self.tracked.update(os.fsdecode(name) for name in raw.split(b"\0") if name)
         if inherited_files:
             # Only successfully inherited paths use HEAD as their baseline.
             # Preserve the caller's dirty baseline everywhere else, and never
             # modify the real index or working tree.
-            subprocess.run(
-                [
-                    "git",
-                    "reset",
-                    "-q",
-                    "HEAD",
-                    "--",
-                    *[f":(top,literal){name}" for name in inherited_files],
-                ],
-                cwd=self.root,
-                env=self.env,
-                capture_output=True,
-                check=True,
-            )
+            paths = [self._repo_path(name) for name in inherited_files]
+            paths = [name for name in paths if name in self.tracked]
+            if paths:
+                subprocess.run(
+                    [
+                        "git",
+                        "reset",
+                        "-q",
+                        "HEAD",
+                        "--",
+                        *[f":(top,literal){name}" for name in paths],
+                    ],
+                    cwd=self.root,
+                    env=self.env,
+                    capture_output=True,
+                    check=True,
+                )
             self.before = subprocess.run(
                 ["git", "write-tree"],
                 cwd=self.root,
@@ -240,6 +251,12 @@ class DiffStatSnapshot:
                 text=True,
                 check=True,
             ).stdout.strip()
+
+    def _repo_path(self, name: str) -> str:
+        # Adapter snapshots are repo-relative; reported paths may be cwd-relative.
+        if name in self.tracked or (Path(self.root) / name).exists():
+            return name
+        return os.path.relpath(self.cwd / name, self.root)
 
     def _tree(self) -> str:
         subprocess.run(
@@ -272,7 +289,7 @@ class DiffStatSnapshot:
                 self.before,
                 after,
                 "--",
-                *[f":(top,literal){name}" for name in files],
+                *[f":(top,literal){self._repo_path(name)}" for name in files],
             ],
             cwd=self.root,
             env=self.env,

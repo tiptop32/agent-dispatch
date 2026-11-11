@@ -390,6 +390,83 @@ async def test_nested_self_review_waits_for_unrelated_holder(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [2, 3])
+async def test_mutual_nested_self_reviews_fail_fast_and_unblock_roots(tmp_path, limit):
+    executors = {
+        A: ExecutorSettings(adapter="omp", model="provider/a", max_concurrent=limit),
+        B: ExecutorSettings(adapter="omp", model="other/b"),
+    }
+    repos = [directory(tmp_path, f"root-{i}") for i in range(limit)]
+    entered = asyncio.Barrier(limit)
+    children = []
+    async with lab(tmp_path, executors=executors) as (_, _, adapters, d):
+
+        async def run(ctx):
+            if ctx.read_only:
+                return
+            index = next(i for i, repo in enumerate(repos) if str(repo) == ctx.cwd)
+            await entered.wait()
+            child = await d.submit(
+                req(repos[index], executor=A, kind="review", hop=1, parent_task_id=ctx.task_id)
+            )
+            children.append(await d.wait(child.task_id, 1))
+
+        adapters[A].on_execute = run
+        roots = [await d.submit(req(repo, executor=A)) for repo in repos]
+        for root in roots:
+            assert (await d.wait(root.task_id, WAIT)).status == "completed"
+        assert len(children) == limit
+        assert all(child.status in {"completed", "failed"} for child in children)
+        failed = [child for child in children if child.status == "failed"]
+        assert failed
+        assert all("executor capacity deadlock" in child.result.error for child in failed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_kind", ["auto_review", "nested"])
+async def test_global_wait_does_not_reserve_child_executor(tmp_path, monkeypatch, child_kind):
+    executors = {
+        A: ExecutorSettings(adapter="omp", model="provider/a", max_concurrent=1, timeout_seconds=1),
+        B: ExecutorSettings(adapter="omp", model="other/b", review_by=A),
+    }
+    monkeypatch.setattr("agent_dispatch.dispatch.dispatcher.REVIEW_WAIT_GRACE_SECONDS", 0)
+    repo = directory(tmp_path, "repo")
+    children = []
+    async with lab(tmp_path, executors=executors, group_capacity=1) as (_, _, adapters, d):
+        d._semaphore = asyncio.Semaphore(1)
+
+        async def run_parent(ctx):
+            if child_kind == "nested":
+                child = await d.submit(req(repo, executor=A, hop=1, parent_task_id=ctx.task_id))
+                children.append(await d.wait(child.task_id, 1))
+            else:
+                Path(ctx.cwd, "a.py").write_text("x = 2\n")  # noqa: ASYNC240
+                adapters[B].result = ExecutionResult(
+                    status="completed",
+                    executor=B,
+                    model=None,
+                    summary="fixed",
+                    changed_files=["a.py"],
+                )
+
+        adapters[B].on_execute = run_parent
+        adapters[A].result = ExecutionResult(
+            status="completed", executor=A, model=None, summary="reviewed", verdict="pass"
+        )
+        parent = await occupy(d, adapters[B], repo)
+        queued = await d.submit(req(directory(tmp_path, "queued"), executor=A))
+        await asyncio.sleep(QUEUE_WAIT)
+        adapters[B].gate.set()
+        done = await d.wait(parent.task_id, WAIT)
+        assert done.status == "completed"
+        if child_kind == "auto_review":
+            assert done.result.meta["review"]["verdict"] == "pass"
+        else:
+            assert len(children) == 1 and children[0].status == "completed"
+        assert (await d.wait(queued.task_id, WAIT)).status == "completed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "same_group,holder_kind", [(False, "review"), (True, "review"), (False, "task")]
 )

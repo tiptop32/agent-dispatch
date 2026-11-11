@@ -136,3 +136,76 @@ async def test_handoff_diff_stat_includes_staged_inherited_lines(tmp_path, git_r
     finally:
         await dispatcher.shutdown()
         await storage.close()
+
+
+def test_inherited_missing_untracked_path_does_not_hide_diff_stat(git_repo):
+    cwd = git_repo / "nested"
+    cwd.mkdir()
+    (cwd / "inherited.py").write_text("old = 1\n")
+    subprocess.run(["git", "add", "."], cwd=git_repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "tracked baseline"], cwd=git_repo, check=True)
+    (git_repo / "a.py").write_text("caller = 1\n")
+    (cwd / "inherited.py").write_text("inherited = 2\nextra = 3\n")
+    (cwd / "new-staged.py").write_text("inherited_new = True\n")
+    subprocess.run(["git", "add", "inherited.py", "new-staged.py"], cwd=cwd, check=True)
+    index = (git_repo / ".git" / "index").read_bytes()
+    before = DiffStatSnapshot(
+        cwd, inherited_files=["inherited.py", "new-staged.py", "deleted-untracked.py"]
+    )
+    try:
+        assert before.diff_stat(["inherited.py", "new-staged.py", "deleted-untracked.py"]) == {
+            "files": 2,
+            "added": 3,
+            "removed": 1,
+        }
+        assert (git_repo / ".git" / "index").read_bytes() == index
+        assert (git_repo / "a.py").read_text() == "caller = 1\n"
+    finally:
+        before.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["snapshot", "measurement"])
+async def test_diff_stat_failure_is_visible_with_reason(tmp_path, git_repo, monkeypatch, phase):
+    from agent_dispatch.executors import workspace
+
+    _, _, dispatcher = await _make(tmp_path, review_by=None)
+
+    def broken(*args, **kwargs):
+        raise OSError("snapshot permission denied")
+
+    monkeypatch.setattr(
+        workspace if phase == "snapshot" else workspace.DiffStatSnapshot,
+        "DiffStatSnapshot" if phase == "snapshot" else "diff_stat",
+        broken,
+    )
+    try:
+        task = await dispatcher.submit(_req(git_repo, allow_escalation=False))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == "completed"
+        reason = done.result.meta["diff_stat_unavailable"]
+        assert isinstance(reason, str) and "snapshot permission denied" in reason
+    finally:
+        await dispatcher.shutdown()
+
+
+def test_only_deleted_untracked_inheritance_can_be_measured(git_repo, monkeypatch):
+    run = subprocess.run
+
+    def strict_reset(argv, **kwargs):
+        # Some Git versions reject a reset whose path is absent in index and HEAD.
+        if argv[:2] == ["git", "reset"] and ":(top,literal)deleted-untracked.py" in argv:
+            raise subprocess.CalledProcessError(1, argv, stderr=b"pathspec did not match")
+        return run(argv, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", strict_reset)
+    before = DiffStatSnapshot(git_repo, inherited_files=["deleted-untracked.py"])
+    try:
+        (git_repo / "a.py").write_text("executor = 2\n")
+        assert before.diff_stat(["a.py", "deleted-untracked.py"]) == {
+            "files": 1,
+            "added": 1,
+            "removed": 1,
+        }
+    finally:
+        before.close()

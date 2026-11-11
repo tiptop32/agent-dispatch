@@ -1,0 +1,8 @@
+# Review verdict
+Your previous review in this session omitted its verdict. Do not repeat the review, change files, or start new work. Reply only with the fenced `agent-dispatch-result` block below. Replace `pass|fail` with your verdict on the changes you already reviewed. Keep the original findings; do not report any changed files.
+
+{% if prod %}{% include "prod_data_rule.md.j2" %}
+{% endif %}
+```agent-dispatch-result
+{"status":"completed","summary":"","verdict":"pass|fail","changed_files":[],"tests":{"command":"","result":"not_run"},"needs_escalation":false}
+```

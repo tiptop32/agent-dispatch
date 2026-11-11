@@ -77,6 +77,7 @@ execution:
   verify_timeout_seconds: 600 # предел на каждую команду verify из запроса
   report_recovery_timeout_seconds: 300 # дозапрос отчёта в той же сессии, если работа есть, а блок нет; 0 выключает
   review_fix_rounds: 1 # общий бюджет правок после verify или ревью; 0 выключает
+  review_fix_timeout_seconds: 600 # ceiling per fix round; 0 inherits the task timeout
   transport_retry_attempts: 1 # только безопасный transport retry до первого ответа; 0 выключает
   transport_retry_max_seconds: 60
   transport_retry_backoff_seconds: 1.0
@@ -85,6 +86,7 @@ executors:
   claude:
     adapter: claude
     max_concurrent: null  # CLI calls only, including reviews; null leaves the executor uncapped
+    idle_timeout_seconds: null # null inherits execution.idle_timeout_seconds; 0 disables idle checking
     command: claude
     extra_args: ["--permission-mode", "acceptEdits", "--allowedTools", "Bash,Edit,Write,Read,Glob,Grep"]
     enabled: true

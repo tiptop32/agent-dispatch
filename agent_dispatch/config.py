@@ -181,6 +181,8 @@ class ExecutionSettings(_ConfigModel):
     report_recovery_timeout_seconds: int = Field(300, ge=0)
     #: Общий бюджет продолжений после провала verify или любой ступени ревью.
     review_fix_rounds: int = Field(1, ge=0)
+    #: Ceiling per repair round; 0 inherits the task timeout.
+    review_fix_timeout_seconds: int = Field(600, ge=0)
     #: Повтор только для transport ошибки до первого ответа и неизменённой
     #: рабочей копии; 0 выключает. Повтор не заменяет escalation.
     transport_retry_attempts: int = Field(1, ge=0)
@@ -213,6 +215,8 @@ class ExecutorSettings(_ConfigModel):
     #: Жёсткий таймаут задач этого исполнителя, секунды. Запрос с
     #: `timeout_seconds` сильнее, без обоих действует `routing.default_timeout_seconds`.
     timeout_seconds: int | None = Field(None, ge=1)
+    #: Quiet limit override; None inherits execution, 0 disables idle checking.
+    idle_timeout_seconds: int | None = Field(None, ge=0)
     #: Исполнитель, который демон зовёт на ревью законченной правки этого
     #: исполнителя до интеграции (`Dispatcher._review_work`). `fail` эскалирует.
     review_by: str | list[str] | None = None

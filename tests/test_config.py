@@ -480,3 +480,10 @@ def test_user_order_of_executors_wins_over_defaults(tmp_path):
     names = list(load_settings(tmp_path).executors)
     assert names.index("omp/x5-code-large") < names.index("omp/sol")
     assert "omp/terra" in names  # дефолтные, которых нет у пользователя, остаются
+
+
+def test_review_fix_timeout_loads_packaged_default_and_zero_override(tmp_config_dir):
+    settings = load_settings(tmp_config_dir)
+    assert settings.execution.review_fix_timeout_seconds == 600
+    (tmp_config_dir / "config.yaml").write_text("execution:\n  review_fix_timeout_seconds: 0\n")
+    assert load_settings(tmp_config_dir).execution.review_fix_timeout_seconds == 0

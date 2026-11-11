@@ -45,24 +45,25 @@ class ExecutorConcurrency:
         return ancestors
 
     def _would_cycle(self, ancestors: set[str], executor: str) -> bool:
-        # Edges are from each active ancestor to the current holders of the
-        # executor its descendant is waiting for. Rebuild from live leases so
-        # a finished holder cannot leave a stale dependency behind.
-        edges: dict[str, set[str]] = {}
-        for sources, target in self._waiting.values():
-            holders = {task for task, lease in self._active.items() if lease.executor == target}
-            for source in sources:
-                edges.setdefault(source, set()).update(holders)
-        pending = [task for task, lease in self._active.items() if lease.executor == executor]
-        seen: set[str] = set()
-        while pending:
-            task = pending.pop()
-            if task in ancestors:
-                return True
-            if task not in seen:
-                seen.add(task)
-                pending.extend(edges.get(task, ()))
-        return False
+        # Start with every ancestor waiting through a descendant, then prune
+        # those whose requested executor has a holder outside the blocked set.
+        # The remaining closed set cannot release a slot. Unlike a simple path
+        # search, this handles multiple holders without rejecting a wait that
+        # an unrelated, runnable holder can satisfy.
+        holders = {task for task, lease in self._active.items() if lease.executor == executor}
+        waiting = [
+            (sources, {task for task, lease in self._active.items() if lease.executor == target})
+            for sources, target in self._waiting.values()
+        ]
+        blocked = ancestors.union(*(sources for sources, _ in waiting))
+        while True:
+            remaining = set(ancestors)
+            for sources, target_holders in waiting:
+                if target_holders and target_holders <= blocked:
+                    remaining.update(sources)
+            if remaining == blocked:
+                return bool(holders) and holders <= blocked
+            blocked = remaining
 
     def _semaphore(self, executor: str) -> asyncio.Semaphore | None:
         limit = self.settings.executors[executor].max_concurrent
@@ -94,11 +95,7 @@ class ExecutorConcurrency:
             if ancestor is not None and record is not None and record.request.kind != "review":
                 inherited_from, lease = ancestor
             else:
-                holders = {task for task, held in self._active.items() if held.executor == executor}
-                ancestor_ids = {task for task, _ in ancestors}
-                if ancestor is not None and semaphore.locked() and holders <= ancestor_ids:
-                    raise RuntimeError(f"executor capacity deadlock: {executor}")
-                sources = {task for task, held in ancestors if held.executor != executor}
+                sources = {task for task, _ in ancestors}
                 if semaphore.locked() and sources:
                     if self._would_cycle(sources, executor):
                         raise RuntimeError(f"executor capacity deadlock: {executor}")

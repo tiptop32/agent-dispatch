@@ -316,3 +316,29 @@ def test_zero_repeat_limit_disables_loop_detection(clock):
     for line in (FIXTURES / "looping.ndjson").read_text().splitlines():
         watchdog.on_line(line)
     assert watchdog.check() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override,global_idle,expected",
+    [(900, 300, 900), (None, 77, 77), (0, 300, None), (900, 0, 900)],
+)
+async def test_executor_idle_override_reaches_run_context(
+    tmp_path, git_repo, override, global_idle, expected
+):
+    from tests.test_review_fix_round import make_dispatcher, request
+
+    storage, adapters, dispatcher = await make_dispatcher(
+        tmp_path, execution={"idle_timeout_seconds": global_idle}
+    )
+    dispatcher.settings.executors["worker"] = ExecutorSettings(
+        adapter="omp", model="test/worker", idle_timeout_seconds=override
+    )
+    try:
+        task = await dispatcher.submit(request(git_repo))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == "completed"
+        assert adapters["worker"].calls[0].idle_timeout_seconds == expected
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()

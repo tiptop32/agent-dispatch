@@ -360,3 +360,26 @@ def test_resumed_followup_prompt_without_prod_has_no_data_rule():
     followup = Followup(task_id="t1", executor="omp", status="completed", resumed=True)
     rendered = render_prompt(TaskPackage(request=request(), followup=followup), "omp", settings())
     assert "# Prod data rule" not in rendered
+
+
+@pytest.mark.parametrize("prod", [False, True])
+@pytest.mark.parametrize("verdict", ["pass", "fail"])
+def test_verdict_recovery_example_is_accepted_by_result_parser(prod, verdict):
+    from agent_dispatch.dispatch.task_package import render_verdict_prompt
+    from agent_dispatch.executors.process import ProcessOutcome
+    from agent_dispatch.executors.result_parser import extract_result_block, normalize
+    from agent_dispatch.schemas import validate_agent_result
+
+    prompt = render_verdict_prompt(prod=prod)
+    response = prompt.replace("pass|fail", verdict)
+    raw = extract_result_block(response)
+    assert validate_agent_result(raw) == []
+    parsed = normalize(
+        raw,
+        ProcessOutcome(exit_code=0, stdout=response, stderr="", duration_ms=1, timed_out=False),
+        [],
+        "reviewer",
+        None,
+    )
+    assert parsed.status == "completed" and parsed.verdict == verdict
+    assert ("Prod data rule" in prompt) is prod

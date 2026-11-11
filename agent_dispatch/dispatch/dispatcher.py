@@ -22,6 +22,7 @@ from agent_dispatch.dispatch.task_package import (
     render_prompt,
     render_report_prompt,
     render_review_fix_prompt,
+    render_verdict_prompt,
     rewrite_repo_prefix,
 )
 from agent_dispatch.executors import workspace, worktree
@@ -142,7 +143,7 @@ class Dispatcher:
         # Семафор группы создаётся при первой задаче этой группы.
         self._group_semaphores: dict[str, asyncio.Semaphore] = {}
         self._executor_concurrency = ExecutorConcurrency(settings, storage)
-        # Root admission reserves the first CLI slot before global capacity;
+        # Root admission reserves the first CLI slot with group/global capacity;
         # _call_adapter consumes and releases it before verification/review.
         self._executor_reservations: dict[str, contextlib.AsyncExitStack] = {}
         # Ёмкость ревью отдельная: долгая корневая задача не должна оставлять
@@ -776,10 +777,22 @@ class Dispatcher:
     async def _wait_group(
         self, record: TaskRecord, executor: str
     ) -> tuple[asyncio.Semaphore, contextlib.AsyncExitStack]:
-        """Reserve CLI and group together, never waiting while owning either."""
+        """Reserve group, global and CLI capacity without holding slots while waiting."""
         semaphore = self._group_semaphore(executor)
         while True:
             await semaphore.acquire()
+            # Unlocked acquire() does not suspend on this event loop. Check
+            # each remaining resource before taking it; never queue while
+            # holding group/global capacity or an executor lease.
+            if self._semaphore.locked():
+                semaphore.release()
+                await self._semaphore.acquire()
+                if semaphore.locked():
+                    self._semaphore.release()
+                    continue
+                await semaphore.acquire()
+            else:
+                await self._semaphore.acquire()
             if not self._executor_concurrency.busy(executor):
                 try:
                     reservation = contextlib.AsyncExitStack()
@@ -788,18 +801,21 @@ class Dispatcher:
                     )
                     return semaphore, reservation
                 except BaseException:
+                    self._semaphore.release()
                     semaphore.release()
                     raise
+            self._semaphore.release()
             semaphore.release()
             async with contextlib.AsyncExitStack() as reservation:
                 await reservation.enter_async_context(
                     self._executor_concurrency.slot(record.task_id, executor, root=True)
                 )
-                if not semaphore.locked():
+                # Keep the granted lease only if both root slots can be taken
+                # without suspension. Otherwise release it before retrying.
+                if not semaphore.locked() and not self._semaphore.locked():
                     await semaphore.acquire()
+                    await self._semaphore.acquire()
                     return semaphore, reservation.pop_all()
-            # Group capacity changed while awaiting the CLI. Release the CLI
-            # before joining the group queue again.
 
     async def _acquire_group(
         self, record: TaskRecord, decision: RouteDecision, names: list[str]
@@ -838,7 +854,7 @@ class Dispatcher:
     async def _capacity(
         self, record: TaskRecord, decision: RouteDecision, names: list[str]
     ) -> AsyncIterator[RouteDecision]:
-        """Занять группу, затем общий слот; ревью и вложенные задачи отдельно."""
+        """Reserve root capacity together; reviews and nested tasks use separate pools."""
         req = record.request
         if req.hop > 0:
             yield decision
@@ -858,23 +874,23 @@ class Dispatcher:
                 if switched:
                     record.decision = decision
                     await self.storage.update_task(record)
-                async with self._semaphore:
-                    await self.storage.add_event(
-                        record.task_id,
-                        "slot",
-                        {
-                            "limit_group": self.settings.limit_group(decision.executor),
-                            "wait_seconds": round(time.monotonic() - started, 6),
-                            "preferred_executor": preferred_executor,
-                            "executor": decision.executor,
-                            "executor_wait_seconds": round(time.monotonic() - started, 6),
-                            "queue_fallback": switched,
-                            "switch_reason": "preferred_group_timeout" if switched else None,
-                        },
-                    )
-                    yield decision
+                await self.storage.add_event(
+                    record.task_id,
+                    "slot",
+                    {
+                        "limit_group": self.settings.limit_group(decision.executor),
+                        "wait_seconds": round(time.monotonic() - started, 6),
+                        "preferred_executor": preferred_executor,
+                        "executor": decision.executor,
+                        "executor_wait_seconds": round(time.monotonic() - started, 6),
+                        "queue_fallback": switched,
+                        "switch_reason": "preferred_group_timeout" if switched else None,
+                    },
+                )
+                yield decision
         finally:
             self._executor_reservations.pop(record.task_id, None)
+            self._semaphore.release()
             semaphore.release()
 
     async def _run_executor(
@@ -895,13 +911,16 @@ class Dispatcher:
             )
         handoff, inherited_files = await self._initialize_handoff(record, tree)
         stat_snapshot = None
+        stat_failure = None
         if not review:
-            with contextlib.suppress(OSError, subprocess.CalledProcessError):
+            try:
                 stat_snapshot = await asyncio.to_thread(
                     workspace.DiffStatSnapshot,
                     tree.path if tree is not None else req.cwd,
                     inherited_files=inherited_files,
                 )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                stat_failure = f"snapshot: {type(exc).__name__}: {exc}"
         ctx = await self._build_context(record, decision, tree)
         if handoff.get("apply_failed"):
             ctx = ctx.model_copy(
@@ -993,6 +1012,7 @@ class Dispatcher:
         if not review and report_recovery.needs_report(result):
             result = await self._recover_report(record, decision, adapter, ctx, result)
         if review:
+            result = await self._recover_verdict(record, decision, adapter, ctx, result)
             await self._check_review_wrote_nothing(req, before, result)
         await self._note_executor_failure(record, decision, result)
         if not review:
@@ -1005,13 +1025,15 @@ class Dispatcher:
             if review and result.meta.get("warning")
             else await self._plan_escalation(record, decision, result)
         )
+        if stat_failure is not None:
+            result.meta["diff_stat_unavailable"] = stat_failure
         if stat_snapshot is not None:
             try:
                 result.meta["diff_stat"] = await asyncio.to_thread(
                     stat_snapshot.diff_stat, result.changed_files
                 )
-            except (OSError, subprocess.CalledProcessError):
-                result.meta["diff_stat_unavailable"] = True
+            except (OSError, subprocess.CalledProcessError) as exc:
+                result.meta["diff_stat_unavailable"] = f"measurement: {type(exc).__name__}: {exc}"
             finally:
                 stat_snapshot.close()
         if tree is not None:
@@ -1183,8 +1205,21 @@ class Dispatcher:
             prompt = render_review_fix_prompt(
                 self.settings.executors[decision.executor].adapter, feedback, prod=prod, task=task
             )
-            fix_ctx = ctx.model_copy(update={"prompt": prompt, "resume_session": session})
+            ceiling = self.settings.execution.review_fix_timeout_seconds
+            fix_ctx = ctx.model_copy(
+                update={
+                    "prompt": prompt,
+                    "resume_session": session,
+                    "timeout_seconds": min(ceiling, ctx.timeout_seconds)
+                    if ceiling
+                    else ctx.timeout_seconds,
+                }
+            )
+            started = time.monotonic()
             fixed = await self._call_adapter(adapter, fix_ctx, decision)
+            # A report-only reply cannot turn an interrupted repair into a success.
+            round_status, round_error = fixed.status, fixed.error
+            round_parse_error = fixed.meta.get("parse_error")
             await self._note_executor_failure(record, decision, fixed)
             if fixed.meta.get("parse_error") == "no result block":
                 fixed.meta.setdefault("session_id", session)
@@ -1193,6 +1228,30 @@ class Dispatcher:
             usage = fixed.usage.model_dump() if fixed.usage else None
             files = list(dict.fromkeys([*result.changed_files, *fixed.changed_files]))
             meta = dict(result.meta)
+            pending = {
+                "round": rounds,
+                "trigger": trigger,
+                "stage": stage,
+                "verdict": "unknown",
+                "usage": usage,
+                "duration_s": time.monotonic() - started,
+            }
+            meta.setdefault("fix_rounds", []).append(pending)
+            if round_status != "completed":
+                pending.update(status=round_status, error=round_error, verdict="fail")
+                if round_parse_error is not None:
+                    pending["parse_error"] = round_parse_error
+                if "report_recovery" in fixed.meta:
+                    pending["report_recovery"] = fixed.meta["report_recovery"]
+                result = result.model_copy(
+                    update={
+                        "status": "partial",
+                        "changed_files": files,
+                        "usage": report_recovery._usage(result.usage, fixed.usage),
+                        "meta": meta,
+                    }
+                )
+                break
             for key in (
                 "failure_cause",
                 "failure_class",
@@ -1212,28 +1271,16 @@ class Dispatcher:
                 "escalation_suppressed",
             ):
                 meta.pop(key, None)
-            if fixed.status == "completed":
-                meta.pop("review", None)
+            meta.pop("review", None)
             meta.update(fixed.meta)
-            pending = {
-                "round": rounds,
-                "trigger": trigger,
-                "stage": stage,
-                "verdict": "unknown",
-                "usage": usage,
-            }
-            meta.setdefault("fix_rounds", []).append(pending)
             result = fixed.model_copy(
                 update={
                     "changed_files": files,
                     "usage": report_recovery._usage(result.usage, fixed.usage),
-                    "verification": None if fixed.status == "completed" else result.verification,
+                    "verification": None,
                     "meta": meta,
                 }
             )
-            if result.status != "completed":
-                pending["verdict"] = "fail"
-                break
             if req.verify:
                 await self._verify(record, result, tree)
         return result
@@ -1318,6 +1365,7 @@ class Dispatcher:
         )
         request._automatic_review = True
         timeout = self.settings.timeout_for(reviewer)
+        recovery_timeout = min(timeout, self.settings.execution.report_recovery_timeout_seconds)
         # `submit` создаёт воркер ревью до своего конца (событие `git` пишется
         # после): отмена посреди него оставила бы ревьюера без хозяина. Поэтому
         # `submit` идёт отдельной задачей под shield, и отмена на любом шаге до
@@ -1336,7 +1384,9 @@ class Dispatcher:
             await self.storage.add_event(
                 task_id, "review_by", {"child": child.task_id, "by": reviewer}
             )
-            done = await self.wait(child.task_id, timeout + REVIEW_WAIT_GRACE_SECONDS)
+            done = await self.wait(
+                child.task_id, timeout + recovery_timeout + REVIEW_WAIT_GRACE_SECONDS
+            )
         except asyncio.CancelledError:
             await self._abandon_review(submitting)
             raise
@@ -1364,6 +1414,9 @@ class Dispatcher:
             verdict,
             summary=outcome.summary if outcome is not None and reason is None else "",
             reason=reason,
+        )
+        result.meta["review"]["verdict_recovered"] = bool(
+            outcome and outcome.meta.get("verdict_recovered")
         )
         if outcome is not None and outcome.meta.get("warning"):
             # Ревьюер тронул файлы: вызывающий должен узнать об этом из итога.
@@ -1417,10 +1470,55 @@ class Dispatcher:
             "task_id": child,
             "verdict": verdict,
             "summary": summary[:REVIEW_SUMMARY_LIMIT],
+            "verdict_recovered": False,
         }
         if reason is not None:
             review["reason"] = reason[:500]
         result.meta["review"] = review
+
+    async def _recover_verdict(
+        self,
+        record: TaskRecord,
+        decision: RouteDecision,
+        adapter: ExecutorAdapter,
+        ctx: RunContext,
+        result: ExecutionResult,
+    ) -> ExecutionResult:
+        """Ask a reviewer once, before its parent consumes the stage verdict."""
+        result.meta["verdict_recovered"] = False
+        timeout = self.settings.execution.report_recovery_timeout_seconds
+        session = result.meta.get("session_id")
+        if (
+            result.verdict is not None
+            or result.status not in ("completed", "partial")
+            or result.error
+            or not isinstance(session, str)
+            or not session
+            or not timeout
+        ):
+            return result
+        prod = record.request.prod or decision.meta.get("perimeter") == "prod"
+        verdict_ctx = ctx.model_copy(
+            update={
+                "prompt": render_verdict_prompt(prod=prod),
+                "resume_session": session,
+                "timeout_seconds": min(timeout, ctx.timeout_seconds),
+            }
+        )
+        recovered = await self._call_adapter(adapter, verdict_ctx, decision)
+        await self._note_executor_failure(record, decision, recovered)
+        result.usage = report_recovery._usage(result.usage, recovered.usage)
+        if (
+            recovered.status in ("completed", "partial")
+            and not recovered.error
+            and recovered.verdict
+        ):
+            result.verdict = recovered.verdict
+            result.meta["verdict_recovered"] = True
+        await self.storage.add_event(
+            record.task_id, "verdict_recovery", {"recovered": result.meta["verdict_recovered"]}
+        )
+        return result
 
     async def _recover_report(
         self,
@@ -1553,10 +1651,13 @@ class Dispatcher:
             self.settings.executors[decision.executor].adapter,
             self.settings,
         )
+        idle = self.settings.executors[decision.executor].idle_timeout_seconds
+        if idle is None:
+            idle = self.settings.execution.idle_timeout_seconds
         return RunContext(
             cwd=str(tree.path) if tree else req.cwd,
             timeout_seconds=timeout,
-            idle_timeout_seconds=self.settings.execution.idle_timeout_seconds or None,
+            idle_timeout_seconds=idle or None,
             watchdog_interval_seconds=self.settings.execution.watchdog_interval_seconds,
             watchdog_tool_idle_seconds=self.settings.execution.watchdog_tool_idle_seconds,
             watchdog_repeat_limit=self.settings.execution.watchdog_repeat_limit,

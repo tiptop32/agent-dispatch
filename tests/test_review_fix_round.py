@@ -112,15 +112,11 @@ async def test_failed_review_resumes_and_merges_the_fix(tmp_path, git_repo, work
     assert done.result.usage.cost_usd == pytest.approx(0.3)
     assert done.result.verification.result == "passed"
     assert done.result.meta["review"]["verdict"] == "pass"
-    assert done.result.meta["fix_rounds"] == [
-        {
-            "round": 1,
-            "trigger": "review_failed",
-            "stage": "first",
-            "verdict": "pass",
-            "usage": {"input_tokens": None, "output_tokens": None, "cost_usd": 0.2},
-        }
-    ]
+    [repair] = done.result.meta["fix_rounds"]
+    assert repair["trigger"] == "review_failed"
+    assert repair["stage"] == "first" and repair["round"] == 1
+    assert repair["verdict"] == "pass"
+    assert repair["usage"]["cost_usd"] == 0.2
     assert len(adapters["first"].calls) == 2
     assert not adapters["senior"].calls
     assert (git_repo / "a.py").read_text() == "x = 2\n"
@@ -223,7 +219,7 @@ async def test_parent_cancellation_interrupts_fix_and_prod_rule_is_present(tmp_p
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("report_succeeds", [False, True])
-async def test_repair_missing_report_recovers_or_keeps_review_blocker(
+async def test_repair_missing_report_preserves_blocker_even_after_report_recovery(
     tmp_path, git_repo, report_succeeds
 ):
     storage, adapters, dispatcher = await make_dispatcher(tmp_path)
@@ -249,9 +245,13 @@ async def test_repair_missing_report_recovers_or_keeps_review_blocker(
     done = await dispatcher.wait(task.task_id, 10)
     assert len(adapters["worker"].calls) == 3
     assert "fixed.py" in done.result.changed_files
-    assert done.result.meta["review"]["verdict"] == ("pass" if report_succeeds else "fail")
-    assert len(adapters["first"].calls) == (2 if report_succeeds else 1)
-    assert done.status == (TaskStatus.completed if report_succeeds else TaskStatus.partial)
+    assert done.result.meta["review"]["verdict"] == "fail"
+    assert len(adapters["first"].calls) == 1
+    assert done.status == TaskStatus.partial
+    assert done.result.meta["fix_rounds"][0]["verdict"] == "fail"
+    assert done.result.meta["fix_rounds"][0]["report_recovery"] == (
+        "recovered" if report_succeeds else "failed: report unavailable"
+    )
     await storage.close()
 
 
@@ -330,6 +330,109 @@ async def test_verification_fix_verdict_is_not_overwritten_by_review(tmp_path, g
         measured = fix_round(load(tmp_path / "db.sqlite"))
         assert measured["recovered"] == int(repaired)
         assert measured["failed"] == int(not repaired)
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ceiling,task_timeout,expected",
+    [(None, 1800, 600), (45, 1800, 45), (600, 30, 30), (0, 1800, 1800)],
+)
+async def test_fix_round_timeout_and_elapsed_duration(
+    tmp_path, git_repo, monkeypatch, ceiling, task_timeout, expected
+):
+    from types import SimpleNamespace
+
+    from agent_dispatch.dispatch import dispatcher as module
+
+    execution = {} if ceiling is None else {"review_fix_timeout_seconds": ceiling}
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path, execution=execution)
+    now = [100.0]
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    adapters["first"].result = result("first", changed_files=[], verdict="fail")
+
+    async def fix(ctx):
+        if len(adapters["worker"].calls) == 2:
+            now[0] += 12.5
+            adapters["first"].result = result("first", changed_files=[], verdict="pass")
+
+    adapters["worker"].on_execute = fix
+    try:
+        task = await dispatcher.submit(request(git_repo, timeout_seconds=task_timeout))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == TaskStatus.completed
+        assert adapters["worker"].calls[1].timeout_seconds == expected
+        assert done.result.meta["fix_rounds"][0]["duration_s"] == 12.5
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger", ["review_failed", "verification_failed"])
+@pytest.mark.parametrize("failure", ["unavailable", "resume", "missing_report"])
+async def test_fix_failure_preserves_work_and_escalation_reason(
+    tmp_path, git_repo, trigger, failure
+):
+    from evals.replay.harness import fix_round, load, post_review
+
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path)
+    adapters["first"].result = result(
+        "first", changed_files=[], verdict="fail", summary="original finding"
+    )
+    error = {
+        "unavailable": "executor became unavailable while waiting for a slot: worker",
+        "resume": "failed --resume: session not found",
+        "missing_report": None,
+    }[failure]
+    status = "partial" if failure == "missing_report" else "failed"
+
+    async def fix(ctx):
+        count = len(adapters["worker"].calls)
+        if count == 2:
+            (Path(ctx.cwd) / "fixed.py").write_text("attempted = True\n")
+            adapters["worker"].result = result(
+                status=status,
+                error=error,
+                changed_files=["fixed.py"],
+                usage=Usage(cost_usd=0.2),
+                meta={"session_id": "work-session", "parse_error": "no result block"},
+            )
+        elif count == 3:
+            adapters["worker"].result = result(
+                changed_files=[], usage=Usage(cost_usd=0.03), summary="report recovered"
+            )
+
+    adapters["worker"].on_execute = fix
+    try:
+        task = await dispatcher.submit(
+            request(git_repo, verify=["false"] if trigger == "verification_failed" else [])
+        )
+        done = await dispatcher.wait(task.task_id, 10)
+        original = await storage.get_task(task.task_id)
+        assert done.decision.executor == "senior"
+        assert original.result.status == "partial"
+        assert original.result.summary == "done"
+        assert original.result.changed_files == ["a.py", "fixed.py"]
+        assert original.result.usage.cost_usd == pytest.approx(
+            0.33 if failure == "missing_report" else 0.3
+        )
+        row = original.result.meta["fix_rounds"][0]
+        assert row["verdict"] == "fail"
+        assert row["status"] == status
+        assert row["error"] == error
+        assert row["parse_error"] == "no result block"
+        events = await storage.list_events(task.task_id)
+        assert any(e["kind"] == "escalate" and e["payload"]["reason"] == trigger for e in events)
+        assert len(adapters["first"].calls) == int(trigger == "review_failed")
+        measured = fix_round(load(tmp_path / "db.sqlite"))
+        assert measured["failed"] == 1 and measured["recovered"] == 0
+        if trigger == "review_failed":
+            review = post_review(load(tmp_path / "db.sqlite"))
+            assert review["verdicts"]["fail"] == 1
+            assert review["review_failed"]["escalated"] == 1
     finally:
         await dispatcher.shutdown()
         await storage.close()

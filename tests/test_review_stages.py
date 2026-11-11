@@ -182,3 +182,118 @@ async def test_review_stage_config_rejects_invalid_members(tmp_path, field, valu
     with pytest.raises(ValidationError, match=message):
         Settings.model_validate(data)
     await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovered", ["pass", "fail", None, "unavailable"])
+@pytest.mark.parametrize("rounds", [0, 1])
+async def test_missing_verdict_recovers_before_stage_decision(
+    tmp_path, git_repo, recovered, rounds
+):
+    from agent_dispatch.models import Usage
+
+    storage, adapters, dispatcher = await make_dispatcher(
+        tmp_path,
+        rounds=rounds,
+        reviewers=["first", "second"],
+        corporate=True,
+        execution={"report_recovery_timeout_seconds": 17},
+    )
+    adapters["first"].result = result(
+        "first",
+        verdict=None,
+        changed_files=[],
+        summary="original finding",
+        usage=Usage(cost_usd=0.1),
+        meta={"session_id": "review-session"},
+    )
+
+    async def review(ctx):
+        count = len(adapters["first"].calls)
+        if count == 2:
+            adapters["first"].result = result(
+                "first",
+                verdict=None if recovered == "unavailable" else recovered,
+                status="failed" if recovered == "unavailable" else "completed",
+                error="review unavailable" if recovered == "unavailable" else None,
+                changed_files=["claimed-only.py"],
+                summary="verdict-only answer",
+                usage=Usage(cost_usd=0.02),
+            )
+        elif count == 3:
+            adapters["first"].result = result("first", changed_files=[], verdict="pass")
+
+    adapters["first"].on_execute = review
+    try:
+        task = await dispatcher.submit(request(git_repo, prod=True, allow_escalation=not rounds))
+        done = await dispatcher.wait(task.task_id, 10)
+        original = await storage.get_task(task.task_id)
+        stages = original.result.meta["review_stages"]
+        first = stages[0]
+        assert first["verdict"] == (recovered if recovered in ("pass", "fail") else "unknown")
+        assert first["verdict_recovered"] is (recovered in ("pass", "fail"))
+        assert first["summary"] == "original finding"
+        assert len(adapters["first"].calls) == (3 if recovered == "fail" and rounds else 2)
+        recovery = adapters["first"].calls[1]
+        initial = adapters["first"].calls[0]
+        assert recovery.resume_session == "review-session"
+        assert recovery.task_id == initial.task_id and recovery.cwd == initial.cwd
+        assert recovery.read_only and recovery.timeout_seconds == 17
+        assert "verdict" in recovery.prompt and "Prod data rule" in recovery.prompt
+        child = await storage.get_task(first["task_id"])
+        assert child.result.usage.cost_usd == pytest.approx(0.12)
+        assert child.result.changed_files == []
+        assert "warning" not in child.result.meta and "warning" not in first
+        assert "claimed-only.py" not in original.result.changed_files
+        if recovered == "fail":
+            if rounds:
+                assert original.result.meta["fix_rounds"][0]["trigger"] == "review_failed"
+                assert original.status == TaskStatus.completed
+                assert len(adapters["worker"].calls) == 2
+                assert "original finding" in adapters["worker"].calls[1].prompt
+            else:
+                assert original.status == TaskStatus.partial
+                assert original.result.error == "review failed (first)"
+                assert done.decision.executor == "senior"
+                assert not adapters["second"].calls
+        else:
+            assert done.status == TaskStatus.completed
+            assert len(adapters["worker"].calls) == 1
+            assert len(adapters["second"].calls) == 1
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_includes_verdict_recovery_budget(tmp_path, git_repo, monkeypatch):
+    import asyncio
+
+    from agent_dispatch.dispatch import dispatcher as module
+
+    storage, adapters, dispatcher = await make_dispatcher(
+        tmp_path, rounds=0, execution={"report_recovery_timeout_seconds": 1}
+    )
+    dispatcher.settings.executors["first"].timeout_seconds = 1
+    monkeypatch.setattr(module, "REVIEW_WAIT_GRACE_SECONDS", 0)
+
+    async def review(ctx):
+        await asyncio.sleep(0.7)
+        recovered = len(adapters["first"].calls) == 2
+        adapters["first"].result = result(
+            "first",
+            changed_files=[],
+            verdict="pass" if recovered else None,
+            meta={"session_id": "review-session"},
+        )
+
+    adapters["first"].on_execute = review
+    try:
+        task = await dispatcher.submit(request(git_repo))
+        done = await dispatcher.wait(task.task_id, 10)
+        [stage] = done.result.meta["review_stages"]
+        assert stage["verdict"] == "pass" and stage["verdict_recovered"]
+        assert not adapters["first"].cancelled
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()

@@ -169,6 +169,10 @@ def render_report_prompt(adapter_kind: AdapterKind) -> str:
     )
 
 
+def render_verdict_prompt(*, prod: bool) -> str:
+    return _templates().get_template("verdict_only.md.j2").render(prod=prod)
+
+
 def render_review_fix_prompt(
     adapter_kind: AdapterKind, feedback: str, *, prod: bool, task: str
 ) -> str:
