@@ -1347,6 +1347,14 @@ class Dispatcher:
                 f" Review the changes in these files: {', '.join(result.changed_files)}; "
                 "other uncommitted changes in the working copy are not part of this review."
             )
+        if req.files or req.constraints:
+            scope += (
+                " Findings whose fixes require changes outside the allowed files (when a file "
+                "list is provided) or violate the original task's constraints must be listed "
+                "in a separate 'follow-up для вызывающего' block; they must not by themselves "
+                "cause verdict: fail. Keep these follow-ups in your review summary so the "
+                "caller can act on them."
+            )
         request = DispatchRequest(
             task=(
                 f"{task}\n\nThe change to review was made by another executor "
@@ -1355,6 +1363,8 @@ class Dispatcher:
             ),
             cwd=cwd,
             kind="review",
+            files=req.files,
+            constraints=req.constraints,
             executor=reviewer,
             parent_task_id=task_id,
             hop=record.hop + 1,

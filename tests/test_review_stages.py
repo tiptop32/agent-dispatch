@@ -10,6 +10,47 @@ from tests.test_review_fix_round import make_dispatcher, request, result
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("corporate", [False, True])
+@pytest.mark.parametrize(
+    "files,constraints",
+    [([], []), (["a.py"], []), ([], ["Править только a.py"]), (["a.py"], ["Править только a.py"])],
+)
+async def test_automatic_review_preserves_original_scope(
+    tmp_path, git_repo, corporate, files, constraints
+):
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path, corporate=corporate)
+    follow_up = "follow-up для вызывающего: tests/ui/README.md устарел"
+    adapters["first"].result = result("first", changed_files=[], verdict="pass", summary=follow_up)
+    original = request(git_repo, files=files, constraints=constraints, prod=corporate)
+    try:
+        task = await dispatcher.submit(original)
+        done = await dispatcher.wait(task.task_id, 10)
+        review = done.result.meta["review"]
+        child = await storage.get_task(review["task_id"])
+        assert child.request.files == files
+        assert child.request.constraints == constraints
+        [ctx] = adapters["first"].calls
+        for item in files + constraints:
+            assert item in ctx.prompt
+        if files or constraints:
+            assert "outside the allowed files" in child.request.task
+            assert "violate the original task's constraints" in child.request.task
+            assert "follow-up для вызывающего" in child.request.task
+            assert "must not by themselves cause verdict: fail" in child.request.task
+            assert "Keep these follow-ups in your review summary" in child.request.task
+        else:
+            assert "follow-up для вызывающего" not in child.request.task
+        assert child.result.summary == follow_up
+        assert review["summary"] == follow_up
+        assert done.result.meta["review_stages"][0]["summary"] == follow_up
+        assert done.status == TaskStatus.completed
+        assert len(adapters["worker"].calls) == 1
+        assert not adapters["senior"].calls
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failed_stage", [None, "first", "second"])
 async def test_stages_retry_only_the_failed_stage(tmp_path, git_repo, failed_stage):
     storage, adapters, dispatcher = await make_dispatcher(tmp_path, reviewers=["first", "second"])

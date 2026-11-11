@@ -191,14 +191,24 @@ async def test_compact_output_keeps_max_children_advice(tmp_path):
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_dispatch_truncates_long_summary(tmp_path):
-    summary = "x" * 801
-    respx.post("http://127.0.0.1:7433/tasks").mock(
-        return_value=httpx.Response(200, json=view(summary=summary).model_dump(mode="json"))
-    )
-    r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
-    assert f"summary: {'x' * 800} …" in r.content[0].text
-    assert "x" * 801 not in r.content[0].text
+@pytest.mark.parametrize("tool", ["dispatch", "status"])
+@pytest.mark.parametrize(
+    "kind,size,limit",
+    [("task", 801, 800), ("review", 801, 8000), ("review", 8000, 8000), ("review", 8001, 8000)],
+)
+async def test_compact_summary_limit_depends_on_task_kind(tmp_path, tool, kind, size, limit):
+    summary = "x" * size
+    completed = view(summary=summary)
+    completed.request.kind = kind
+    payload = completed.model_dump(mode="json")
+    respx.post("http://127.0.0.1:7433/tasks").mock(return_value=httpx.Response(200, json=payload))
+    respx.get("http://127.0.0.1:7433/tasks/t1").mock(return_value=httpx.Response(200, json=payload))
+    args = {"task": "review", "cwd": ".", "kind": kind} if tool == "dispatch" else {"task_id": "t1"}
+    response = await call(settings(tmp_path), tool, args)
+    text = response.content[0].text
+    expected = summary if size <= limit else summary[:limit] + " …"
+    assert text.split("summary: ", 1)[1] == expected
+    assert "log_tail" not in text
 
 
 @pytest.mark.asyncio
@@ -487,6 +497,27 @@ async def test_compact_output_shows_the_review(tmp_path, review, line):
     r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
     lines = r.content[0].text.splitlines()
     assert line in lines
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compact_output_keeps_follow_ups_of_a_passed_review(tmp_path):
+    """Ревью прошло, но нашло правки вне разрешённых файлов: вызывающий обязан их увидеть."""
+    reviewed = view()
+    reviewed.result.meta["review"] = {
+        "by": "omp/x5-large",
+        "verdict": "pass",
+        "summary": (
+            "Работа по плану.\nfollow-up для вызывающего: tests/ui/README.md:24 описывает FileLock"
+        ),
+    }
+    respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(200, json=reviewed.model_dump(mode="json"))
+    )
+    r = await call(settings(tmp_path), "dispatch", {"task": "fix", "cwd": "."})
+    text = r.content[0].text
+    assert "review: pass by omp/x5-large — Работа по плану." in text
+    assert "follow-up для вызывающего: tests/ui/README.md:24 описывает FileLock" in text
 
 
 @pytest.mark.asyncio

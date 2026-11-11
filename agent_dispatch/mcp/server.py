@@ -171,13 +171,16 @@ def _verification_line(info: VerificationInfo) -> str:
 
 
 def _review_line(review: dict) -> str:
-    """Итог ревью `review_by` одной строкой: у `fail` первая строка замечаний,
-    у `skipped` причина. Полный текст ревью лежит в задаче-потомке."""
+    """Итог ревью `review_by`: у `fail` замечания, у `skipped` причина, у `pass` — follow-up
+    вне разрешённых файлов, если они есть. Полный текст ревью лежит в задаче-потомке."""
     text = f"review: {review.get('verdict')} by {review.get('by')}"
     if review.get("verdict") == "fail":
         detail = (review.get("summary") or "").strip()
     elif review.get("verdict") == "skipped":
         detail = review.get("reason") or ""
+    elif "follow-up" in (review.get("summary") or "").lower():
+        # Правки вне разрешённых файлов не валят ревью, но вызывающий обязан их увидеть.
+        detail = review["summary"].strip()
     else:
         detail = ""
     return f"{text} — {detail[:1500]}" if detail else text
@@ -240,8 +243,9 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
                 continue  # тот же код, что и в failure_class
             lines.append(f"{key}: {value}")
         if summary:
-            if len(summary) > 800:
-                summary = summary[:800] + " …"
+            limit = 8000 if view.request.kind == "review" else 800
+            if len(summary) > limit:
+                summary = summary[:limit] + " …"
             lines.append(f"summary: {summary}")
 
     show_log = view.status in {
