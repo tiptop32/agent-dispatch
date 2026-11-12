@@ -1,9 +1,11 @@
 import hashlib
 import os
+import selectors
 import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 #: Отметки снимка для путей, чьё состояние не сводится к содержимому файла.
@@ -50,7 +52,7 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _path_state(root: Path, name: str) -> str:
+def _path_state(root: Path, name: str, *, metadata_only: bool = False) -> str:
     """Отпечаток пути: режим и содержимое; для особых случаев — стабильная метка."""
     path = root / name
     try:
@@ -61,9 +63,10 @@ def _path_state(root: Path, name: str) -> str:
             return digest.hexdigest()
         info = path.lstat()
         if stat.S_ISDIR(info.st_mode):
-            # Подмодуль или вложенная репа: снаружи содержимое не читается,
-            # отпечатком служит сам факт каталога.
+            # Nested repositories are represented by the directory, not read recursively.
             return DIRECTORY
+        if metadata_only:
+            return f"stat:{info.st_mode}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}"
         digest = hashlib.sha256()
         digest.update(f"mode:{stat.S_IMODE(info.st_mode):o}\0".encode("ascii"))
         digest.update(bytes.fromhex(_hash_file(path)))
@@ -74,7 +77,46 @@ def _path_state(root: Path, name: str) -> str:
         return UNREADABLE
 
 
-def snapshot(cwd: str | Path) -> dict[str, str]:
+def bounded_git_output(
+    cwd: str | Path, args: list[str], *, limit: int, timeout: float = 2
+) -> tuple[bytes, bool]:
+    """Read at most limit+1 Git bytes, with a deadline and unconditional child cleanup."""
+    with (
+        subprocess.Popen(
+            ["git", "--no-pager", *args],
+            cwd=cwd,
+            env=git_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        ) as process,
+        selectors.DefaultSelector() as ready,
+    ):
+        data = bytearray()
+        ready.register(process.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + timeout
+        try:
+            while len(data) <= limit:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not ready.select(remaining):
+                    raise subprocess.TimeoutExpired(process.args, timeout)
+                chunk = os.read(process.stdout.fileno(), min(4096, limit + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+            if len(data) > limit:
+                process.kill()
+            process.stdout.close()
+            code = process.wait(timeout=timeout)
+            if code != 0 and len(data) <= limit:
+                raise subprocess.CalledProcessError(code, process.args)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=timeout)
+    return bytes(data[:limit]), len(data) > limit
+
+
+def snapshot(cwd: str | Path, *, metadata_only: bool = False) -> dict[str, str]:
     """Return dirty paths from git status mapped to their state fingerprints.
 
     The fingerprint covers the file bytes plus the file mode, so re-editing or
@@ -82,14 +124,23 @@ def snapshot(cwd: str | Path) -> dict[str, str]:
     not only new paths. Symlinks hash their target, directories (submodules,
     nested repos) map to a stable marker, a deleted path to ``<deleted>`` and
     an unreadable one to ``<unreadable>`` instead of raising.
+    With metadata_only, files use size/mode/mtime/ctime instead of reading bytes;
+    semantic supervision uses this bounded-read mode, not content attribution.
     """
-    result = subprocess.run(
-        ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
-        cwd=cwd,
-        env=git_env(),
-        capture_output=True,
-        check=True,
-    )
+    if metadata_only:
+        status, truncated = bounded_git_output(
+            cwd, ["status", "--porcelain", "-z", "--untracked-files=all"], limit=262144
+        )
+        if truncated:
+            raise ValueError("workspace status exceeds supervisor snapshot bound")
+    else:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+            cwd=cwd,
+            env=git_env(),
+            capture_output=True,
+            check=True,
+        ).stdout
     states: dict[str, str] = {}
     # Пути porcelain считаются от корня репозитория, а не от cwd: при cwd в
     # подкаталоге хеш от cwd давал бы `<deleted>` в обоих снимках.
@@ -101,9 +152,10 @@ def snapshot(cwd: str | Path) -> dict[str, str]:
             capture_output=True,
             check=True,
             text=True,
+            timeout=2 if metadata_only else None,
         ).stdout.strip()
     )
-    entries = result.stdout.split(b"\0")
+    entries = status.split(b"\0")
     index = 0
     while index < len(entries) - 1:
         entry = entries[index]
@@ -112,7 +164,7 @@ def snapshot(cwd: str | Path) -> dict[str, str]:
             continue
         status = entry[:2].decode("ascii")
         name = os.fsdecode(entry[3:])
-        states[name] = _path_state(root, name)
+        states[name] = _path_state(root, name, metadata_only=metadata_only)
         if "R" in status or "C" in status:
             index += 1
     return states

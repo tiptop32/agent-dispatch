@@ -74,6 +74,14 @@ execution:
   watchdog_interval_seconds: 300 # период проверки прогресса потока
   watchdog_tool_idle_seconds: 900 # молчание при открытом инструменте
   watchdog_repeat_limit: 6        # одинаковых завершённых вызовов подряд; 0 отключает
+  supervision:
+    enabled: true             # семантический надзор демона, отдельно от сторожа omp
+    command: omp
+    model: agent-lb/gpt-6.1-sol
+    profile: te-sidecall       # изолированный профиль omp без MCP, с models.yml
+    interval_seconds: 300     # первый вызов только после 5 минут работы CLI
+    timeout_seconds: 60       # сбой проверки останавливает исполнителя, без fallback
+    evidence_max_bytes: 16384 # новые байты лога; полная история не передаётся
   verify_timeout_seconds: 600 # предел на каждую команду verify из запроса
   report_recovery_timeout_seconds: 300 # дозапрос отчёта в той же сессии, если работа есть, а блок нет; 0 выключает
   review_fix_rounds: 1 # общий бюджет правок после verify или ревью; 0 выключает

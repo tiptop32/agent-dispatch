@@ -174,6 +174,14 @@ def _print_task(view: TaskView, as_json: bool) -> None:
     typer.echo(f"changed_files: {','.join(result.changed_files) if result else ''}")
     if result and result.verification:
         typer.echo(f"verified: {result.verification.result}")
+    if result and result.meta.get("supervision"):
+        note = result.meta["supervision"]
+        typer.echo(f"error: {result.error or note.get('reason', '')}")
+        for fact in note.get("evidence", [])[:8]:
+            typer.echo(f"evidence: {str(fact)[:1000]}")
+        for key in ("worktree", "branch", "patch", "integration_held"):
+            if result.meta.get(key):
+                typer.echo(f"{key}: {result.meta[key]}")
     typer.echo(f"summary: {result.summary if result else ''}")
     if view.status not in FINAL_STATUSES:
         typer.echo(f"still running: agent-dispatch status {view.task_id}")

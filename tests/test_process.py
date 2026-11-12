@@ -391,3 +391,58 @@ async def test_run_cli_delivers_complete_utf8_stdout_lines(tmp_path: Path) -> No
     assert lines == ["first", "привет", "last"]
     assert outcome.stdout == "first\nпривет\r\nlast"
     assert (tmp_path / "lines.log").read_text().count("привет") == 1
+
+
+async def test_cancellation_during_process_creation_does_not_lose_the_child(tmp_path, monkeypatch):
+    real_spawn = asyncio.create_subprocess_exec
+    created, release = asyncio.Event(), asyncio.Event()
+    processes = []
+
+    async def delayed_spawn(*args, **kwargs):
+        process = await real_spawn(*args, **kwargs)
+        processes.append(process)
+        created.set()
+        await release.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    task = asyncio.create_task(
+        run_cli(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=tmp_path,
+            env=dict(os.environ),
+            stdin=None,
+            timeout_seconds=10,
+            log_path=tmp_path / "launch.log",
+        )
+    )
+    await asyncio.wait_for(created.wait(), 5)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert processes[0].returncode is not None
+
+
+async def test_normal_cli_exit_does_not_leave_a_background_writer(tmp_path):
+    marker = tmp_path / "late-write"
+    child = (
+        "import pathlib,time,sys;time.sleep(0.6);pathlib.Path(sys.argv[1]).write_text('escaped')"
+    )
+    parent = (
+        "import subprocess,sys;subprocess.Popen("
+        f"[sys.executable,'-c',{child!r},{str(marker)!r}],"
+        "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)"
+    )
+    outcome = await run_cli(
+        [sys.executable, "-c", parent],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        stdin=None,
+        timeout_seconds=5,
+        log_path=tmp_path / "exit.log",
+        grace_seconds=0.2,
+    )
+    assert outcome.exit_code == 0
+    await asyncio.sleep(0.7)
+    assert not marker.exists()

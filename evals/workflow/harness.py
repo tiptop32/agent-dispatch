@@ -153,9 +153,17 @@ def _check_hop(case: dict[str, Any], prompt: str, failures: list[str]) -> None:
     elif case["hop"] == 1:
         expected = "Do NOT delegate further: the hop limit is reached."
     else:
-        expected = "You may split this task into at most 2 independent subtasks"
+        expected = "You may delegate at most 2 bounded subtasks"
     if expected not in prompt:
         failures.append("delegation hop")
+    if case["kind"] == "task" and case["hop"] == 0:
+        for contract in (
+            "~/.agents/skills/foreman/SKILL.md",
+            "preserve the original goal, supervise progress and verify evidence",
+            "one subordinate at a time at your level",
+        ):
+            if contract not in prompt:
+                failures.append(f"subordinate foreman contract: {contract}")
 
 
 def render(verdicts: list[Verdict]) -> str:

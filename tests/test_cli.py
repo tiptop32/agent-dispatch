@@ -221,6 +221,36 @@ def test_status_prints_task(tmp_config_dir):
 
 
 @respx.mock
+@pytest.mark.parametrize("code", ["supervision_stopped", "supervision_error"])
+def test_status_explains_supervision_stop_and_retained_work(tmp_config_dir, code):
+    state = _state()
+    _write_running_state(tmp_config_dir, state)
+    view = _view(
+        "failed",
+        meta={
+            "supervision": {
+                "decision": "stop",
+                "reason": "Wrong scope",
+                "evidence": ["edited billing.py"],
+            },
+            "worktree": "/tmp/kept-worker",
+            "patch": "/tmp/kept.patch",
+            "integration_held": "supervision",
+        },
+    )
+    view["result"]["error"] = f"{code}: Wrong scope"
+    respx.get(f"http://127.0.0.1:{state.port}/tasks/t1").mock(
+        return_value=httpx.Response(200, json=view)
+    )
+    result = runner.invoke(app, ["status", "t1"])
+    assert result.exit_code == 0
+    assert f"error: {code}: Wrong scope" in result.stdout
+    assert "evidence: edited billing.py" in result.stdout
+    assert "worktree: /tmp/kept-worker" in result.stdout
+    assert "patch: /tmp/kept.patch" in result.stdout
+
+
+@respx.mock
 def test_cancel_prints_cancelled_task(tmp_config_dir):
     state = _state()
     _write_running_state(tmp_config_dir, state)

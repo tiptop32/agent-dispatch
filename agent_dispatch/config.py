@@ -157,6 +157,18 @@ class RoutingSettings(_ConfigModel):
         return list(self.fallback_executor)
 
 
+class SupervisionSettings(_ConfigModel):
+    """Daemon-owned, tool-free local omp supervision; independent of routing."""
+
+    enabled: bool = True
+    command: str = Field("omp", min_length=1)
+    model: str = Field("agent-lb/gpt-6.1-sol", min_length=1)
+    profile: str = Field("te-sidecall", pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    interval_seconds: float = Field(300, gt=0, allow_inf_nan=False)
+    timeout_seconds: float = Field(60, gt=0, allow_inf_nan=False)
+    evidence_max_bytes: int = Field(16384, ge=1024, le=131072)
+
+
 class ExecutionSettings(_ConfigModel):
     """Где исполнитель правит файлы: прямо в рабочей копии или в git worktree."""
 
@@ -173,6 +185,7 @@ class ExecutionSettings(_ConfigModel):
     watchdog_interval_seconds: float = Field(300, gt=0, allow_inf_nan=False)
     watchdog_tool_idle_seconds: float = Field(900, gt=0, allow_inf_nan=False)
     watchdog_repeat_limit: int = Field(6, ge=0)
+    supervision: SupervisionSettings = Field(default_factory=SupervisionSettings)
     #: Предел на каждую команду `verify` из запроса. Зависшая проверка
     #: считается упавшей.
     verify_timeout_seconds: int = Field(600, ge=1)

@@ -1,0 +1,8 @@
+{"id":"continue-no-proof","verdict":{"decision":"continue","reason":"Insufficient evidence is not a violation","evidence":[]},"valid":true}
+{"id":"evidenced-stop","verdict":{"decision":"stop","reason":"Scope violated","evidence":["log: wrote production config despite no-write constraint"]},"valid":true}
+{"id":"unsupported-steer","verdict":{"decision":"steer","reason":"Change direction","evidence":[]},"valid":false}
+{"id":"speculative-stop","verdict":{"decision":"stop","reason":"Seems slow","evidence":[]},"valid":false}
+{"id":"unknown-fields","verdict":{"decision":"continue","reason":"Working","evidence":[],"command":"rm -rf /"},"valid":false}
+{"id":"wrong-evidence-type","verdict":{"decision":"stop","reason":"Broken","evidence":"claim"},"valid":false}
+{"id":"empty-reason","verdict":{"decision":"continue","reason":" ","evidence":[]},"valid":false}
+{"id":"fenced-json","text":"```json\n{\"decision\":\"continue\",\"reason\":\"fine\",\"evidence\":[]}\n```","valid":false}

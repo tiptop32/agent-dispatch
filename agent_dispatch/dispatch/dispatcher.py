@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_dispatch.config import Settings
-from agent_dispatch.dispatch import followup, redact, report_recovery, verify
+from agent_dispatch.dispatch import followup, redact, report_recovery, supervision, verify
 from agent_dispatch.dispatch.concurrency import ExecutorConcurrency
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import (
@@ -107,6 +107,8 @@ def _failed_result(
         executor=record.decision.executor if record.decision else "",
         model=previous.model if previous else None,
         summary=previous.summary if previous else "",
+        usage=previous.usage if previous else None,
+        changed_files=list(previous.changed_files) if previous else [],
         error=error,
         meta=dict(previous.meta if previous else {}) if meta is None else meta,
     )
@@ -1009,20 +1011,31 @@ class Dispatcher:
         if handoff:
             result.meta["handoff"] = handoff
             result.changed_files = sorted(set(inherited_files) | set(result.changed_files))
-        if not review and report_recovery.needs_report(result):
+        if (
+            not review
+            and not result.meta.get("supervision")
+            and report_recovery.needs_report(result)
+        ):
             result = await self._recover_report(record, decision, adapter, ctx, result)
-        if review:
+        if review and not result.meta.get("supervision"):
             result = await self._recover_verdict(record, decision, adapter, ctx, result)
             await self._check_review_wrote_nothing(req, before, result)
         await self._note_executor_failure(record, decision, result)
-        if not review:
+        if not review and not result.meta.get("supervision"):
             result = await self._verify_and_review(record, decision, adapter, ctx, result, tree)
+        if result.meta.get("supervision"):
+            record.result = result
+            await self.storage.update_task(record)
+            try:
+                await self._stop_supervised_descendants(task_id, result)
+            except Exception as exc:
+                result.meta["supervision_cleanup_error"] = f"{type(exc).__name__}: {exc}"
         # Ревью, после которого изменилась рабочая копия, не эскалируется:
         # иначе вызывающий получил бы ответ следующего ревьюера без
         # предупреждения о правках первого.
         plan = (
             None
-            if review and result.meta.get("warning")
+            if result.meta.get("supervision") or (review and result.meta.get("warning"))
             else await self._plan_escalation(record, decision, result)
         )
         if stat_failure is not None:
@@ -1173,6 +1186,8 @@ class Dispatcher:
             else:
                 stage = stages[stage_index]
                 await self._review_work(record, decision, result, tree, stage)
+                if result.meta.get("supervision"):
+                    return result
                 review = result.meta["review"]
                 result.meta.setdefault("review_stages", []).append({**review, "round": rounds})
                 verdict = review["verdict"]
@@ -1217,6 +1232,10 @@ class Dispatcher:
             )
             started = time.monotonic()
             fixed = await self._call_adapter(adapter, fix_ctx, decision)
+            if fixed.meta.get("supervision"):
+                fixed.changed_files = sorted(set(result.changed_files) | set(fixed.changed_files))
+                fixed.usage = report_recovery._usage(result.usage, fixed.usage)
+                return fixed
             # A report-only reply cannot turn an interrupted repair into a success.
             round_status, round_error = fixed.status, fixed.error
             round_parse_error = fixed.meta.get("parse_error")
@@ -1225,6 +1244,10 @@ class Dispatcher:
                 fixed.meta.setdefault("session_id", session)
             if report_recovery.needs_report(fixed):
                 fixed = await self._recover_report(record, decision, adapter, fix_ctx, fixed)
+            if fixed.meta.get("supervision"):
+                fixed.changed_files = sorted(set(result.changed_files) | set(fixed.changed_files))
+                fixed.usage = report_recovery._usage(result.usage, fixed.usage)
+                return fixed
             usage = fixed.usage.model_dump() if fixed.usage else None
             files = list(dict.fromkeys([*result.changed_files, *fixed.changed_files]))
             meta = dict(result.meta)
@@ -1404,6 +1427,22 @@ class Dispatcher:
         if done.status not in FINAL_STATUSES:
             with contextlib.suppress(KeyError, ValueError):
                 await self.cancel(child.task_id)
+        if outcome is not None and outcome.meta.get("supervision"):
+            result.status = "failed"
+            result.error = outcome.error
+            result.meta.update(
+                {
+                    key: outcome.meta[key]
+                    for key in (
+                        "supervision",
+                        "failure_class",
+                        "error_code",
+                        "escalation_suppressed",
+                        "retryable",
+                    )
+                }
+            )
+            return
         if tree is not None:
             # После отмены ревьюера по сроку: иначе он писал бы после отката.
             await self._reset_after_review(tree, result)
@@ -1517,6 +1556,12 @@ class Dispatcher:
         )
         recovered = await self._call_adapter(adapter, verdict_ctx, decision)
         await self._note_executor_failure(record, decision, recovered)
+        if recovered.meta.get("supervision"):
+            recovered.changed_files = sorted(
+                set(result.changed_files) | set(recovered.changed_files)
+            )
+            recovered.usage = report_recovery._usage(result.usage, recovered.usage)
+            return recovered
         result.usage = report_recovery._usage(result.usage, recovered.usage)
         if (
             recovered.status in ("completed", "partial")
@@ -1552,6 +1597,10 @@ class Dispatcher:
             }
         )
         report = await self._call_adapter(adapter, report_ctx, decision)
+        if report.meta.get("supervision"):
+            report.changed_files = sorted(set(result.changed_files) | set(report.changed_files))
+            report.usage = report_recovery._usage(result.usage, report.usage)
+            return report
         # Дозапрос мог упасть на сбое самого исполнителя (лимит, пустой ответ):
         # итог задачи несёт ошибку первого запуска, а не его, и без
         # этого вызова исполнитель остался бы в ротации.
@@ -1582,7 +1631,59 @@ class Dispatcher:
                             f"{decision.executor}"
                         ),
                     )
-                return await adapter.execute(ctx)
+                record = await self.storage.get_task(ctx.task_id)
+                if record is None:
+                    raise ValueError(f"missing task mandate: {ctx.task_id}")
+                for ancestor_id in await self.storage.ancestors(ctx.task_id):
+                    ancestor = await self.storage.get_task(ancestor_id)
+                    if ancestor and ancestor.result and ancestor.result.meta.get("supervision"):
+                        return ExecutionResult(
+                            status="failed",
+                            executor=decision.executor,
+                            model=None,
+                            summary="Ancestor stopped by semantic supervision.",
+                            error=ancestor.result.error,
+                            meta={
+                                "supervision": ancestor.result.meta["supervision"],
+                                "supervision_origin": ancestor_id,
+                                "failure_class": "supervision_stopped",
+                                "retryable": False,
+                                "escalation_suppressed": "supervision_stopped",
+                            },
+                        )
+
+                async def emit(note: dict) -> None:
+                    if note.get("decision") in {"stop", "error"}:
+                        code = (
+                            "supervision_stopped"
+                            if note["decision"] == "stop"
+                            else "supervision_error"
+                        )
+                        result = ExecutionResult(
+                            status="failed",
+                            executor=decision.executor,
+                            model=None,
+                            summary="Executor stopped by semantic supervision.",
+                            error=f"{code}: {note['reason']}",
+                            meta={
+                                "supervision": note,
+                                "failure_class": code,
+                                "error_code": code,
+                                "escalation_suppressed": code,
+                                "retryable": False,
+                            },
+                        )
+                        record.result = result
+                        await self.storage.update_task(record)
+                        await self._stop_supervised_descendants(ctx.task_id, result)
+                    await self.storage.add_event(ctx.task_id, "supervision", note)
+
+                result = await supervision.supervise(
+                    self.settings, ctx, record.request, lambda: adapter.execute(ctx), emit
+                )
+                if result.meta.get("supervision"):
+                    result.executor = decision.executor
+                return result
         except Exception as exc:
             return ExecutionResult(
                 status="failed",
@@ -1592,6 +1693,37 @@ class Dispatcher:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
+    async def _stop_supervised_descendants(self, task_id: str, result: ExecutionResult) -> None:
+        """Daemon child tasks are not in the worker CLI's OS process group."""
+        descendants = []
+        for child in await self.storage.list_active_tasks():
+            if task_id in await self.storage.ancestors(child.task_id):
+                descendants.append(child.task_id)
+        workers = []
+        for child_id in descendants:
+            worker = self._tasks.get(child_id)
+            if worker is not None and not worker.done():
+                worker.cancel()
+                workers.append(worker)
+        await asyncio.gather(*workers, return_exceptions=True)
+        for child_id in descendants:
+            child = await self.storage.get_task(child_id)
+            if child is None or child.status == TaskStatus.completed:
+                continue
+            child.result = child.result or _failed_result(child, result.error)
+            child.result.error = result.error
+            child.result.meta.update(
+                supervision=result.meta["supervision"],
+                supervision_origin=task_id,
+                failure_class="supervision_stopped",
+                escalation_suppressed="supervision_stopped",
+                retryable=False,
+            )
+            await self.storage.update_task(child)
+            await self.storage.add_event(
+                child_id, "supervision", {**result.meta["supervision"], "origin": task_id}
+            )
+
     @staticmethod
     def _resume_failed(result: ExecutionResult) -> bool:
         """Продолженная сессия упала, не начав работу.
@@ -1599,7 +1731,7 @@ class Dispatcher:
         Сбой исполнителя (лимит, сеть) повторился бы и с нуля, а таймаут и
         молчание значат, что агент работал: их не повторяем.
         """
-        if result.status != "failed" or result.changed_files:
+        if result.status != "failed" or result.changed_files or result.meta.get("supervision"):
             return False
         error = result.error or ""
         if error == "timeout" or error.startswith("stalled:"):
@@ -1736,6 +1868,8 @@ class Dispatcher:
         self, record: TaskRecord, decision: RouteDecision, result: ExecutionResult
     ) -> None:
         """Вывести исполнителя из ротации, если он упал на сбое, не связанном с задачей."""
+        if result.meta.get("supervision"):
+            return
         internal = classify_internal_failure(result)
         if internal is not None:
             result.meta.setdefault("failure_class", internal)
@@ -2018,7 +2152,9 @@ class Dispatcher:
             "routing_policy_version",
             decision.meta.get("routing_policy_version", f"{decision.router.value}-v1"),
         )
-        failure_class = classify_internal_failure(result)
+        failure_class = (
+            None if result.meta.get("supervision") else classify_internal_failure(result)
+        )
         if failure_class is not None:
             result.meta.setdefault("failure_class", failure_class)
             result.meta.setdefault("error_code", failure_class)
@@ -2111,6 +2247,9 @@ class Dispatcher:
         # ожидания здесь может снять запись результата вместе с путём.
         if not path.exists():  # noqa: ASYNC240
             return
+        current = await self.storage.get_task(record.task_id)
+        if current and current.result and current.result.meta.get("supervision"):
+            record.result = current.result
         cancelled = isinstance(exc, asyncio.CancelledError)
         result = _failed_result(
             record, "cancelled" if cancelled else f"{type(exc).__name__}: {exc}"
@@ -2126,6 +2265,26 @@ class Dispatcher:
     async def _mark_cancelled(self, record: TaskRecord) -> None:
         if record.status in FINAL_STATUSES:
             return
+        current = await self.storage.get_task(record.task_id)
+        if current and current.result and current.result.meta.get("supervision"):
+            record.result = current.result
+        if not (record.result and record.result.meta.get("supervision_usage")):
+            notes = [
+                event["payload"]
+                for event in await self.storage.list_events(record.task_id)
+                if event["kind"] == "supervision"
+            ]
+            usage = None
+            for note in notes:
+                usage = report_recovery._usage(usage, supervision.usage_from_metrics(note))
+            if usage is not None:
+                record.result = record.result or _failed_result(record, "cancelled")
+                record.result.usage = report_recovery._usage(record.result.usage, usage)
+                record.result.meta["supervision_usage"] = {
+                    "checks_finished": len(notes),
+                    "usage": usage.model_dump(),
+                    "inflight_check_usage": "unknown after cancellation",
+                }
         record.status, record.finished_at = TaskStatus.cancelled, self._now()
         await self.storage.add_event(record.task_id, "cancel", {})
         await self.storage.update_task(record)
@@ -2202,6 +2361,18 @@ class Dispatcher:
         result.meta["worktree"] = str(tree.path)
         result.meta["branch"] = tree.branch
         execution = self.settings.execution
+        if result.meta.get("supervision"):
+            result.meta["integrated"] = False
+            result.meta["integration_held"] = "supervision"
+            try:
+                patch = await asyncio.to_thread(worktree.build_patch, tree)
+                patch_path = self.settings.server.data_dir / "patches" / f"{task_id}.patch"
+                await asyncio.to_thread(patch_path.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(patch_path.write_text, patch)
+                result.meta["patch"] = str(patch_path)
+            except (OSError, worktree.WorktreeError) as exc:
+                result.meta["integration_error"] = f"stopped worktree retained; patch: {exc}"
+            return
         try:
             sha = await asyncio.to_thread(
                 worktree.commit, tree, f"agent-dispatch: task {task_id[:8]}"

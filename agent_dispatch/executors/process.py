@@ -44,15 +44,30 @@ async def run_cli(
     """Run a CLI process, streaming output and terminating its process group."""
     started_at = time.monotonic()
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    process = await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=cwd,
-        env=env,
-        stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
+    spawning = asyncio.create_task(
+        asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd,
+            env=env,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
     )
+    try:
+        process = await asyncio.shield(spawning)
+    except asyncio.CancelledError:
+        # Cancellation may arrive while exec is starting, before we own its PID.
+        # Join the launch before killing/draining: neither a supervisor nor its
+        # worker may escape just because completion won this race.
+        process = await spawning
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.communicate()
+        raise
 
     # start_new_session=True делает процесс лидером новой группы: pgid == pid.
     # os.getpgid(pid) здесь гонялся бы с child watcher: быстрый процесс уже собран,
@@ -182,6 +197,8 @@ async def run_cli(
     finally:
         if process.returncode is None:
             await terminate_group()
+        else:
+            signal_group(signal.SIGKILL)
         if not process_wait.done():
             process_wait.cancel()
             await asyncio.gather(process_wait, return_exceptions=True)

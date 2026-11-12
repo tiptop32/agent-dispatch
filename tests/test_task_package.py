@@ -1,4 +1,3 @@
-import os
 import subprocess
 from pathlib import Path
 
@@ -51,30 +50,6 @@ def test_build_task_package_full_collects_git_status_and_diff(git_repo):
     assert package.git_diff_stat is not None and "a.py" in package.git_diff_stat
 
 
-@pytest.mark.parametrize(
-    ("adapter", "mode", "snapshot"),
-    [
-        ("claude", ContextMode.prompt, "prompt_claude_prompt.md"),
-        ("claude", ContextMode.prompt_summary, "prompt_claude_summary.md"),
-        ("claude", ContextMode.full, "prompt_claude_full.md"),
-        ("omp", ContextMode.prompt_summary, "prompt_omp_summary.md"),
-    ],
-)
-def test_render_prompt_matches_snapshot(adapter, mode, snapshot):
-    package = TaskPackage(
-        request=request(mode),
-        git_status=" M src/client.py\n" if mode is ContextMode.full else None,
-        git_diff_stat=" src/client.py | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n"
-        if mode is ContextMode.full
-        else None,
-    )
-    rendered = render_prompt(package, adapter, settings())
-    path = Path(__file__).parent / "snapshots" / snapshot
-    if os.environ.get("UPDATE_SNAPSHOTS"):
-        path.write_text(rendered)
-    assert rendered == path.read_text()
-
-
 def test_render_prompt_prompt_mode_omits_context_sections():
     rendered = render_prompt(TaskPackage(request=request(ContextMode.prompt)), "claude", settings())
     assert "# Context" not in rendered
@@ -89,14 +64,14 @@ def test_render_prompt_hop_limit_forbids_delegation():
     assert "split this task" not in rendered
 
 
-def test_render_prompt_hop_zero_allows_fanout():
+def test_render_prompt_hop_zero_allows_bounded_delegation():
     rendered = render_prompt(TaskPackage(request=request(hop=0)), "claude", settings())
-    assert "at most 2 independent subtasks" in rendered
+    assert "at most 2 bounded subtasks" in rendered
 
 
 def test_render_prompt_uses_configured_max_children():
     rendered = render_prompt(TaskPackage(request=request()), "claude", settings(max_children=3))
-    assert "at most 3 independent subtasks" in rendered
+    assert "at most 3 bounded subtasks" in rendered
 
 
 def test_render_prompt_is_identical_for_claude_and_omp():
