@@ -1430,6 +1430,7 @@ class Dispatcher:
         if outcome is not None and outcome.meta.get("supervision"):
             result.status = "failed"
             result.error = outcome.error
+            result.changed_files = sorted(set(result.changed_files) | set(outcome.changed_files))
             result.meta.update(
                 {
                     key: outcome.meta[key]
@@ -2274,15 +2275,24 @@ class Dispatcher:
                 for event in await self.storage.list_events(record.task_id)
                 if event["kind"] == "supervision"
             ]
+            checks = [note for note in notes if note.get("decision") != "cancelled"]
             usage = None
-            for note in notes:
+            worker_usage = None
+            for note in checks:
                 usage = report_recovery._usage(usage, supervision.usage_from_metrics(note))
-            if usage is not None:
+            for note in notes:
+                if note.get("decision") == "cancelled":
+                    worker_usage = report_recovery._usage(
+                        worker_usage, supervision.usage_from_metrics(note)
+                    )
+            if usage is not None or worker_usage is not None:
                 record.result = record.result or _failed_result(record, "cancelled")
-                record.result.usage = report_recovery._usage(record.result.usage, usage)
+                record.result.usage = report_recovery._usage(
+                    record.result.usage, report_recovery._usage(worker_usage, usage)
+                )
                 record.result.meta["supervision_usage"] = {
-                    "checks_finished": len(notes),
-                    "usage": usage.model_dump(),
+                    "checks_finished": len(checks),
+                    "usage": usage.model_dump() if usage else None,
                     "inflight_check_usage": "unknown after cancellation",
                 }
         record.status, record.finished_at = TaskStatus.cancelled, self._now()

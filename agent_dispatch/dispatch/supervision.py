@@ -317,11 +317,10 @@ async def judge(settings: Settings, payload: dict, log_path: Path) -> tuple[Verd
                 str(overlay),
                 "--system-prompt",
                 SYSTEM_PROMPT,
-                prompt,
             ],
             cwd=scratch,
             env=env,
-            stdin=None,
+            stdin=prompt,
             timeout_seconds=cfg.timeout_seconds,
             log_path=log_path,
             grace_seconds=2,
@@ -348,6 +347,8 @@ async def judge(settings: Settings, payload: dict, log_path: Path) -> tuple[Verd
             raise ValueError(f"supervisor CLI timed out after {cfg.timeout_seconds:g}s")
         if outcome.exit_code != 0:
             raise ValueError(f"supervisor CLI exited {outcome.exit_code}: {outcome.stderr[:300]}")
+        if final is not None and final.get("stopReason") == "error":
+            raise ValueError("supervisor provider error")
         if final is None or final.get("stopReason") != "stop":
             raise ValueError("no completed assistant verdict")
         if f"{final.get('provider')}/{final.get('model')}" != cfg.model:
@@ -367,8 +368,18 @@ async def judge(settings: Settings, payload: dict, log_path: Path) -> tuple[Verd
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         if outcome.timed_out:
             reason = f"supervisor CLI timed out after {cfg.timeout_seconds:g}s"
+        elif (
+            final is not None
+            and final.get("stopReason") == "error"
+            and isinstance(final.get("errorMessage"), str)
+            and final["errorMessage"].strip()
+        ):
+            reason = f"supervisor provider error: {_clean(final['errorMessage'], settings)[:300]}"
         elif outcome.exit_code != 0:
-            reason = f"supervisor CLI exited {outcome.exit_code}: {outcome.stderr[:300]}"
+            detail = _clean(outcome.stderr, settings)[:300]
+            reason = f"supervisor CLI exited {outcome.exit_code}: {detail}"
+        elif final is not None and final.get("stopReason") == "error" and outcome.stderr.strip():
+            reason = f"supervisor provider error: {_clean(outcome.stderr, settings)[:300]}"
         else:
             reason = f"malformed supervisor verdict: {type(exc).__name__}"
         raise JudgmentError(reason, metrics) from exc

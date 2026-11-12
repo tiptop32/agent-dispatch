@@ -47,7 +47,7 @@ if "--worker" in sys.argv:
     (control / "worker-late").write_text("worker kept writing")
     sys.exit(0)
 
-payload = json.loads(sys.argv[-1])
+payload = json.load(sys.stdin)
 count_path = control / "checks"
 count = int(count_path.read_text()) + 1 if count_path.exists() else 1
 count_path.write_text(str(count))
