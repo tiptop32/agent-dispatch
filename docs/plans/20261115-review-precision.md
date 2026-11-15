@@ -49,14 +49,14 @@ fail нестабильны (тот же ревьюер после раунда 
 - Modify: `tests/test_review_fix_round.py`
 - Modify: `tests/test_dispatcher_worktree.py`
 
-- [ ] Патч пишется внутри `_review_work` после коммита (`:1353`) и только когда ревью-потомок действительно запущен. Строки `skipped` без `task_id` (`commit:` на `:1356`, `perimeter: no corporate reviewer` на `:1171-1176`, сбой `submit` на `:1414`) получают `input_patch: null` и `input_skipped: <причина>`
-- [ ] Worktree: `git diff <tree.base>..<sha коммита>`; при handoff в диф входит патч предка, это то же, что видел ревьюер
-- [ ] In_place: база HEAD (ревьюер видел работу вместе с грязью вызывающего, это и сохраняется). Патч строится во временном индексе, как в `DiffStatSnapshot` (`workspace.py:223-260`), с pathspec по `changed_files` (тот же scope, что у ревьюера, `:1384-1387`), поэтому untracked-файлы задачи входят, чужие грязные файлы и индекс вызывающего не трогаются; сбой даёт `input_skipped: snapshot`
-- [ ] Файл `<data_dir>/review_inputs/<review_task_id>.patch`, путь в `review_stages[i].input_patch`; лимит `REVIEW_INPUT_LIMIT_BYTES = 1 MiB`, при превышении файл не пишется, ставится `input_skipped: size`
-- [ ] Периметр: используется готовое `perimeter` (`_lineage_perimeter`, `:2045-2082`, уже вычислено на `:1167` в `_verify_and_review`, передаётся в `_review_work` параметром), своя проверка не пишется. Под периметром `input_skipped: perimeter`. Патчи и логи таких задач и так лежат на диске (`patches/`), пропуск нужен ради части B (отправка судье)
-- [ ] Хранение: автоматического удаления нет, `worktrees --clean` каталог не трогает (это датасет разметки)
-- [ ] Тесты: worktree, in_place с untracked-файлом, skipped-ступень без `task_id`, периметр, лимит, сбой снимка
-- [ ] Прогнать тесты, должны пройти
+- [x] Патч пишется внутри `_review_work` после коммита (`:1353`) и только когда ревью-потомок действительно запущен. Строки `skipped` без `task_id` (`commit:` на `:1356`, `perimeter: no corporate reviewer` на `:1171-1176`, сбой `submit` на `:1414`) получают `input_patch: null` и `input_skipped: <причина>`
+- [x] Worktree: `git diff <tree.base>..<sha коммита>`; при handoff в диф входит патч предка, это то же, что видел ревьюер
+- [x] In_place: база HEAD (ревьюер видел работу вместе с грязью вызывающего, это и сохраняется). Патч строится во временном индексе, как в `DiffStatSnapshot` (`workspace.py:223-260`), с pathspec по `changed_files` (тот же scope, что у ревьюера, `:1384-1387`), поэтому untracked-файлы задачи входят, чужие грязные файлы и индекс вызывающего не трогаются; сбой даёт `input_skipped: snapshot`
+- [x] Файл `<data_dir>/review_inputs/<review_task_id>.patch`, путь в `review_stages[i].input_patch`; лимит `REVIEW_INPUT_LIMIT_BYTES = 1 MiB`, при превышении файл не пишется, ставится `input_skipped: size`
+- [x] Периметр: используется готовое `perimeter` (`_lineage_perimeter`, `:2045-2082`, уже вычислено на `:1167` в `_verify_and_review`, передаётся в `_review_work` параметром), своя проверка не пишется. Под периметром `input_skipped: perimeter`. Патчи и логи таких задач и так лежат на диске (`patches/`), пропуск нужен ради части B (отправка судье)
+- [x] Хранение: автоматического удаления нет, `worktrees --clean` каталог не трогает (это датасет разметки)
+- [x] Тесты: worktree, in_place с untracked-файлом, skipped-ступень без `task_id`, периметр, лимит, сбой снимка
+- [x] Прогнать тесты, должны пройти
 
 ### Task 3: секция replay `review_stability`
 **Depends on:** Task 1

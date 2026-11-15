@@ -663,3 +663,62 @@ async def test_fix_round_delta_uses_worktree_after_initial_commit(tmp_path, git_
     finally:
         await dispatcher.shutdown()
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_review_input_keeps_handoff_patch_after_worktree_cleanup(tmp_path, git_repo):
+    settings, storage, adapters, dispatcher = await _make(tmp_path)
+    settings.routing.corporate_perimeter = False
+    settings.escalation = {"omp": ["senior"]}
+    settings.executors["senior"] = ExecutorSettings(
+        adapter="omp", model="test/senior", review_by="reviewer"
+    )
+    settings.executors["reviewer"] = ExecutorSettings(adapter="omp", model="test/reviewer")
+    adapters["omp"].result = ExecutionResult(
+        status="partial",
+        executor="omp",
+        model=None,
+        summary="started",
+        changed_files=["a.py"],
+        error="timeout",
+    )
+    adapters["omp"].on_execute = _writes("x = 2\n")
+    adapters["senior"] = FakeAdapter(
+        "senior",
+        result=ExecutionResult(
+            status="completed",
+            executor="senior",
+            model=None,
+            summary="finished",
+            changed_files=["new.py"],
+        ),
+        on_execute=_writes("finished = True\n", "new.py"),
+    )
+    observed = []
+
+    async def review(ctx):
+        observed.append(_git(Path(ctx.cwd), "diff", "--binary", "main..HEAD"))
+
+    adapters["reviewer"] = FakeAdapter(
+        "reviewer",
+        result=ExecutionResult(
+            status="completed", executor="reviewer", model=None, summary="good", verdict="pass"
+        ),
+        on_execute=review,
+    )
+    try:
+        task = await dispatcher.submit(_req(git_repo))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.task_id != task.task_id and done.status == TaskStatus.completed
+        assert done.result.meta["handoff"]["from_task"] == task.task_id
+        [stage] = done.result.meta["review_stages"]
+        path = Path(stage["input_patch"])
+        assert path == settings.server.data_dir / "review_inputs" / f"{stage['task_id']}.patch"
+        patch = await asyncio.to_thread(path.read_text)
+        assert observed == [patch]
+        assert "+x = 2" in patch and "+finished = True" in patch
+        assert not await asyncio.to_thread(Path(adapters["senior"].calls[0].cwd).exists)
+        assert done.result.meta["integrated"] is True
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()

@@ -137,6 +137,18 @@ async def test_failed_review_resumes_and_merges_the_fix(tmp_path, git_repo, work
     assert repair["usage"]["cost_usd"] == 0.2
     assert repair["diff_stat"] == {"files": 1, "added": 1, "removed": 0}
     assert len(adapters["first"].calls) == 2
+    first_review, second_review = done.result.meta["review_stages"]
+    before = Path(first_review["input_patch"])
+    after = Path(second_review["input_patch"])
+    assert before != after
+    assert before.name == f"{first_review['task_id']}.patch"
+    assert before.parent == dispatcher.settings.server.data_dir / "review_inputs"
+    before_patch = await asyncio.to_thread(before.read_text)
+    after_patch = await asyncio.to_thread(after.read_text)
+    assert "+x = 'bad'" in before_patch
+    assert "fixed.py" not in before_patch
+    assert "+x = 2" in after_patch
+    assert "+fixed = True" in after_patch
     assert not adapters["senior"].calls
     assert (git_repo / "a.py").read_text() == "x = 2\n"
     assert await storage.count_children(task.task_id) == 0
@@ -647,6 +659,160 @@ async def test_round_snapshot_closes_on_supervision_and_failure(
             assert "failure note unavailable" in done.result.error
         else:
             assert done.result.meta["supervision"]["reason"] == "stop"
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_in_place_review_input_includes_scoped_dirt_and_untracked_without_staging(
+    tmp_path, git_repo
+):
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path, rounds=0)
+    (git_repo / "a.py").write_text("caller = True\n")
+    (git_repo / "foreign.txt").write_text("private caller dirt\n")
+    await asyncio.to_thread(
+        subprocess.run, ["git", "add", "a.py", "foreign.txt"], cwd=git_repo, check=True
+    )
+    (git_repo / "foreign.txt").write_text("unstaged private caller dirt\n")
+    (git_repo / "unrelated.txt").write_text("untracked caller dirt\n")
+    index = git_repo / ".git" / "index"
+    index_before = index.read_bytes()
+
+    async def work(ctx):
+        (Path(ctx.cwd) / "a.py").write_text("caller = True\nworker = True\n")
+        (Path(ctx.cwd) / "new.py").write_text("new = True\n")
+        adapters["worker"].result = result(changed_files=["a.py", "new.py"])
+
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(request(git_repo))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == TaskStatus.completed
+        [review] = done.result.meta["review_stages"]
+        patch = await asyncio.to_thread(Path(review["input_patch"]).read_text)
+        assert "-x = 1" in patch
+        assert "+caller = True" in patch and "+worker = True" in patch
+        assert "new file mode" in patch and "+new = True" in patch
+        assert "foreign.txt" not in patch and "unrelated.txt" not in patch
+        assert index.read_bytes() == index_before
+        assert (git_repo / "foreign.txt").read_text() == "unstaged private caller dirt\n"
+        assert (git_repo / "unrelated.txt").read_text() == "untracked caller dirt\n"
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_mode", ["in_place", "worktree"])
+@pytest.mark.parametrize("skip", ["size", "snapshot", "write"])
+async def test_review_input_failure_does_not_discard_review(
+    tmp_path, git_repo, monkeypatch, workspace_mode, skip
+):
+    storage, adapters, dispatcher = await make_dispatcher(
+        tmp_path, rounds=0, execution={"workspace_mode": workspace_mode}
+    )
+
+    async def work(ctx):
+        content = "x" * dispatcher_module.REVIEW_INPUT_LIMIT_BYTES if skip == "size" else "x = 2"
+        (Path(ctx.cwd) / "a.py").write_text(content + "\n")
+
+    real_output = dispatcher_module.workspace.bounded_git_output
+
+    def unavailable(cwd, args, **kwargs):
+        if "--binary" in args:
+            raise subprocess.CalledProcessError(128, "git diff")
+        return real_output(cwd, args, **kwargs)
+
+    if skip == "snapshot":
+        monkeypatch.setattr(dispatcher_module.workspace, "bounded_git_output", unavailable)
+    elif skip == "write":
+        directory = dispatcher.settings.server.data_dir
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "review_inputs").write_text("not a directory\n")
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(request(git_repo))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == TaskStatus.completed
+        [review] = done.result.meta["review_stages"]
+        assert review["verdict"] == "pass" and review["task_id"]
+        assert review["input_patch"] is None
+        assert review["input_skipped"] == ("size" if skip == "size" else "snapshot")
+        assert not list(dispatcher.settings.server.data_dir.glob("review_inputs/*.patch"))
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reviewers", [None, "first"])
+async def test_perimeter_review_never_saves_input(tmp_path, git_repo, reviewers):
+    storage, adapters, dispatcher = await make_dispatcher(
+        tmp_path, rounds=0, reviewers=reviewers, corporate=True
+    )
+
+    async def work(ctx):
+        (Path(ctx.cwd) / "a.py").write_text("private = True\n")
+
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(request(git_repo, prod=True))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == TaskStatus.completed
+        [review] = done.result.meta["review_stages"]
+        assert review["input_patch"] is None
+        assert review["input_skipped"] == "perimeter"
+        assert bool(review["task_id"]) == bool(reviewers)
+        assert review["verdict"] == ("pass" if reviewers else "skipped")
+        assert not (dispatcher.settings.server.data_dir / "review_inputs").exists()
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["commit", "submit"])
+async def test_review_not_started_has_no_input_patch(tmp_path, git_repo, monkeypatch, failure):
+    storage, adapters, dispatcher = await make_dispatcher(
+        tmp_path, rounds=0, execution={"workspace_mode": "worktree"}
+    )
+
+    async def work(ctx):
+        (Path(ctx.cwd) / "a.py").write_text("x = 2\n")
+
+    if failure == "commit":
+        real_commit = dispatcher_module.worktree.commit
+        calls = 0
+
+        def commit(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise dispatcher_module.worktree.WorktreeError("cannot commit")
+            return real_commit(*args)
+
+        monkeypatch.setattr(dispatcher_module.worktree, "commit", commit)
+    else:
+        real_submit = dispatcher.submit
+
+        async def submit(req):
+            if req.kind == "review":
+                raise OSError("cannot submit")
+            return await real_submit(req)
+
+        monkeypatch.setattr(dispatcher, "submit", submit)
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(request(git_repo))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == TaskStatus.completed
+        [review] = done.result.meta["review_stages"]
+        assert review["verdict"] == "skipped" and review["task_id"] is None
+        assert review["input_patch"] is None
+        assert review["input_skipped"] == failure
+        assert not adapters["first"].calls
+        assert not (dispatcher.settings.server.data_dir / "review_inputs").exists()
     finally:
         await dispatcher.shutdown()
         await storage.close()

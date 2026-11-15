@@ -118,6 +118,9 @@ def _failed_result(
 #: и в контекст следующего звена; полный отчёт остаётся у задачи-потомка.
 REVIEW_SUMMARY_LIMIT = 2000
 
+#: Снимки остаются датасетом разметки после удаления worktree.
+REVIEW_INPUT_LIMIT_BYTES = 1 << 20
+
 #: Запас ожидания ревью сверх таймаута ревьюера: жёсткий таймаут убивает CLI
 #: ровно в срок, а запись результата потомка занимает ещё мгновение.
 REVIEW_WAIT_GRACE_SECONDS = 60
@@ -1140,6 +1143,7 @@ class Dispatcher:
         stages: list[str] | None = None
         stage_index = 0
         pending: dict[str, object] | None = None
+        perimeter = False
         if req.verify and result.status in ("completed", "partial"):
             await self._verify(record, result, tree)
         while True:
@@ -1185,7 +1189,7 @@ class Dispatcher:
                 break
             else:
                 stage = stages[stage_index]
-                await self._review_work(record, decision, result, tree, stage)
+                await self._review_work(record, decision, result, tree, stage, perimeter)
                 if result.meta.get("supervision"):
                     return result
                 review = result.meta["review"]
@@ -1383,17 +1387,19 @@ class Dispatcher:
         result: ExecutionResult,
         tree: worktree.Worktree | None,
         reviewer: str,
+        perimeter: bool,
     ) -> None:
         """Run one automatic review stage in its own child task."""
         req, task_id = record.request, record.task_id
         cwd, base, task = req.cwd, None, req.task
         scope = ""
+        commit_sha = None
         if tree is not None:
             # Работы в рабочей копии вызывающего ещё нет: ревьюер читает
             # дерево. Коммит нужен, чтобы `git diff <base>` показал и новые
             # файлы; после `verify` он возвращает тот же HEAD.
             try:
-                await asyncio.to_thread(
+                commit_sha = await asyncio.to_thread(
                     worktree.commit, tree, f"agent-dispatch: task {task_id[:8]}"
                 )
             except worktree.WorktreeError as exc:
@@ -1458,6 +1464,15 @@ class Dispatcher:
                 reason = f"submit: {type(exc).__name__}: {exc}"
                 self._note_review(result, reviewer, None, "skipped", reason=reason)
                 return
+            review_input = await asyncio.to_thread(
+                self._save_review_input,
+                child.task_id,
+                cwd,
+                result.changed_files,
+                tree,
+                commit_sha,
+                perimeter,
+            )
             await self.storage.add_event(
                 task_id, "review_by", {"child": child.task_id, "by": reviewer}
             )
@@ -1509,6 +1524,7 @@ class Dispatcher:
             summary=outcome.summary if outcome is not None and reason is None else "",
             reason=reason,
         )
+        result.meta["review"].update(review_input)
         result.meta["review"]["verdict_recovered"] = bool(
             outcome and outcome.meta.get("verdict_recovered")
         )
@@ -1523,6 +1539,48 @@ class Dispatcher:
             # бы слова ревьюера о лимитах за лимит CLI.
             result.status = "partial"
             result.error = f"review failed ({reviewer})"
+
+    def _save_review_input(
+        self,
+        child_id: str,
+        cwd: str,
+        files: list[str],
+        tree: worktree.Worktree | None,
+        commit_sha: str | None,
+        perimeter: bool,
+    ) -> dict[str, object]:
+        """Сохранить вход ревью, а не финальный патч после раундов правки."""
+        skipped: dict[str, object] = {"input_patch": None}
+        if perimeter:
+            return {**skipped, "input_skipped": "perimeter"}
+        try:
+            if tree is not None:
+                if not tree.base or not commit_sha:
+                    return {**skipped, "input_skipped": "snapshot"}
+                patch, oversized = workspace.bounded_git_output(
+                    cwd,
+                    [
+                        "diff",
+                        "--binary",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--no-color",
+                        f"{tree.base}..{commit_sha}",
+                    ],
+                    limit=REVIEW_INPUT_LIMIT_BYTES,
+                )
+            else:
+                patch, oversized = workspace.review_input_patch(
+                    cwd, files, limit=REVIEW_INPUT_LIMIT_BYTES
+                )
+            if oversized:
+                return {**skipped, "input_skipped": "size"}
+            path = self.settings.server.data_dir / "review_inputs" / f"{child_id}.patch"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(patch)
+            return {"input_patch": str(path)}
+        except (OSError, subprocess.SubprocessError):
+            return {**skipped, "input_skipped": "snapshot"}
 
     async def _abandon_review(self, submitting: asyncio.Task[TaskRecord]) -> None:
         """Отменить ревью задачи, которую отменили посреди `_review_work`."""
@@ -1565,9 +1623,12 @@ class Dispatcher:
             "verdict": verdict,
             "summary": summary[:REVIEW_SUMMARY_LIMIT],
             "verdict_recovered": False,
+            "input_patch": None,
         }
         if reason is not None:
             review["reason"] = reason[:500]
+        if child is None:
+            review["input_skipped"] = reason.split(":", 1)[0] if reason else "skipped"
         result.meta["review"] = review
 
     async def _recover_verdict(

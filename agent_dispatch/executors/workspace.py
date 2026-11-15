@@ -78,14 +78,19 @@ def _path_state(root: Path, name: str, *, metadata_only: bool = False) -> str:
 
 
 def bounded_git_output(
-    cwd: str | Path, args: list[str], *, limit: int, timeout: float = 2
+    cwd: str | Path,
+    args: list[str],
+    *,
+    limit: int,
+    timeout: float = 2,
+    env: dict[str, str] | None = None,
 ) -> tuple[bytes, bool]:
     """Read at most limit+1 Git bytes, with a deadline and unconditional child cleanup."""
     with (
         subprocess.Popen(
             ["git", "--no-pager", *args],
             cwd=cwd,
-            env=git_env(),
+            env=git_env() if env is None else env,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         ) as process,
@@ -218,6 +223,58 @@ def diff(before: dict[str, str], after: dict[str, str]) -> list[str]:
     changed = {path for path, state in after.items() if before.get(path) != state}
     changed |= before.keys() - after.keys()
     return sorted(changed)
+
+
+def review_input_patch(cwd: str | Path, files: list[str], *, limit: int) -> tuple[bytes, bool]:
+    """Снимок HEAD → рабочие файлы ревью без изменения индекса вызывающего."""
+    env = git_env()
+
+    def git(*args: str) -> bytes:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, env=env, capture_output=True, check=True
+        ).stdout
+
+    root = Path(os.fsdecode(git("rev-parse", "--show-toplevel")).strip())
+    objects = os.fsdecode(
+        git("rev-parse", "--path-format=absolute", "--git-path", "objects")
+    ).strip()
+    tracked = {
+        os.fsdecode(name)
+        for name in git("ls-tree", "-r", "--name-only", "-z", "HEAD").split(b"\0")
+        if name
+    }
+    paths = [
+        f":(top,literal){name}"
+        if name in tracked or (root / name).exists()
+        else f":(top,literal){os.path.relpath(Path(cwd).resolve() / name, root)}"
+        for name in files
+    ]
+    with tempfile.TemporaryDirectory(prefix="agent-dispatch-review-") as directory:
+        temporary = Path(directory)
+        (temporary / "objects").mkdir()
+        env.update(
+            GIT_INDEX_FILE=str(temporary / "index"),
+            GIT_OBJECT_DIRECTORY=str(temporary / "objects"),
+            GIT_ALTERNATE_OBJECT_DIRECTORIES=objects,
+        )
+        git("read-tree", "HEAD")
+        git("add", "-A", "--", *paths)
+        return bounded_git_output(
+            cwd,
+            [
+                "diff",
+                "--cached",
+                "--binary",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "HEAD",
+                "--",
+                *paths,
+            ],
+            limit=limit,
+            env=env,
+        )
 
 
 class DiffStatSnapshot:
