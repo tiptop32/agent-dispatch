@@ -20,6 +20,7 @@ from agent_dispatch.doctor import (
     omp_mcp_env_check,
     omp_version_check,
     omp_x5_profile_check,
+    review_inputs_check,
     run_checks,
     stale_files,
     worktrees_check,
@@ -352,6 +353,48 @@ def test_worktrees_check_warns_about_old_trees_and_reports_total_size(tmp_config
     assert "1 trees" in check.detail and "total" in check.detail
     assert "1 older than 7 days" in check.detail
     assert format_checks([check]).startswith("WARN  worktrees:")
+
+
+def test_review_inputs_check_ok_without_directories(tmp_config_dir):
+    settings = _configure(tmp_config_dir)
+    check = review_inputs_check(settings)
+    assert check.ok and not check.warning
+    assert "review_inputs 0.0 B" in check.detail and "patches 0.0 B" in check.detail
+
+
+def test_review_inputs_check_ok_below_threshold(tmp_config_dir):
+    settings = _configure(tmp_config_dir)
+    inputs = settings.server.data_dir / "review_inputs"
+    patches = settings.server.data_dir / "patches"
+    inputs.mkdir()
+    patches.mkdir()
+    (inputs / "task.patch").write_bytes(b"x" * 1024)
+    (patches / "task.diff").write_bytes(b"y" * 2048)
+
+    check = review_inputs_check(settings)
+
+    assert check.ok and not check.warning
+    assert "review_inputs 1.0 KiB" in check.detail
+    assert "patches 2.0 KiB" in check.detail
+    assert format_checks([check]).startswith("ok  review-inputs:")
+
+
+def test_review_inputs_check_warns_above_threshold(tmp_config_dir):
+    settings = _configure(tmp_config_dir)
+    inputs = settings.server.data_dir / "review_inputs"
+    inputs.mkdir()
+    # Пишем разреженный файл: 500 MB реальных байтов писать незачем.
+    with open(inputs / "big.patch", "wb") as fh:
+        fh.seek(doctor_module.REVIEW_INPUTS_WARN_BYTES)
+        fh.write(b"\0")
+    (settings.server.data_dir / "patches").mkdir()
+    (settings.server.data_dir / "patches" / "small.diff").write_bytes(b"z" * 10)
+
+    check = review_inputs_check(settings)
+
+    assert check.ok and check.warning
+    assert "500.0 MiB" in check.detail
+    assert format_checks([check]).startswith("WARN  review-inputs:")
 
 
 @pytest.fixture(autouse=True)

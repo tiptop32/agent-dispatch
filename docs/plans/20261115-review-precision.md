@@ -94,9 +94,9 @@ fail нестабильны (тот же ревьюер после раунда 
 - Modify: `agent_dispatch/doctor.py`
 - Modify: `tests/test_doctor.py`
 
-- [ ] `doctor` выдаёт WARN, если `<data_dir>/review_inputs/` вместе с `<data_dir>/patches/` больше 500 MB; автоматического удаления нет
-- [ ] Тесты `tests/test_doctor.py`: ниже порога OK, выше WARN, каталогов нет OK
-- [ ] Прогнать тесты, должны пройти
+- [x] `doctor` выдаёт WARN, если `<data_dir>/review_inputs/` вместе с `<data_dir>/patches/` больше 500 MB; автоматического удаления нет
+- [x] Тесты `tests/test_doctor.py`: ниже порога OK, выше WARN, каталогов нет OK
+- [x] Прогнать тесты, должны пройти
 
 ## Не делаем
 

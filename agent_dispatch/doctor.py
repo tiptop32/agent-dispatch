@@ -120,6 +120,11 @@ OMP_SOURCE_VALUE = "omp"
 #: Минимальная версия omp, с которой работает миграция и профиль x5.
 OMP_MIN_VERSION = "18.15.0"
 OMP_COMMAND = "omp"
+#: review_inputs (датасет разметки точности ревью) и patches не чистятся
+#: автоматически и растут на 1 MiB за ревью. 500 MB — запас на тысячи задач:
+#: ниже порога каталоги не мешают, выше — стоит размечать и выносить датасет
+#: вручную, пока диск не кончился.
+REVIEW_INPUTS_WARN_BYTES = 500 * 1024 * 1024
 X5_PROFILE_PROVIDER = "copilot-x5/"
 
 
@@ -315,6 +320,24 @@ def worktrees_check(settings: Settings) -> Check:
     )
 
 
+def review_inputs_check(settings: Settings) -> Check:
+    """Суммарный размер review_inputs и patches: автоматического удаления нет."""
+    data_dir = settings.server.data_dir
+    sizes = {
+        name: worktree.directory_size(data_dir / name) for name in ("review_inputs", "patches")
+    }
+    total = sum(sizes.values())
+    return Check(
+        name="review-inputs",
+        ok=True,
+        warning=total > REVIEW_INPUTS_WARN_BYTES,
+        detail=(
+            f"review_inputs {_format_size(sizes['review_inputs'])}, "
+            f"patches {_format_size(sizes['patches'])}"
+        ),
+    )
+
+
 async def _daemon_check(settings: Settings) -> Check:
     state = read_state(settings.server.data_dir)
     if state is None or not is_running(state):
@@ -362,6 +385,7 @@ async def run_checks(settings: Settings, online: bool = False) -> list[Check]:
     checks.append(_omp_version_check())
     checks.append(_omp_x5_profile_check())
     checks.append(worktrees_check(settings))
+    checks.append(review_inputs_check(settings))
     safe_env = child_env(settings)
     for name, executor in settings.executors.items():
         availability = await check_cli_version(name, executor.resolved_command, safe_env)
