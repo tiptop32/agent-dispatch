@@ -247,11 +247,11 @@ def review_input_patch(cwd: str | Path, files: list[str], *, limit: int) -> tupl
     }
     paths = []
     for name in files:
-        if not (name in tracked or (root / name).exists()):
+        if not (name in tracked or os.path.lexists(root / name)):
             name = os.path.relpath(Path(cwd).resolve() / name, root)
         # Пути нет ни в HEAD, ни на диске (удалённый неотслеживаемый файл): дифа
         # с HEAD у него нет, а git add упал бы на несовпавшем pathspec.
-        if name in tracked or (root / name).exists():
+        if name in tracked or os.path.lexists(root / name):
             paths.append(f":(top,literal){name}")
     if not paths:
         return b"", False
@@ -371,7 +371,7 @@ class DiffStatSnapshot:
 
     def _repo_path(self, name: str) -> str:
         # Adapter snapshots are repo-relative; reported paths may be cwd-relative.
-        if name in self.tracked or (Path(self.root) / name).exists():
+        if name in self.tracked or os.path.lexists(Path(self.root) / name):
             return name
         return os.path.relpath(self.cwd / name, self.root)
 

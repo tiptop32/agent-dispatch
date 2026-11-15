@@ -44,6 +44,16 @@ def test_review_input_patch_keeps_deletion_when_cwd_is_subdirectory(git_repo: Pa
     assert b"deleted file mode" in patch and b"pkg/b.py" in patch
 
 
+def test_review_input_patch_keeps_new_dangling_symlink(git_repo: Path) -> None:
+    cwd = _commit_subdir_file(git_repo)
+    (git_repo / "root-link").symlink_to("missing-target")
+    (cwd / "link").symlink_to("missing-target")
+    # Ссылка на отсутствующую цель существует: exists() смотрел на цель и терял её.
+    patch, _ = review_input_patch(cwd, ["root-link", "pkg/link"], limit=1 << 20)
+    assert b"new file mode 120000" in patch
+    assert b"root-link" in patch and b"pkg/link" in patch
+
+
 def test_review_input_patch_skips_path_missing_from_head_and_disk(git_repo: Path) -> None:
     (git_repo / "a.py").write_text("changed\n")
     patch, _ = review_input_patch(git_repo, ["a.py", "gone.py"], limit=1 << 20)
