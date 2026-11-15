@@ -608,3 +608,58 @@ async def test_recover_stale_does_not_point_to_a_removed_worktree(tmp_path, git_
     done = await storage.get_task(record.task_id)
     assert "worktree" not in done.result.meta
     assert done.result.meta["branch"] and done.result.meta["integrated"] is False
+
+
+@pytest.mark.asyncio
+async def test_fix_round_delta_uses_worktree_after_initial_commit(tmp_path, git_repo):
+    settings, storage, adapters, dispatcher = await _make(tmp_path, review_fix_rounds=1)
+    settings.executors["omp"].review_by = "reviewer"
+    settings.executors["reviewer"] = ExecutorSettings(adapter="omp", model="test/reviewer")
+    reviewer = FakeAdapter(
+        "reviewer",
+        result=ExecutionResult(
+            status="completed",
+            executor="reviewer",
+            model=None,
+            summary="fix last line",
+            verdict="fail",
+        ),
+    )
+    adapters["reviewer"] = reviewer
+    (git_repo / "caller.txt").write_text("caller dirt\n")
+
+    async def work(ctx):
+        adapters["omp"].result = ExecutionResult(
+            status="completed",
+            executor="omp",
+            model=None,
+            summary="done",
+            changed_files=["a.py"],
+            meta={"session_id": "work-session"},
+        )
+        if len(adapters["omp"].calls) == 1:
+            (Path(ctx.cwd) / "a.py").write_text("x = 2\ninitial = True\nbad = True\n")
+        else:
+            assert _git(Path(ctx.cwd), "show", "HEAD:a.py") == (
+                "x = 2\ninitial = True\nbad = True\n"
+            )
+            (Path(ctx.cwd) / "a.py").write_text("x = 2\ninitial = True\nfixed = True\n")
+            reviewer.result = reviewer.result.model_copy(update={"verdict": "pass"})
+
+    adapters["omp"].on_execute = work
+    try:
+        task = await dispatcher.submit(_req(git_repo))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == TaskStatus.completed
+        assert done.result.meta["fix_rounds"][0]["diff_stat"] == {
+            "files": 1,
+            "added": 1,
+            "removed": 1,
+        }
+        assert done.result.meta["diff_stat"] == {"files": 1, "added": 3, "removed": 1}
+        assert done.result.meta["integrated"] is True
+        assert (git_repo / "a.py").read_text() == "x = 2\ninitial = True\nfixed = True\n"
+        assert (git_repo / "caller.txt").read_text() == "caller dirt\n"
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()

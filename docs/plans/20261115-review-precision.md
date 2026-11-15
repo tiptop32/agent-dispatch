@@ -37,9 +37,9 @@ fail нестабильны (тот же ревьюер после раунда 
 - Modify: `tests/test_review_fix_round.py`
 - Modify: `tests/test_dispatcher_worktree.py`
 
-- [ ] `dispatcher.py`: `DiffStatSnapshot(tree.path if tree else req.cwd)` через `asyncio.to_thread` перед `_call_adapter` раунда (`:1234`); `fix_rounds[i].diff_stat` по `fixed.changed_files` после `_recover_report` (`:1246`); `close()` снимка на всех выходах, включая ранние `return` при supervision (`:1235-1239`, `:1247-1251`); `inherited_files` для раунда не нужен; при сбое снимка `fix_rounds[i].diff_stat_unavailable` с причиной (образец `:1042,1049`)
-- [ ] Тесты `tests/test_review_fix_round.py`: дельта только раунда; in_place с грязным файлом вызывающего (база включает грязь); сбой снимка; ранний выход supervision закрывает снимок. `tests/test_dispatcher_worktree.py`: worktree
-- [ ] Прогнать тесты, должны пройти
+- [x] `dispatcher.py`: `DiffStatSnapshot(tree.path if tree else req.cwd)` через `asyncio.to_thread` перед `_call_adapter` раунда (`:1234`); `fix_rounds[i].diff_stat` по `fixed.changed_files` после `_recover_report` (`:1246`); `close()` снимка на всех выходах, включая ранние `return` при supervision (`:1235-1239`, `:1247-1251`); `inherited_files` для раунда не нужен; при сбое снимка `fix_rounds[i].diff_stat_unavailable` с причиной (образец `:1042,1049`)
+- [x] Тесты `tests/test_review_fix_round.py`: дельта только раунда; in_place с грязным файлом вызывающего (база включает грязь); сбой снимка; ранний выход supervision закрывает снимок. `tests/test_dispatcher_worktree.py`: worktree
+- [x] Прогнать тесты, должны пройти
 
 ### Task 2: сохранённое состояние ревью
 **Depends on:** Task 1

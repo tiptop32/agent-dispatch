@@ -1231,23 +1231,66 @@ class Dispatcher:
                 }
             )
             started = time.monotonic()
-            fixed = await self._call_adapter(adapter, fix_ctx, decision)
-            if fixed.meta.get("supervision"):
-                fixed.changed_files = sorted(set(result.changed_files) | set(fixed.changed_files))
-                fixed.usage = report_recovery._usage(result.usage, fixed.usage)
-                return fixed
-            # A report-only reply cannot turn an interrupted repair into a success.
-            round_status, round_error = fixed.status, fixed.error
-            round_parse_error = fixed.meta.get("parse_error")
-            await self._note_executor_failure(record, decision, fixed)
-            if fixed.meta.get("parse_error") == "no result block":
-                fixed.meta.setdefault("session_id", session)
-            if report_recovery.needs_report(fixed):
-                fixed = await self._recover_report(record, decision, adapter, fix_ctx, fixed)
-            if fixed.meta.get("supervision"):
-                fixed.changed_files = sorted(set(result.changed_files) | set(fixed.changed_files))
-                fixed.usage = report_recovery._usage(result.usage, fixed.usage)
-                return fixed
+            round_stat: dict[str, object] = {}
+            snapshot_task = asyncio.create_task(
+                asyncio.to_thread(workspace.DiffStatSnapshot, tree.path if tree else req.cwd)
+            )
+            measurement_task = None
+            try:
+                try:
+                    round_snapshot = await asyncio.shield(snapshot_task)
+                except (OSError, subprocess.CalledProcessError) as exc:
+                    round_snapshot = None
+                    round_stat["diff_stat_unavailable"] = f"snapshot: {type(exc).__name__}: {exc}"
+                fixed = await self._call_adapter(adapter, fix_ctx, decision)
+                if fixed.meta.get("supervision"):
+                    fixed.changed_files = sorted(
+                        set(result.changed_files) | set(fixed.changed_files)
+                    )
+                    fixed.usage = report_recovery._usage(result.usage, fixed.usage)
+                    return fixed
+                # Ответ только с отчётом не делает прерванную правку успешной.
+                round_status, round_error = fixed.status, fixed.error
+                round_parse_error = fixed.meta.get("parse_error")
+                await self._note_executor_failure(record, decision, fixed)
+                if fixed.meta.get("parse_error") == "no result block":
+                    fixed.meta.setdefault("session_id", session)
+                if report_recovery.needs_report(fixed):
+                    fixed = await self._recover_report(record, decision, adapter, fix_ctx, fixed)
+                if fixed.meta.get("supervision"):
+                    fixed.changed_files = sorted(
+                        set(result.changed_files) | set(fixed.changed_files)
+                    )
+                    fixed.usage = report_recovery._usage(result.usage, fixed.usage)
+                    return fixed
+                if round_snapshot is not None:
+                    measurement_task = asyncio.create_task(
+                        asyncio.to_thread(round_snapshot.diff_stat, fixed.changed_files)
+                    )
+                    try:
+                        round_stat["diff_stat"] = await asyncio.shield(measurement_task)
+                    except (OSError, subprocess.CalledProcessError) as exc:
+                        round_stat["diff_stat_unavailable"] = (
+                            f"measurement: {type(exc).__name__}: {exc}"
+                        )
+            finally:
+                # Поток нельзя отменить: дожидаемся его даже при повторной
+                # отмене, иначе снимок потеряется или будет закрыт во время чтения.
+                cancellation = None
+                for operation in (snapshot_task, measurement_task):
+                    if operation is None:
+                        continue
+                    while not operation.done():
+                        try:
+                            await asyncio.shield(operation)
+                        except asyncio.CancelledError as exc:
+                            cancellation = exc
+                        except Exception:
+                            break
+                if not snapshot_task.cancelled() and snapshot_task.exception() is None:
+                    snapshot_task.result().close()
+                if cancellation is not None:
+                    raise cancellation
             usage = fixed.usage.model_dump() if fixed.usage else None
             files = list(dict.fromkeys([*result.changed_files, *fixed.changed_files]))
             meta = dict(result.meta)
@@ -1258,6 +1301,7 @@ class Dispatcher:
                 "verdict": "unknown",
                 "usage": usage,
                 "duration_s": time.monotonic() - started,
+                **round_stat,
             }
             meta.setdefault("fix_rounds", []).append(pending)
             if round_status != "completed":

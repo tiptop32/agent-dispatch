@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ from agent_dispatch.config import (
     ServerSettings,
     Settings,
 )
+from agent_dispatch.dispatch import dispatcher as dispatcher_module
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.executors.process import ProcessOutcome
 from agent_dispatch.executors.registry import AvailabilityCache
@@ -82,6 +85,21 @@ def request(repo, **updates):
     return DispatchRequest(task="repair the parser", cwd=str(repo), executor="worker", **updates)
 
 
+@pytest.fixture
+def round_snapshots(monkeypatch):
+    snapshots = []
+    real_snapshot = dispatcher_module.workspace.DiffStatSnapshot
+
+    def snapshot(cwd, **kwargs):
+        captured = real_snapshot(cwd, **kwargs)
+        if "inherited_files" not in kwargs:
+            snapshots.append(captured)
+        return captured
+
+    monkeypatch.setattr(dispatcher_module.workspace, "DiffStatSnapshot", snapshot)
+    return snapshots
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("workspace_mode", ["in_place", "worktree"])
 async def test_failed_review_resumes_and_merges_the_fix(tmp_path, git_repo, workspace_mode):
@@ -117,6 +135,7 @@ async def test_failed_review_resumes_and_merges_the_fix(tmp_path, git_repo, work
     assert repair["stage"] == "first" and repair["round"] == 1
     assert repair["verdict"] == "pass"
     assert repair["usage"]["cost_usd"] == 0.2
+    assert repair["diff_stat"] == {"files": 1, "added": 1, "removed": 0}
     assert len(adapters["first"].calls) == 2
     assert not adapters["senior"].calls
     assert (git_repo / "a.py").read_text() == "x = 2\n"
@@ -196,7 +215,9 @@ async def test_disabled_unknown_and_budget_do_not_start_fix(
 
 
 @pytest.mark.asyncio
-async def test_parent_cancellation_interrupts_fix_and_prod_rule_is_present(tmp_path, git_repo):
+async def test_parent_cancellation_interrupts_fix_and_prod_rule_is_present(
+    tmp_path, git_repo, round_snapshots
+):
     storage, adapters, dispatcher = await make_dispatcher(tmp_path, corporate=True)
     adapters["first"].result = result("first", verdict="fail", changed_files=[])
     fixing = asyncio.Event()
@@ -214,6 +235,8 @@ async def test_parent_cancellation_interrupts_fix_and_prod_rule_is_present(tmp_p
     assert adapters["worker"].cancelled
     assert (await storage.get_task(task.task_id)).status == TaskStatus.cancelled
     assert len(adapters["first"].calls) == 1
+    [snapshot] = round_snapshots
+    assert not await asyncio.to_thread(Path(snapshot.temp.name).exists)
     await storage.close()
 
 
@@ -433,6 +456,197 @@ async def test_fix_failure_preserves_work_and_escalation_reason(
             review = post_review(load(tmp_path / "db.sqlite"))
             assert review["verdicts"]["fail"] == 1
             assert review["review_failed"]["escalated"] == 1
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dirty", [False, True])
+@pytest.mark.parametrize("edits", [False, True])
+async def test_round_delta_excludes_initial_work_and_caller_dirt(tmp_path, git_repo, dirty, edits):
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path, rounds=2)
+    if dirty:
+        (git_repo / "a.py").write_text("caller = 1\ncaller = 2\n")
+    initial = (git_repo / "a.py").read_text() + "initial = True\n"
+    adapters["first"].result = result("first", changed_files=[], verdict="fail")
+
+    async def work(ctx):
+        call = len(adapters["worker"].calls)
+        if call == 1:
+            (Path(ctx.cwd) / "a.py").write_text(initial)
+        else:
+            if edits:
+                with (Path(ctx.cwd) / "a.py").open("a") as output:
+                    output.write(f"repair_{call} = True\n")
+            if call == 3:
+                adapters["first"].result = result("first", changed_files=[], verdict="pass")
+
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(request(git_repo))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == TaskStatus.completed
+        assert [row["diff_stat"] for row in done.result.meta["fix_rounds"]] == [
+            {"files": int(edits), "added": int(edits), "removed": 0},
+            {"files": int(edits), "added": int(edits), "removed": 0},
+        ]
+        assert done.result.meta["diff_stat"] == {
+            "files": 1,
+            "added": 1 + 2 * int(edits),
+            "removed": 0,
+        }
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["snapshot", "measurement"])
+@pytest.mark.parametrize("error_type", [OSError, subprocess.CalledProcessError])
+async def test_round_snapshot_failure_is_reported(
+    tmp_path, git_repo, monkeypatch, round_snapshots, phase, error_type
+):
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path)
+    adapters["first"].result = result("first", changed_files=[], verdict="fail")
+    real_snapshot = dispatcher_module.workspace.DiffStatSnapshot
+    error = OSError("stat unavailable") if error_type is OSError else error_type(1, "git")
+
+    def fail(*args):
+        raise error
+
+    def snapshot(cwd, **kwargs):
+        if "inherited_files" in kwargs:
+            return real_snapshot(cwd, **kwargs)
+        if phase == "snapshot":
+            raise error
+        captured = real_snapshot(cwd)
+        captured.diff_stat = fail
+        return captured
+
+    monkeypatch.setattr(dispatcher_module.workspace, "DiffStatSnapshot", snapshot)
+
+    async def work(ctx):
+        if len(adapters["worker"].calls) == 2:
+            adapters["first"].result = result("first", changed_files=[], verdict="pass")
+
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(request(git_repo))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == TaskStatus.completed
+        [row] = done.result.meta["fix_rounds"]
+        assert row["diff_stat_unavailable"] == f"{phase}: {type(error).__name__}: {error}"
+        assert "diff_stat" not in row
+        assert "diff_stat" in done.result.meta
+        for captured in round_snapshots:
+            assert not await asyncio.to_thread(Path(captured.temp.name).exists)
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["snapshot", "measurement"])
+async def test_round_cancellation_waits_for_snapshot_thread_before_closing(
+    tmp_path, git_repo, monkeypatch, round_snapshots, phase
+):
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path)
+    adapters["first"].result = result("first", changed_files=[], verdict="fail")
+    entered, release = threading.Event(), threading.Event()
+    real_snapshot = dispatcher_module.workspace.DiffStatSnapshot
+    thread_finished = []
+
+    def snapshot(cwd, **kwargs):
+        captured = real_snapshot(cwd, **kwargs)
+        if "inherited_files" in kwargs:
+            return captured
+        real_measure = captured.diff_stat
+
+        def blocked():
+            entered.set()
+            assert release.wait(5), "snapshot thread was not released"
+            assert Path(captured.temp.name).is_dir()
+            thread_finished.append(True)
+
+        if phase == "snapshot":
+            blocked()
+        else:
+
+            def measure(files):
+                blocked()
+                return real_measure(files)
+
+            captured.diff_stat = measure
+        return captured
+
+    monkeypatch.setattr(dispatcher_module.workspace, "DiffStatSnapshot", snapshot)
+    cancelling = None
+    try:
+        task = await dispatcher.submit(request(git_repo))
+        assert await asyncio.to_thread(entered.wait, 5)
+        cancelling = asyncio.create_task(dispatcher.cancel(task.task_id))
+        # Даём отмене дойти до finally, пока фоновый поток удерживает снимок.
+        await asyncio.sleep(0.05)
+        assert not cancelling.done()
+        assert await asyncio.to_thread(Path(round_snapshots[0].temp.name).is_dir)
+        release.set()
+        done = await asyncio.wait_for(cancelling, 5)
+        assert done.status == TaskStatus.cancelled
+        assert thread_finished == [True]
+        assert not await asyncio.to_thread(Path(round_snapshots[0].temp.name).exists)
+        if phase == "snapshot":
+            assert len(adapters["worker"].calls) == 1
+    finally:
+        release.set()
+        if cancelling is not None:
+            await cancelling
+        await dispatcher.shutdown()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_at", ["adapter", "recovery", "failure_note"])
+async def test_round_snapshot_closes_on_supervision_and_failure(
+    tmp_path, git_repo, monkeypatch, round_snapshots, exit_at
+):
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path)
+    adapters["first"].result = result("first", changed_files=[], verdict="fail")
+
+    async def work(ctx):
+        if len(adapters["worker"].calls) == 2:
+            adapters["worker"].result = result(
+                status="partial",
+                meta={"supervision": {"reason": "stop"}}
+                if exit_at == "adapter"
+                else {"session_id": "work-session", "parse_error": "no result block"},
+            )
+
+    async def recover(record, decision, adapter, ctx, fixed):
+        fixed.meta["supervision"] = {"reason": "stop"}
+        return fixed
+
+    real_note = dispatcher._note_executor_failure
+
+    async def note(record, decision, fixed):
+        if round_snapshots:
+            raise RuntimeError("failure note unavailable")
+        await real_note(record, decision, fixed)
+
+    if exit_at == "recovery":
+        monkeypatch.setattr(dispatcher, "_recover_report", recover)
+    elif exit_at == "failure_note":
+        monkeypatch.setattr(dispatcher, "_note_executor_failure", note)
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(request(git_repo, allow_escalation=False))
+        done = await dispatcher.wait(task.task_id, 10)
+        [snapshot] = round_snapshots
+        assert not await asyncio.to_thread(Path(snapshot.temp.name).exists)
+        if exit_at == "failure_note":
+            assert "failure note unavailable" in done.result.error
+        else:
+            assert done.result.meta["supervision"]["reason"] == "stop"
     finally:
         await dispatcher.shutdown()
         await storage.close()
