@@ -1199,6 +1199,25 @@ def recommendations(report: dict) -> list[dict[str, str]]:
                 ),
             }
         )
+    for reviewer, stability in report.get("review_stability", {}).get("by_reviewer", {}).items():
+        if (
+            stability["measured_pass"] >= REVIEW_STABILITY_MIN_SAMPLES
+            and stability["unstable_share"] > REVIEW_UNSTABLE_SHARE
+        ):
+            result.append(
+                {
+                    "priority": "WARN",
+                    "metric": "review_stability.unstable_share",
+                    "action": (
+                        f"Разобрать нестабильные fail ревьюера {reviewer}: pass без правок "
+                        "не доказывает ложность первого fail; решение принимает человек."
+                    ),
+                    "evidence": (
+                        f"{reviewer}: {stability['unstable']}/{stability['measured_pass']} "
+                        f"измеренных pass после правки ({stability['unstable_share']:.0%})"
+                    ),
+                }
+            )
     feedback_info = report.get("feedback", {})
     if feedback_info.get("eligible", 0) and feedback_info.get("labeled", 0) == 0:
         result.append(
@@ -1610,6 +1629,122 @@ def review_stages(tasks: list[Task]) -> dict:
             "baseline_fail_share": 0.43,
         },
     }
+
+
+def _review_fail_outcome(
+    row: dict, rounds: list[dict], reviews: list[dict], task: Task
+) -> tuple[str, dict | None]:
+    reviewer, next_round = row["by"], row["round"] + 1
+    fix = next(
+        (
+            item
+            for item in rounds
+            if item.get("trigger") == "review_failed"
+            and item.get("stage") == reviewer
+            and item.get("round") == next_round
+        ),
+        None,
+    )
+    if fix is None:
+        return "no_round", None
+    if "status" in fix and fix["status"] != "completed":
+        return "round_failed", fix
+    rereview = next(
+        (item for item in reviews if item["by"] == reviewer and item["round"] == next_round),
+        None,
+    )
+    if rereview is None:
+        verify_failed = any(
+            item.get("trigger") == "verification_failed" and item.get("round", 0) > next_round
+            for item in rounds
+        ) or bool(
+            task.result and task.result.verification and task.result.verification.result == "failed"
+        )
+        return ("verify_failed_after" if verify_failed else "rereview_unknown"), fix
+    verdict = rereview.get("verdict")
+    if verdict in ("unknown", "skipped"):
+        return "rereview_unknown", fix
+    if verdict == "fail":
+        return "still_fail", fix
+    diff = fix.get("diff_stat")
+    if not isinstance(diff, dict):
+        return "unmeasured", fix
+    if diff["files"] == 0:
+        return "unstable", fix
+    if diff["added"] + diff["removed"] <= SMALL_FIX_LINES:
+        return "small_fix", fix
+    return "fixed", fix
+
+
+def review_stability(tasks: list[Task]) -> dict:
+    """Каждый fail имеет один исход; цена unstable уже входит в fix_round.round_cost."""
+    totals: Counter[str] = Counter()
+    reviewers: dict[str, Counter[str]] = {}
+    costs: list[float] = []
+    reviewer_costs: dict[str, list[float]] = {}
+    for task in tasks:
+        rows = [
+            row
+            for row in _meta_rows(task, "review_stages")
+            if isinstance(row.get("by"), str)
+            and row["by"]
+            and isinstance(row.get("round"), int)
+            and row.get("verdict") in _REVIEW_VERDICTS
+        ]
+        rounds = _meta_rows(task, "fix_rounds")
+        for row in rows:
+            if row["verdict"] != "fail":
+                continue
+            outcome, fix = _review_fail_outcome(row, rounds, rows, task)
+            name = row["by"]
+            totals[outcome] += 1
+            reviewers.setdefault(name, Counter())[outcome] += 1
+            if outcome == "unstable":
+                usage = fix.get("usage")
+                cost = _known_cost(usage.get("cost_usd")) if isinstance(usage, dict) else None
+                if cost is not None:
+                    costs.append(cost)
+                    reviewer_costs.setdefault(name, []).append(cost)
+
+    def summary(counts: Counter[str], prices: list[float]) -> dict:
+        measured = sum(counts[key] for key in ("unstable", "small_fix", "fixed"))
+        return {
+            "fails": sum(counts.values()),
+            **{key: counts[key] for key in _REVIEW_STABILITY_OUTCOMES},
+            "measured_pass": measured,
+            "unstable_share": counts["unstable"] / measured if measured else None,
+            "unstable_cost": _cost_summary(prices),
+        }
+
+    return {
+        **summary(totals, costs),
+        "by_reviewer": {
+            name: summary(counts, reviewer_costs.get(name, []))
+            for name, counts in sorted(reviewers.items())
+        },
+    }
+
+
+_REVIEW_STABILITY_OUTCOMES = (
+    "no_round",
+    "round_failed",
+    "verify_failed_after",
+    "rereview_unknown",
+    "still_fail",
+    "unmeasured",
+    "unstable",
+    "small_fix",
+    "fixed",
+)
+
+#: Пять строк отделяют точечную правку от более крупной, но не доказывают её сложность.
+#: Это описательная корзина, а не оценка истинности замечания ревьюера.
+SMALL_FIX_LINES = 5
+
+#: Более пятой части pass без правок достаточно для ручного разбора ревьюера.
+#: Минимум десять измеренных pass не даёт единичному случаю создавать предупреждение.
+REVIEW_UNSTABLE_SHARE = 0.20
+REVIEW_STABILITY_MIN_SAMPLES = 10
 
 
 #: Вердикты ревью `review_by` в порядке вывода.
@@ -2150,6 +2285,23 @@ def render(report: dict) -> str:
         lines += [
             f"  {name}: failed {row['failed']} of {row['reached']} works reached "
             f"({_pct(row['fail_share'])})"
+            for name, row in info["by_reviewer"].items()
+        ]
+    if "review_stability" in report:
+        info = report["review_stability"]
+        lines.append(
+            f"review stability: {info['fails']} fail verdicts, "
+            f"unstable {info['unstable']} of {info['measured_pass']} measured pass "
+            f"({_pct(info['unstable_share'])}); "
+            f"unstable round cost ${info['unstable_cost']['cost_usd']:.4f} "
+            "(subset of fix rounds, not additive)"
+        )
+        lines += [
+            f"  {name}: "
+            + ", ".join(f"{key} {row[key]}" for key in _REVIEW_STABILITY_OUTCOMES)
+            + f"; unstable share {_pct(row['unstable_share'])}, "
+            f"unstable round cost ${row['unstable_cost']['cost_usd']:.4f} "
+            f"({row['unstable_cost']['samples']} priced)"
             for name, row in info["by_reviewer"].items()
         ]
     if "post_review" in report:

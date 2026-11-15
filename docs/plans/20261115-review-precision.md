@@ -65,19 +65,19 @@ fail нестабильны (тот же ревьюер после раунда 
 - Modify: `evals/replay/__main__.py`
 - Modify: `tests/test_replay.py`
 
-- [ ] Единица подсчёта: каждая строка `review_stages` с `verdict: fail` (и первичная, и повторная). Её исход определяет раунд `fix_rounds[j]`, где `trigger == review_failed`, `stage == by` и `round == row.round + 1` (у первичной строки `round: 0`, пишется на `:1191`; поля `round`/`stage`/`trigger` появились одним коммитом 2243e93, строк без `round` нет; фикстуры тестов строятся с `round: 0`). Так каждый fail-вердикт считается один раз: `still_fail` это исход одной единицы, а сама повторная fail-строка становится следующей единицей
-- [ ] Исходы проверяются по порядку, первый подошедший выигрывает:
+- [x] Единица подсчёта: каждая строка `review_stages` с `verdict: fail` (и первичная, и повторная). Её исход определяет раунд `fix_rounds[j]`, где `trigger == review_failed`, `stage == by` и `round == row.round + 1` (у первичной строки `round: 0`, пишется на `:1191`; поля `round`/`stage`/`trigger` появились одним коммитом 2243e93, строк без `round` нет; фикстуры тестов строятся с `round: 0`). Так каждый fail-вердикт считается один раз: `still_fail` это исход одной единицы, а сама повторная fail-строка становится следующей единицей
+- [x] Исходы проверяются по порядку, первый подошедший выигрывает:
   1. `no_round`: раунда нет (бюджет, нет сессии, `_budget_stop`, бюджет потрачен на verify, выход supervision до записи раунда `:1237,1248`; причина не хранится, корзина одна)
   2. `round_failed`: `fix_rounds[j].status` есть и не `completed` (`:1264`)
   3. `verify_failed_after`: повторной строки `review_stages[round == j, by == stage]` нет, и дальше идёт раунд с `trigger == verification_failed` или финальный `verification.result == failed`
   4. `rereview_unknown`: повторная строка `unknown`/`skipped` или повторной строки нет без признаков п. 3
   5. `still_fail`: повторная строка `fail`
   6. повторная строка `pass`: `unmeasured`, если нет `fix_rounds[j].diff_stat`; иначе `unstable` (0 файлов), `small_fix` (`added + removed ≤ SMALL_FIX_LINES = 5`, комментарий «почему 5»), `fixed`
-- [ ] `unstable_share = unstable / (unstable + small_fix + fixed)`: знаменатель это измеренные pass после правки
-- [ ] Разбивка по имени ревьюера; стоимость `unstable` как подмножество `fix_round.round_cost`, не складывается
-- [ ] `recommendations`: WARN при `unstable_share` > 0.2 и знаменателе не меньше 10; рядом комментарий с обоснованием, как у `REVIEW_SKIPPED_SHARE` (`harness.py:1688`)
-- [ ] Тесты `tests/test_replay.py`: каждый исход; порядок исходов; `still_fail` при исчерпанном бюджете считается двумя единицами (`still_fail`, затем `no_round`), а не дважды одной; старая строка без `diff_stat` с исходом `still_fail` не попадает в `unmeasured`; multi-stage; порог WARN
-- [ ] Прогнать тесты, должны пройти
+- [x] `unstable_share = unstable / (unstable + small_fix + fixed)`: знаменатель это измеренные pass после правки
+- [x] Разбивка по имени ревьюера; стоимость `unstable` как подмножество `fix_round.round_cost`, не складывается
+- [x] `recommendations`: WARN при `unstable_share` > 0.2 и знаменателе не меньше 10; рядом комментарий с обоснованием, как у `REVIEW_SKIPPED_SHARE` (`harness.py:1688`)
+- [x] Тесты `tests/test_replay.py`: каждый исход; порядок исходов; `still_fail` при исчерпанном бюджете считается двумя единицами (`still_fail`, затем `no_round`), а не дважды одной; старая строка без `diff_stat` с исходом `still_fail` не попадает в `unmeasured`; multi-stage; порог WARN
+- [x] Прогнать тесты, должны пройти
 
 ### Task 4: документация
 **Depends on:** Task 3, Task 5

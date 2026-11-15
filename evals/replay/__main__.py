@@ -31,6 +31,7 @@ from .harness import (
     recommendations,
     render,
     replay,
+    review_stability,
     review_stages,
     router_vs_static,
     successor,
@@ -145,6 +146,7 @@ def main() -> int:
     report["handoff"] = handoff(tasks)
     report["fix_round"] = fix_round(tasks)
     report["review_stages"] = review_stages(tasks)
+    report["review_stability"] = review_stability(tasks)
     # Один locator на прогон: дифы эксперимента судятся второй раз из кэша.
     locator = GitLocator()
     if not args.no_git:

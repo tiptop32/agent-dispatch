@@ -41,6 +41,7 @@ from evals.replay.harness import (
     recommendations,
     render,
     replay,
+    review_stability,
     review_stages,
     router_vs_static,
     timeouts,
@@ -2081,6 +2082,249 @@ def test_review_stages_use_unique_work_denominators_and_final_round_outcomes():
     assert review_stages([])["paid"]["fail_share"] is None
 
 
+def _stability_task(task_id="stability", *, reviews=None, rounds=None, verify_failed=False):
+    return _task(
+        task_id,
+        "partial",
+        result={
+            **_result(
+                "partial",
+                meta={
+                    "review_stages": (
+                        reviews
+                        if reviews is not None
+                        else [{"by": "reviewer", "verdict": "fail", "round": 0}]
+                    ),
+                    "fix_rounds": rounds or [],
+                },
+            ),
+            "verification": {"result": "failed" if verify_failed else "passed", "commands": []},
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "fix_overrides,rereview,verify_failed,later_rounds,expected",
+    [
+        (None, "pass", True, [], "no_round"),
+        ({"trigger": "verification_failed"}, "pass", False, [], "no_round"),
+        ({"stage": "other"}, "pass", False, [], "no_round"),
+        ({"round": 2}, "pass", False, [], "no_round"),
+        ({"status": "failed"}, "pass", True, [], "round_failed"),
+        ({"status": "partial"}, None, True, [], "round_failed"),
+        ({}, None, True, [], "verify_failed_after"),
+        (
+            {},
+            None,
+            False,
+            [{"round": 2, "trigger": "verification_failed"}],
+            "verify_failed_after",
+        ),
+        (
+            {},
+            None,
+            False,
+            [{"round": 0, "trigger": "verification_failed"}],
+            "rereview_unknown",
+        ),
+        ({}, None, False, [], "rereview_unknown"),
+        ({}, "unknown", True, [], "rereview_unknown"),
+        ({}, "skipped", True, [], "rereview_unknown"),
+        ({}, "fail", True, [], "still_fail"),
+        ({"diff_stat": None}, "fail", False, [], "still_fail"),
+        ({"diff_stat": None}, "pass", False, [], "unmeasured"),
+        ({"diff_stat_unavailable": "snapshot"}, "pass", False, [], "unmeasured"),
+        ({"diff_stat": {"files": 0, "added": 0, "removed": 0}}, "pass", True, [], "unstable"),
+        ({"diff_stat": {"files": 1, "added": 0, "removed": 0}}, "pass", False, [], "small_fix"),
+        ({"diff_stat": {"files": 1, "added": 2, "removed": 3}}, "pass", False, [], "small_fix"),
+        ({"diff_stat": {"files": 1, "added": 2, "removed": 4}}, "pass", False, [], "fixed"),
+        ({"status": "completed"}, "pass", False, [], "unmeasured"),
+    ],
+)
+def test_review_stability_outcomes_follow_precedence(
+    fix_overrides, rereview, verify_failed, later_rounds, expected
+):
+    rounds = []
+    if fix_overrides is not None:
+        rounds.append(
+            {
+                "round": 1,
+                "trigger": "review_failed",
+                "stage": "reviewer",
+                # Вердикт раунда не заменяет вердикт повторного ревью.
+                "verdict": "pass" if rereview != "pass" else "fail",
+                **fix_overrides,
+            }
+        )
+    rounds += later_rounds
+    reviews = [{"by": "reviewer", "verdict": "fail", "round": 0}]
+    if rereview:
+        reviews.append({"by": "reviewer", "verdict": rereview, "round": 1})
+    report = review_stability(
+        [_stability_task(reviews=reviews, rounds=rounds, verify_failed=verify_failed)]
+    )
+
+    # Повторный fail при исчерпанном бюджете сам становится единицей no_round.
+    extra_fail = int(rereview == "fail")
+    outcomes = {
+        key: report[key]
+        for key in (
+            "no_round",
+            "round_failed",
+            "verify_failed_after",
+            "rereview_unknown",
+            "still_fail",
+            "unmeasured",
+            "unstable",
+            "small_fix",
+            "fixed",
+        )
+        if report[key]
+    }
+    expected_counts = {expected: 1}
+    if extra_fail:
+        expected_counts["no_round"] = expected_counts.get("no_round", 0) + 1
+    assert outcomes == expected_counts
+    assert report["fails"] == 1 + extra_fail
+    measured = int(expected in ("unstable", "small_fix", "fixed"))
+    assert report["measured_pass"] == measured
+    assert report["unstable_share"] == (int(expected == "unstable") if measured else None)
+    assert report["by_reviewer"]["reviewer"]["fails"] == report["fails"]
+
+
+def test_review_stability_matches_reviewer_and_round_and_keeps_cost_a_subset():
+    task = _stability_task(
+        reviews=[
+            {"by": "first", "verdict": "fail", "round": 0},
+            {"by": "first", "verdict": "pass", "round": 1},
+            {"by": "second", "verdict": "fail", "round": 1},
+            {"by": "second", "verdict": "fail", "round": 2},
+            {"by": "second", "verdict": "pass", "round": 3},
+        ],
+        rounds=[
+            {
+                "round": 1,
+                "trigger": "review_failed",
+                "stage": "first",
+                "verdict": "pass",
+                "diff_stat": {"files": 0, "added": 0, "removed": 0},
+                "usage": {"cost_usd": 0.2},
+            },
+            {
+                "round": 2,
+                "trigger": "review_failed",
+                "stage": "second",
+                "verdict": "fail",
+                "usage": {"cost_usd": 0.3},
+            },
+            {
+                "round": 3,
+                "trigger": "review_failed",
+                "stage": "second",
+                "verdict": "pass",
+                "diff_stat": {"files": 2, "added": 6, "removed": 1},
+                "usage": {"cost_usd": 0.5},
+            },
+        ],
+    )
+    report = review_stability([task])
+    assert report["fails"] == 3
+    assert (report["unstable"], report["still_fail"], report["fixed"], report["unmeasured"]) == (
+        1,
+        1,
+        1,
+        0,
+    )
+    assert report["measured_pass"] == 2
+    assert report["unstable_share"] == 0.5
+    assert report["by_reviewer"]["first"]["unstable_share"] == 1
+    assert report["by_reviewer"]["second"]["unstable_share"] == 0
+    assert report["by_reviewer"]["second"]["still_fail"] == 1
+    assert report["unstable_cost"] == {"samples": 1, "cost_usd": 0.2, "avg_usd": 0.2}
+    assert report["by_reviewer"]["first"]["unstable_cost"] == report["unstable_cost"]
+    assert fix_round([task])["round_cost"]["cost_usd"] == 1.0
+
+
+def test_review_stability_empty_legacy_and_unknown_cost_are_not_zero_measurements():
+    legacy = _stability_task(reviews=[None, "secret", {"by": [], "verdict": []}])
+    empty = review_stability([legacy, _task("no-result", "failed")])
+    assert empty["fails"] == 0
+    assert empty["unstable_share"] is None
+    assert empty["by_reviewer"] == {}
+    rounds = [
+        {
+            "round": 1,
+            "trigger": "review_failed",
+            "stage": "reviewer",
+            "diff_stat": {"files": 0, "added": 0, "removed": 0},
+        }
+    ]
+    reviews = [
+        {"by": "reviewer", "verdict": "fail", "round": 0},
+        {"by": "reviewer", "verdict": "pass", "round": 1},
+    ]
+    tasks = [_stability_task(reviews=reviews, rounds=rounds)]
+    report = review_stability(tasks)
+    assert report["unstable"] == 1
+    assert report["unstable_cost"] == {"samples": 0, "cost_usd": 0, "avg_usd": None}
+    rounds[0]["usage"] = {"cost_usd": 0}
+    report = review_stability([_stability_task(reviews=reviews, rounds=rounds)])
+    assert report["unstable_cost"] == {"samples": 1, "cost_usd": 0, "avg_usd": 0}
+
+
+@pytest.mark.parametrize(
+    "unstable,measured,warning", [(3, 9, False), (2, 10, False), (3, 10, True)]
+)
+def test_review_stability_warn_requires_share_and_measured_sample(unstable, measured, warning):
+    tasks = []
+    for index in range(measured):
+        tasks.append(
+            _stability_task(
+                str(index),
+                reviews=[
+                    {"by": "reviewer", "verdict": "fail", "round": 0},
+                    {"by": "reviewer", "verdict": "pass", "round": 1},
+                ],
+                rounds=[
+                    {
+                        "round": 1,
+                        "trigger": "review_failed",
+                        "stage": "reviewer",
+                        "diff_stat": {"files": int(index >= unstable), "added": 6, "removed": 0},
+                    }
+                ],
+            )
+        )
+    # Неизмеренные исходы не размывают долю и не пополняют минимальную выборку.
+    tasks += [_stability_task(f"no-round-{index}") for index in range(20)]
+    # Стабильный сосед не должен скрывать превышение порога у другого ревьюера.
+    for index in range(10):
+        tasks.append(
+            _stability_task(
+                f"other-{index}",
+                reviews=[
+                    {"by": "other", "verdict": "fail", "round": 0},
+                    {"by": "other", "verdict": "pass", "round": 1},
+                ],
+                rounds=[
+                    {
+                        "round": 1,
+                        "trigger": "review_failed",
+                        "stage": "other",
+                        "diff_stat": {"files": 1, "added": 6, "removed": 0},
+                    }
+                ],
+            )
+        )
+    report = {"review_stability": review_stability(tasks)}
+    actions = recommendations(report)
+    assert bool(actions) is warning
+    if warning:
+        assert actions[0]["priority"] == "WARN"
+        assert actions[0]["metric"] == "review_stability.unstable_share"
+        assert "reviewer: 3/10" in actions[0]["evidence"]
+
+
 @pytest.mark.parametrize("as_json", [False, True])
 def test_replay_command_outputs_new_sections(tmp_path, monkeypatch, capsys, as_json):
     import sys
@@ -2097,7 +2341,26 @@ def test_replay_command_outputs_new_sections(tmp_path, monkeypatch, capsys, as_j
                 "10:01",
                 1,
                 None,
-                _result("failed", meta={"watchdog": {"reason": "idle", "tool_open": True}}),
+                _result(
+                    "failed",
+                    meta={
+                        "watchdog": {"reason": "idle", "tool_open": True},
+                        "review_stages": [
+                            {"by": "reviewer", "verdict": "fail", "round": 0},
+                            {"by": "reviewer", "verdict": "pass", "round": 1},
+                        ],
+                        "fix_rounds": [
+                            {
+                                "round": 1,
+                                "trigger": "review_failed",
+                                "stage": "reviewer",
+                                "verdict": "pass",
+                                "usage": {"cost_usd": 0.25},
+                                "diff_stat": {"files": 0, "added": 0, "removed": 0},
+                            }
+                        ],
+                    },
+                ),
             ),
         ],
     )
@@ -2134,11 +2397,16 @@ def test_replay_command_outputs_new_sections(tmp_path, monkeypatch, capsys, as_j
         assert report["caller_bytes"]["median_bytes"] == 123
         assert report["watchdog"]["idle"] == 1
         assert report["handoff"]["count"] == 0
-        assert report["fix_round"]["rounds"] == 0
-        assert report["review_stages"]["works"] == 0
+        assert report["fix_round"]["rounds"] == 1
+        assert report["review_stages"]["works"] == 1
+        assert report["review_stability"]["unstable_share"] == 1
+        assert report["review_stability"]["by_reviewer"]["reviewer"]["unstable"] == 1
     else:
         assert "caller bytes (MCP responses): 1 of 1 roots" in text
         assert "watchdog: 1, idle 1" in text
         assert "handoff: 0 transferred" in text
-        assert "fix rounds: 0" in text
-        assert "review stages: 0 works" in text
+        assert "fix rounds: 1" in text
+        assert "review stages: 1 works" in text
+        assert "review stability: 1 fail verdicts, unstable 1 of 1 measured pass (100%)" in text
+        assert "unstable round cost $0.2500 (subset of fix rounds, not additive)" in text
+        assert "  reviewer: no_round 0" in text
