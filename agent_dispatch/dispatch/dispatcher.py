@@ -1234,7 +1234,6 @@ class Dispatcher:
                     else ctx.timeout_seconds,
                 }
             )
-            started = time.monotonic()
             round_stat: dict[str, object] = {}
             snapshot_task = asyncio.create_task(
                 asyncio.to_thread(workspace.DiffStatSnapshot, tree.path if tree else req.cwd)
@@ -1246,6 +1245,9 @@ class Dispatcher:
                 except (OSError, subprocess.CalledProcessError) as exc:
                     round_snapshot = None
                     round_stat["diff_stat_unavailable"] = f"snapshot: {type(exc).__name__}: {exc}"
+                # duration_s меряет работу исполнителя, без снимка и замера дельты:
+                # git add -A по всей репе на большой копии сам занимает секунды.
+                started = time.monotonic()
                 fixed = await self._call_adapter(adapter, fix_ctx, decision)
                 if fixed.meta.get("supervision"):
                     fixed.changed_files = sorted(
@@ -1267,6 +1269,7 @@ class Dispatcher:
                     )
                     fixed.usage = report_recovery._usage(result.usage, fixed.usage)
                     return fixed
+                finished = time.monotonic()
                 if round_snapshot is not None:
                     measurement_task = asyncio.create_task(
                         asyncio.to_thread(round_snapshot.diff_stat, fixed.changed_files)
@@ -1304,7 +1307,7 @@ class Dispatcher:
                 "stage": stage,
                 "verdict": "unknown",
                 "usage": usage,
-                "duration_s": time.monotonic() - started,
+                "duration_s": finished - started,
                 **round_stat,
             }
             meta.setdefault("fix_rounds", []).append(pending)

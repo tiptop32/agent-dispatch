@@ -1,7 +1,53 @@
+import os
 import subprocess
 from pathlib import Path
 
-from agent_dispatch.executors.workspace import diff, fingerprint, is_git_repo, snapshot
+from agent_dispatch.executors.workspace import (
+    DiffStatSnapshot,
+    diff,
+    fingerprint,
+    is_git_repo,
+    review_input_patch,
+    snapshot,
+)
+
+
+def _commit_subdir_file(repo: Path) -> Path:
+    """Закоммитить pkg/b.py: удаление из подкаталога ломало разрешение путей."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "b.py").write_text("one\ntwo\n")
+    for args in (
+        ["add", "pkg/b.py"],
+        ["-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "pkg"],
+    ):
+        subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True)
+    return repo / "pkg"
+
+
+def test_diff_stat_counts_deleted_file_when_cwd_is_subdirectory(git_repo: Path) -> None:
+    cwd = _commit_subdir_file(git_repo)
+    snap = DiffStatSnapshot(cwd)
+    try:
+        (cwd / "b.py").unlink()
+        # Адаптер отдаёт пути от корня репы: pkg/b.py, а не b.py.
+        assert snap.diff_stat(["pkg/b.py"]) == {"files": 1, "added": 0, "removed": 2}
+    finally:
+        snap.close()
+
+
+def test_review_input_patch_keeps_deletion_when_cwd_is_subdirectory(git_repo: Path) -> None:
+    cwd = _commit_subdir_file(git_repo)
+    (cwd / "b.py").unlink()
+    patch, oversized = review_input_patch(cwd, ["pkg/b.py"], limit=1 << 20)
+    assert not oversized
+    assert b"deleted file mode" in patch and b"pkg/b.py" in patch
+
+
+def test_review_input_patch_skips_path_missing_from_head_and_disk(git_repo: Path) -> None:
+    (git_repo / "a.py").write_text("changed\n")
+    patch, _ = review_input_patch(git_repo, ["a.py", "gone.py"], limit=1 << 20)
+    assert b"a.py" in patch and b"gone.py" not in patch
 
 
 def test_is_git_repo_returns_true_for_git_repository(git_repo: Path) -> None:

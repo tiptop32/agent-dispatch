@@ -238,17 +238,23 @@ def review_input_patch(cwd: str | Path, files: list[str], *, limit: int) -> tupl
     objects = os.fsdecode(
         git("rev-parse", "--path-format=absolute", "--git-path", "objects")
     ).strip()
+    # --full-tree: из подкаталога ls-tree иначе отдаёт пути от cwd, и удалённый
+    # файл pkg/a.py не узнаётся как отслеживаемый.
     tracked = {
         os.fsdecode(name)
-        for name in git("ls-tree", "-r", "--name-only", "-z", "HEAD").split(b"\0")
+        for name in git("ls-tree", "-r", "--full-tree", "--name-only", "-z", "HEAD").split(b"\0")
         if name
     }
-    paths = [
-        f":(top,literal){name}"
-        if name in tracked or (root / name).exists()
-        else f":(top,literal){os.path.relpath(Path(cwd).resolve() / name, root)}"
-        for name in files
-    ]
+    paths = []
+    for name in files:
+        if not (name in tracked or (root / name).exists()):
+            name = os.path.relpath(Path(cwd).resolve() / name, root)
+        # Пути нет ни в HEAD, ни на диске (удалённый неотслеживаемый файл): дифа
+        # с HEAD у него нет, а git add упал бы на несовпавшем pathspec.
+        if name in tracked or (root / name).exists():
+            paths.append(f":(top,literal){name}")
+    if not paths:
+        return b"", False
     with tempfile.TemporaryDirectory(prefix="agent-dispatch-review-") as directory:
         temporary = Path(directory)
         (temporary / "objects").mkdir()
@@ -324,13 +330,15 @@ class DiffStatSnapshot:
                 check=True,
             )
         self.before = self._tree()
+        # Отслеживаемые пути нужны всегда: без них удалённый файл в подкаталоге
+        # (pkg/a.py при cwd=pkg) не существует на диске, и _repo_path дописал бы
+        # префикс второй раз, а замер вернул бы files=0.
         self.tracked: set[str] = set()
-        if inherited_files:
-            for args in (["ls-files", "-z"], ["ls-tree", "-r", "--name-only", "-z", "HEAD"]):
-                raw = subprocess.run(
-                    ["git", *args], cwd=self.root, env=self.env, capture_output=True, check=True
-                ).stdout
-                self.tracked.update(os.fsdecode(name) for name in raw.split(b"\0") if name)
+        for args in (["ls-files", "-z"], ["ls-tree", "-r", "--name-only", "-z", "HEAD"]):
+            raw = subprocess.run(
+                ["git", *args], cwd=self.root, env=self.env, capture_output=True, check=True
+            ).stdout
+            self.tracked.update(os.fsdecode(name) for name in raw.split(b"\0") if name)
         if inherited_files:
             # Only successfully inherited paths use HEAD as their baseline.
             # Preserve the caller's dirty baseline everywhere else, and never

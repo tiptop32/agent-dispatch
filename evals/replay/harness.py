@@ -1634,6 +1634,13 @@ def review_stages(tasks: list[Task]) -> dict:
 def _review_fail_outcome(
     row: dict, rounds: list[dict], reviews: list[dict], task: Task
 ) -> tuple[str, dict | None]:
+    """Исход одного fail-вердикта по раунду `row.round + 1` той же ступени.
+
+    Если после раунда упал verify, следующий раунд идёт по verify, и повторное
+    ревью приходит уже с его номером: исход здесь `verify_failed_after`, а pass
+    того ревью в `unstable`/`fixed` не попадает. Это граница по плану, а не потеря:
+    правка после verify меряет уже не замечание ревьюера.
+    """
     reviewer, next_round = row["by"], row["round"] + 1
     fix = next(
         (
