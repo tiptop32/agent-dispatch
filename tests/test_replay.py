@@ -171,6 +171,60 @@ def test_recommendations_prioritize_observed_waste_and_missing_instrumentation()
     assert "2/10" in items[0]["evidence"]
 
 
+@pytest.mark.parametrize(
+    "decisions,expected_share,warning",
+    [
+        ([], None, False),
+        (["continue", "stop"], 0.0, False),
+        (["error"] + ["continue"] * 8 + ["stop"], 0.10, False),
+        (["error", "error"] + ["continue"] * 7 + ["stop"], 0.20, True),
+    ],
+)
+def test_replay_supervision_error_share_counts_checks_and_warns_above_threshold(
+    tmp_path, decisions, expected_share, warning
+):
+    db = _db(
+        tmp_path,
+        [("root", "omp/sol", "10:00", "10:01", 1, None, _result("completed"))],
+    )
+    notes = [{"decision": decision, "check": check} for check, decision in enumerate(decisions, 1)]
+    # Baseline failures, cancellations and inherited stop notices are not checks.
+    notes += [
+        {"decision": "error", "check": 0},
+        {"decision": "cancelled"},
+        {"decision": "error", "check": 2, "origin": "parent"},
+    ]
+    with sqlite3.connect(db) as conn:
+        conn.executemany(
+            "insert into events (task_id, ts, kind, payload_json) "
+            "values ('root', '2026-09-23T10:00:30+00:00', 'supervision', ?)",
+            [(json.dumps(note),) for note in notes],
+        )
+    report = replay(load(db))
+    info = report["supervision"]
+    assert info["checks"] == len(decisions)
+    assert info["decisions"] == {
+        "continue": decisions.count("continue"),
+        "stop": decisions.count("stop"),
+        "error": decisions.count("error"),
+    }
+    assert info["error_share"] == expected_share
+    assert info["error_share_threshold"] == 0.10
+    assert info["error_share_exceeded"] is warning
+    actions = [
+        item for item in recommendations(report) if item["metric"] == "supervision.error_share"
+    ]
+    assert bool(actions) is warning
+    text = render(report)
+    assert (
+        f"supervision checks: {len(decisions)}, continue {decisions.count('continue')}, "
+        f"stop {decisions.count('stop')}, error {decisions.count('error')}" in text
+    )
+    share_text = "n/a" if expected_share is None else f"{expected_share:.0%}"
+    assert f"supervision error share: {share_text} (threshold 10%)" in text
+    assert ("WARNING: supervision error share exceeds threshold" in text) is warning
+
+
 @pytest.mark.parametrize("busy_seconds,expected", [(0, 0), (180, 1)])
 def test_replay_command_respects_busy_cooldown(
     tmp_path, monkeypatch, capsys, busy_seconds, expected

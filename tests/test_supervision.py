@@ -198,12 +198,12 @@ async def test_exit_or_external_cancel_during_check_joins_both_process_groups(
         ("wrong-model", 5, "supervisor model mismatch"),
     ],
 )
-async def test_unavailable_judgment_fails_closed_without_escalation(
+async def test_two_unavailable_judgments_stop_without_escalation(
     tmp_path, monkeypatch, git_repo, mode, check_timeout, reason
 ):
     async with running(tmp_path, monkeypatch, mode=mode, timeout_seconds=check_timeout) as (
         dispatcher,
-        _,
+        storage,
         adapters,
         control,
     ):
@@ -211,6 +211,20 @@ async def test_unavailable_judgment_fails_closed_without_escalation(
         done = await dispatcher.wait(task.task_id, 8)
         assert done.status == "failed"
         assert done.result.meta["failure_class"] == "supervision_error"
+        assert done.result.meta["error_code"] == "supervision_error"
+        assert done.result.meta["supervision"]["consecutive_errors"] == 2
+        assert done.result.meta["supervision"]["check"] == 2
+        assert done.result.meta["retryable"] is False
+        assert done.result.meta["escalation_suppressed"] == "supervision_error"
+        assert done.result.meta["supervision_usage"]["checks_started"] == 2
+        assert done.result.meta["supervision_usage"]["checks_finished"] == 2
+        notes = [
+            event["payload"]
+            for event in await storage.list_events(task.task_id)
+            if event["kind"] == "supervision"
+        ]
+        assert [note["decision"] for note in notes] == ["error", "error"]
+        assert [note["consecutive_errors"] for note in notes] == [1, 2]
         assert reason in done.result.error
         assert not dispatcher.availability.cooldowns()
         assert not adapters["other"].calls

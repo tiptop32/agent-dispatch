@@ -1654,7 +1654,7 @@ class Dispatcher:
                         )
 
                 async def emit(note: dict) -> None:
-                    if note.get("decision") in {"stop", "error"}:
+                    if supervision.stops_worker(note):
                         code = (
                             "supervision_stopped"
                             if note["decision"] == "stop"

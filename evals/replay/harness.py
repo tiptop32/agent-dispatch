@@ -95,7 +95,7 @@ class Task:
     started_at: datetime | None = None
     cwd: str = ""
     parent_task_id: str | None = None
-    #: События, которые читает replay (`slot`, `git`), в порядке записи.
+    #: События, которые читает replay, в порядке записи.
     events: list[dict] = field(default_factory=list)
     #: Общий git dir cwd из события `git` при `submit`; у задач до него None.
     git_common_dir: str | None = None
@@ -145,7 +145,7 @@ def load(db_path: Path) -> list[Task]:
         # Только нужные события: таблица растёт с каждой задачей.
         event_rows = conn.execute(
             "select task_id, ts, kind, payload_json from events"
-            " where kind in ('slot', 'git', 'feedback') order by id"
+            " where kind in ('slot', 'git', 'feedback', 'supervision') order by id"
         ).fetchall()
     finally:
         conn.close()
@@ -384,6 +384,31 @@ def _queue_policy(tasks: list[Task]) -> dict:
     }
 
 
+SUPERVISION_ERROR_SHARE = 0.10
+
+
+def supervision_metrics(tasks: list[Task]) -> dict:
+    """Count completed checks once, excluding baseline and descendant notifications."""
+    decisions = dict.fromkeys(("continue", "stop", "error"), 0)
+    for task in tasks:
+        for event in task.events:
+            if event["kind"] != "supervision":
+                continue
+            note = event["payload"]
+            decision = note.get("decision")
+            if decision in decisions and note.get("check", 0) > 0 and not note.get("origin"):
+                decisions[decision] += 1
+    checks = sum(decisions.values())
+    share = decisions["error"] / checks if checks else None
+    return {
+        "checks": checks,
+        "decisions": decisions,
+        "error_share": share,
+        "error_share_threshold": SUPERVISION_ERROR_SHARE,
+        "error_share_exceeded": share is not None and share > SUPERVISION_ERROR_SHARE,
+    }
+
+
 def replay(
     tasks: list[Task],
     cooldown: int = 900,
@@ -527,6 +552,7 @@ def replay(
         "queue_wait_by_limit_group": _queue_wait_by_limit_group(tasks),
         "queue_policy": _queue_policy(tasks),
         "prod": _prod_section(tasks, lineage),
+        "supervision": supervision_metrics(tasks),
         "section_windows": {
             "executor_failures": _window(failure_times),
             "avoidable_runs": _window(avoidable_times),
@@ -1137,6 +1163,22 @@ def recommendations(report: dict) -> list[dict[str, str]]:
                 "evidence": (
                     f"{timeout_info['unknown']} из {timeout_info['count']} таймаутов "
                     "нельзя классифицировать"
+                ),
+            }
+        )
+    supervision = report.get("supervision", {})
+    if supervision.get("error_share_exceeded"):
+        result.append(
+            {
+                "priority": "medium",
+                "metric": "supervision.error_share",
+                "action": (
+                    "Проверить провайдера надзора: сбой проверки не доказывает вину исполнителя."
+                ),
+                "evidence": (
+                    f"{supervision['decisions']['error']}/{supervision['checks']} проверок "
+                    f"без вердикта ({supervision['error_share']:.0%}), "
+                    f"порог {supervision['error_share_threshold']:.0%}"
                 ),
             }
         )
@@ -1933,6 +1975,18 @@ def render(report: dict) -> str:
         f"{report['review_only_failed']} failed, {report['review_only_minutes']} min"
         + window("review_only_runs")
     )
+    supervision = report["supervision"]
+    decisions = supervision["decisions"]
+    lines.append(
+        f"supervision checks: {supervision['checks']}, "
+        + ", ".join(f"{decision} {count}" for decision, count in decisions.items())
+    )
+    lines.append(
+        f"supervision error share: {_pct(supervision['error_share'])} "
+        f"(threshold {supervision['error_share_threshold']:.0%})"
+    )
+    if supervision["error_share_exceeded"]:
+        lines.append("WARNING: supervision error share exceeds threshold")
     waits = report["queue_wait_by_limit_group"]
     # Пустая секция без пояснения читается как «ожиданий не было», а это
     # значит лишь, что демон ещё не писал события `slot`.
