@@ -31,6 +31,7 @@ fail нестабильны (тот же ревьюер после раунда 
 ## Implementation Steps
 
 ### Task 1: дельта раунда
+**Depends on:** none
 **Files:**
 - Modify: `agent_dispatch/dispatch/dispatcher.py`
 - Modify: `tests/test_review_fix_round.py`
@@ -45,18 +46,16 @@ fail нестабильны (тот же ревьюер после раунда 
 **Files:**
 - Modify: `agent_dispatch/dispatch/dispatcher.py`
 - Modify: `agent_dispatch/executors/workspace.py`
-- Modify: `agent_dispatch/doctor.py`
 - Modify: `tests/test_review_fix_round.py`
 - Modify: `tests/test_dispatcher_worktree.py`
-- Modify: `tests/test_doctor.py`
 
 - [ ] Патч пишется внутри `_review_work` после коммита (`:1353`) и только когда ревью-потомок действительно запущен. Строки `skipped` без `task_id` (`commit:` на `:1356`, `perimeter: no corporate reviewer` на `:1171-1176`, сбой `submit` на `:1414`) получают `input_patch: null` и `input_skipped: <причина>`
 - [ ] Worktree: `git diff <tree.base>..<sha коммита>`; при handoff в диф входит патч предка, это то же, что видел ревьюер
 - [ ] In_place: база HEAD (ревьюер видел работу вместе с грязью вызывающего, это и сохраняется). Патч строится во временном индексе, как в `DiffStatSnapshot` (`workspace.py:223-260`), с pathspec по `changed_files` (тот же scope, что у ревьюера, `:1384-1387`), поэтому untracked-файлы задачи входят, чужие грязные файлы и индекс вызывающего не трогаются; сбой даёт `input_skipped: snapshot`
 - [ ] Файл `<data_dir>/review_inputs/<review_task_id>.patch`, путь в `review_stages[i].input_patch`; лимит `REVIEW_INPUT_LIMIT_BYTES = 1 MiB`, при превышении файл не пишется, ставится `input_skipped: size`
 - [ ] Периметр: используется готовое `perimeter` (`_lineage_perimeter`, `:2045-2082`, уже вычислено на `:1167` в `_verify_and_review`, передаётся в `_review_work` параметром), своя проверка не пишется. Под периметром `input_skipped: perimeter`. Патчи и логи таких задач и так лежат на диске (`patches/`), пропуск нужен ради части B (отправка судье)
-- [ ] Хранение: автоматического удаления нет, `worktrees --clean` каталог не трогает (это датасет разметки). `doctor` выдаёт WARN, если `review_inputs/` вместе с `patches/` больше 500 MB
-- [ ] Тесты: worktree, in_place с untracked-файлом, skipped-ступень без `task_id`, периметр, лимит, сбой снимка, WARN `doctor`
+- [ ] Хранение: автоматического удаления нет, `worktrees --clean` каталог не трогает (это датасет разметки)
+- [ ] Тесты: worktree, in_place с untracked-файлом, skipped-ступень без `task_id`, периметр, лимит, сбой снимка
 - [ ] Прогнать тесты, должны пройти
 
 ### Task 3: секция replay `review_stability`
@@ -81,13 +80,23 @@ fail нестабильны (тот же ревьюер после раунда 
 - [ ] Прогнать тесты, должны пройти
 
 ### Task 4: документация
-**Depends on:** Task 2, Task 3
+**Depends on:** Task 3, Task 5
 **Files:**
 - Modify: `CLAUDE.md`
 - Modify: `docs/architecture.md`
 
 - [ ] CLAUDE.md проекта и `docs/architecture.md` (`:49,51,179`): дельта раунда, `review_inputs`, то, что по метрике решает человек
 - [ ] Полный прогон `uv run pytest tests -q`, `ruff check`, `ruff format --check`
+
+### Task 5: предупреждение doctor о размере review_inputs
+**Depends on:** Task 2
+**Files:**
+- Modify: `agent_dispatch/doctor.py`
+- Modify: `tests/test_doctor.py`
+
+- [ ] `doctor` выдаёт WARN, если `<data_dir>/review_inputs/` вместе с `<data_dir>/patches/` больше 500 MB; автоматического удаления нет
+- [ ] Тесты `tests/test_doctor.py`: ниже порога OK, выше WARN, каталогов нет OK
+- [ ] Прогнать тесты, должны пройти
 
 ## Не делаем
 
