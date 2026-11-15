@@ -28,14 +28,28 @@ fail нестабильны (тот же ревьюер после раунда 
 не складывается. Цифру нельзя называть «$ на ложные fail»: ревьюер на повторе не видит
 прошлых замечаний, и ложным мог быть как первый fail, так и второй pass.
 
-## Задачи
+## Implementation Steps
 
 ### Task 1: дельта раунда
+**Files:**
+- Modify: `agent_dispatch/dispatch/dispatcher.py`
+- Modify: `tests/test_review_fix_round.py`
+- Modify: `tests/test_dispatcher_worktree.py`
+
 - [ ] `dispatcher.py`: `DiffStatSnapshot(tree.path if tree else req.cwd)` через `asyncio.to_thread` перед `_call_adapter` раунда (`:1234`); `fix_rounds[i].diff_stat` по `fixed.changed_files` после `_recover_report` (`:1246`); `close()` снимка на всех выходах, включая ранние `return` при supervision (`:1235-1239`, `:1247-1251`); `inherited_files` для раунда не нужен; при сбое снимка `fix_rounds[i].diff_stat_unavailable` с причиной (образец `:1042,1049`)
 - [ ] Тесты `tests/test_review_fix_round.py`: дельта только раунда; in_place с грязным файлом вызывающего (база включает грязь); сбой снимка; ранний выход supervision закрывает снимок. `tests/test_dispatcher_worktree.py`: worktree
 - [ ] Прогнать тесты, должны пройти
 
 ### Task 2: сохранённое состояние ревью
+**Depends on:** Task 1
+**Files:**
+- Modify: `agent_dispatch/dispatch/dispatcher.py`
+- Modify: `agent_dispatch/executors/workspace.py`
+- Modify: `agent_dispatch/doctor.py`
+- Modify: `tests/test_review_fix_round.py`
+- Modify: `tests/test_dispatcher_worktree.py`
+- Modify: `tests/test_doctor.py`
+
 - [ ] Патч пишется внутри `_review_work` после коммита (`:1353`) и только когда ревью-потомок действительно запущен. Строки `skipped` без `task_id` (`commit:` на `:1356`, `perimeter: no corporate reviewer` на `:1171-1176`, сбой `submit` на `:1414`) получают `input_patch: null` и `input_skipped: <причина>`
 - [ ] Worktree: `git diff <tree.base>..<sha коммита>`; при handoff в диф входит патч предка, это то же, что видел ревьюер
 - [ ] In_place: база HEAD (ревьюер видел работу вместе с грязью вызывающего, это и сохраняется). Патч строится во временном индексе, как в `DiffStatSnapshot` (`workspace.py:223-260`), с pathspec по `changed_files` (тот же scope, что у ревьюера, `:1384-1387`), поэтому untracked-файлы задачи входят, чужие грязные файлы и индекс вызывающего не трогаются; сбой даёт `input_skipped: snapshot`
@@ -46,6 +60,12 @@ fail нестабильны (тот же ревьюер после раунда 
 - [ ] Прогнать тесты, должны пройти
 
 ### Task 3: секция replay `review_stability`
+**Depends on:** Task 1
+**Files:**
+- Modify: `evals/replay/harness.py`
+- Modify: `evals/replay/__main__.py`
+- Modify: `tests/test_replay.py`
+
 - [ ] Единица подсчёта: каждая строка `review_stages` с `verdict: fail` (и первичная, и повторная). Её исход определяет раунд `fix_rounds[j]`, где `trigger == review_failed`, `stage == by` и `round == row.round + 1` (у первичной строки `round: 0`, пишется на `:1191`; поля `round`/`stage`/`trigger` появились одним коммитом 2243e93, строк без `round` нет; фикстуры тестов строятся с `round: 0`). Так каждый fail-вердикт считается один раз: `still_fail` это исход одной единицы, а сама повторная fail-строка становится следующей единицей
 - [ ] Исходы проверяются по порядку, первый подошедший выигрывает:
   1. `no_round`: раунда нет (бюджет, нет сессии, `_budget_stop`, бюджет потрачен на verify, выход supervision до записи раунда `:1237,1248`; причина не хранится, корзина одна)
@@ -61,6 +81,11 @@ fail нестабильны (тот же ревьюер после раунда 
 - [ ] Прогнать тесты, должны пройти
 
 ### Task 4: документация
+**Depends on:** Task 2, Task 3
+**Files:**
+- Modify: `CLAUDE.md`
+- Modify: `docs/architecture.md`
+
 - [ ] CLAUDE.md проекта и `docs/architecture.md` (`:49,51,179`): дельта раунда, `review_inputs`, то, что по метрике решает человек
 - [ ] Полный прогон `uv run pytest tests -q`, `ruff check`, `ruff format --check`
 

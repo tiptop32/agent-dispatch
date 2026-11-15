@@ -49,17 +49,27 @@
 задачи; допущение о требованиях; необратимое действие; отказ от части скоупа.
 Не писать: форматирование, имена переменных, очевидные шаги плана.
 
-## Задачи
+## Разбивка по репам
 
-### Task 1: agterm-kit, CLI `decision/agterm-decision`
-- [ ] Python stdlib: `add --kind --text --why [--ref]`, `list [--repo] [--since 7d] [--kind]`, `show <id-prefix>`, `mark <id-prefix> keep|change|revert [--note]`, `answer <id-prefix> --text`, `open`
-- [ ] `open`: записи `decision` без `verdict` и `question` без `answer`, свежие сверху, за 14 дней по умолчанию
-- [ ] Запись одним `write()` под `fcntl.flock`; битая строка при чтении пропускается с предупреждением в stderr
-- [ ] `install.sh`, README; `decision/agterm-decision` добавляется в существующую `ast.parse`-проверку `make lint`
-- [ ] `tests/decision.bats` (изолированный HOME, ASCII-имена тестов): формат против golden, append-only, фильтры, префикс и неоднозначность, open/answer/mark, битая строка, два параллельных `add`, два одинаковых `add` в одну секунду дают разные id, `--prod`, `CLAUDE_CODE_SESSION_ID` задан → `session` заполнен
-- [ ] Прогнать тесты agterm-kit, должны пройти
+- agterm-kit: CLI `agterm-decision`, golden-формат и исходник скилла `decisions` —
+  `~/my_git_reps/agterm-kit/docs/plans/20261116-decision-log.md`.
+- agent-dispatch: задачи ниже.
+- Ручные шаги (песочница запрещает агенту писать в `~/.claude`):
+  - правило в `~/.claude/CLAUDE.md` с критериями выше: при заданном `AGENT_DISPATCH_HOP`
+    вместо CLI заполнять только поле `decisions` в отчёте, при работе с prod-данными
+    вызывать CLI с `--prod`;
+  - симлинк `~/.claude/skills/decisions` → `~/my_git_reps/agterm-kit/decision/skill`.
 
-### Task 2: agent-dispatch, схема и разбор
+## Implementation Steps
+
+### Task 1: схема и разбор
+**Files:**
+- Modify: `agent_dispatch/schemas/agent_result.schema.json`
+- Modify: `agent_dispatch/executors/result_parser.py`
+- Modify: `agent_dispatch/dispatch/task_package.py`
+- Modify: `tests/test_result_parser.py`
+- Modify: `tests/test_task_package.py`
+
 - [ ] `agent_result.schema.json`: необязательное `decisions: array`, элементы `{kind: decision|question, text: string, why?: string|null}`, `required: [kind, text]`
 - [ ] `result_parser._coerce` приводит или отбрасывает всё, что схема отвергнет: не список, элемент не объект, неизвестный `kind`, пустой или нестроковый `text`, нестроковый `why` (→ `null`), лишние ключи элемента (срезаются); `decisions` входит в `_OPTIONAL_FIELDS` (:233), `null` удаляется; причины в `meta.coerced`
 - [ ] Сборка результата (:128-142): нормализованный список копируется в `meta.decisions`
@@ -67,12 +77,31 @@
 - [ ] Тесты `tests/test_result_parser.py`: валидно → `completed` и assert на `meta.decisions`; нет поля; `null`; не список; каждый вид мусора → `completed` + `coerced`; `tests/test_task_package.py`: у review поля нет, у задачи есть
 - [ ] Прогнать тесты, должны пройти
 
-### Task 3: agent-dispatch, слияния
+### Task 2: слияния
+**Depends on:** Task 1
+**Files:**
+- Modify: `agent_dispatch/dispatch/dispatcher.py`
+- Modify: `agent_dispatch/dispatch/report_recovery.py`
+- Modify: `tests/test_review_fix_round.py`
+- Modify: `tests/test_report_recovery.py`
+
 - [ ] Раунд правки (`dispatcher.py:1298`) и `merge_report` конкатенируют `decisions` первой попытки и продолжения, без дублей по `(kind, text)`
 - [ ] Тесты `tests/test_review_fix_round.py`, `tests/test_report_recovery*.py`: записи обеих попыток сохраняются
 - [ ] Прогнать тесты, должны пройти
 
-### Task 4: agent-dispatch, журнал и redact
+### Task 3: журнал и redact
+**Depends on:** Task 1
+**Files:**
+- Modify: `agent_dispatch/config.py`
+- Modify: `agent_dispatch/config_default.yaml`
+- Modify: `config.example.yaml`
+- Modify: `agent_dispatch/dispatch/redact.py`
+- Modify: `agent_dispatch/dispatch/dispatcher.py`
+- Modify: `agent_dispatch/mcp/server.py`
+- Modify: `tests/test_dispatcher.py`
+- Modify: `tests/test_redact.py`
+- Modify: `tests/test_mcp_server.py`
+
 - [ ] `Settings.decision_log_dir` (по умолчанию `~/.local/state/decisions`), синхронно `config_default.yaml` и `config.example.yaml`
 - [ ] `redact_result` дополнительно чистит `decisions[].text/why` в `meta` (для БД при prod); запись в журнал идёт после него
 - [ ] `_finalize` пишет журнал только при непустом `decisions` и только для `kind: task`: ревью-дети идут через тот же `_finalize` (`:738`), их записи отсекает фильтр, а не только отсутствие поля в промпте. Пишет сам (`source` = `result.executor`, `task_id`, `session` = `_lineage_root`); при prod-линии пишется `(prod)`, иначе текст проходит `redact_text`; ошибка записи не ломает `_finalize` (как `mcp_responses.jsonl`); `recover_stale` журнал не пишет, задача не завершена исполнителем
@@ -81,23 +110,42 @@
 - [ ] Тесты `tests/test_dispatcher*.py`: запись, ревью-ребёнок с `decisions` не пишет, пустой список не пишет, redact вне prod, prod → `(prod)`, ошибка записи, `repo` worktree-задачи равен имени основной репы, `session` эскалированного звена равен корню; `tests/test_mcp*.py`: компактная строка; golden-формат
 - [ ] Прогнать тесты, должны пройти
 
-### Task 5: agent-dispatch, replay
+### Task 4: replay
+**Depends on:** Task 3
+**Files:**
+- Modify: `evals/replay/harness.py`
+- Modify: `evals/replay/__main__.py`
+- Modify: `tests/test_replay.py`
+
 - [ ] `evals/replay/harness.py`: секция `decision_log` (`share`, `keep_share`, `empty_why_share`, `change_revert_share`; вердикты читаются из файла журнала, если он есть, иначе `unmeasured`)
 - [ ] Тесты `tests/test_replay*.py`
 - [ ] Прогнать тесты, должны пройти
 
-### Task 6: Claude, правило и скилл
-- [ ] `~/.claude/CLAUDE.md`: правило с критериями выше; при заданном `AGENT_DISPATCH_HOP` вместо CLI заполнять только поле `decisions` в отчёте; при работе с prod-данными вызывать CLI с `--prod`
-- [ ] `~/.claude/skills/decisions/SKILL.md`: разбор через `open` → `mark`/`answer`; для change/revert агент предлагает правку или follow-up
+### Task 5: prod-правило
+**Depends on:** Task 1
+**Files:**
+- Modify: `agent_dispatch/templates/prod_data_rule.md.j2`
+- Modify: `tests/test_task_package.py`
+
 - [ ] Строка в `templates/prod_data_rule.md.j2`: в `decisions` только выводы, без данных; тест шаблона в `tests/test_task_package.py`
 - [ ] Прогнать тесты, должны пройти
 
-### Task 7: eval
+### Task 6: eval
+**Depends on:** Task 3
+**Files:**
+- Modify: `evals/smoke/harness.py`
+- Modify: `tests/test_smoke.py`
+
 - [ ] `evals/smoke`: два сценария на `omp/sol` и одном корпоративном исполнителе, N=10 прогонов каждый. Позитивный: задача с заложенной развилкой (два равноценных имени API), запись считается, если `text` упоминает развилку. Негативный: задача без развилки, запись считается шумом
 - [ ] Порог: позитив не меньше 8/10, шум не больше 2/10 на каждом исполнителе
 - [ ] Тест харнесса сценариев без сети (подсчёт позитива и шума по готовым результатам)
 
-### Task 8: документация
+### Task 7: документация
+**Depends on:** Task 2, Task 3, Task 4, Task 5
+**Files:**
+- Modify: `CLAUDE.md`
+- Modify: `docs/architecture.md`
+
 - [ ] CLAUDE.md проекта и `docs/architecture.md`: поле `decisions`, кто пишет журнал, prod-правило
 - [ ] Полный прогон `uv run pytest tests -q`, `ruff check`, `ruff format --check`
 
