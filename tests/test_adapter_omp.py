@@ -347,3 +347,26 @@ def test_omp_stop_error_cools_the_executor_with_or_without_edits(changed):
     result = adapter()._parse_result(_stop_error_outcome(), changed)
     assert result.error.startswith("Couldn't connect to 127.0.0.1:9 (connection refused)")
     assert classify_failure(result) == "network"
+
+
+def _outcome(fixture: str, **kwargs) -> ProcessOutcome:
+    defaults = dict(exit_code=0, stderr="", timed_out=False, duration_ms=5)
+    defaults.update(kwargs)
+    return ProcessOutcome(stdout=(FIXTURES / fixture).read_text(), **defaults)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "summary"),
+    [
+        (_outcome("ok.ndjson", exit_code=None, timed_out=True), "PONG"),
+        (_outcome("ok.ndjson"), "PONG"),
+        (_outcome("down.ndjson", exit_code=1), ""),
+    ],
+    ids=["timeout", "no-result-block", "stop-error-without-text"],
+)
+def test_omp_failure_summary_is_the_assistant_text_not_the_event_stream(outcome, summary):
+    # 2026-11-09..13: 12 задач несли в `summary` хвост JSONL omp (`"stopReason"`,
+    # `message_end`), и он уходил в handoff следующего звена и в follow-up.
+    result = adapter()._parse_result(outcome, [])
+    assert result.summary == summary
+    assert '"type"' not in result.summary

@@ -174,10 +174,16 @@ class OmpAdapter(BaseExecutorAdapter):
                 usage = _add_usage(usage, _usage(message["usage"]))
             if message.get("stopReason") == "error":
                 stop_error = True
-        raw = extract_result_block("\n".join(text_parts))
+        text = "\n".join(text_parts)
+        raw = extract_result_block(text)
+        # stdout omp это JSONL событий: без подмены `normalize` на путях сбоя клал бы
+        # в `summary` хвост потока, и он уходил бы в handoff и follow-up. Сырой
+        # stdout нужен только `omp_error` ниже, он читает исходный `outcome`.
+        parsed = replace(outcome, stdout=text)
         # `--max-cost` (код 3) не сбой: normalize на ненулевом выходе отбросил бы
         # успевший дойти отчёт агента, поэтому разбираем поток как успешный выход.
-        parsed = replace(outcome, exit_code=0) if outcome.exit_code == 3 else outcome
+        if outcome.exit_code == 3:
+            parsed = replace(parsed, exit_code=0)
         result = normalize(raw, parsed, changed, self.name, self.settings.model)
         if stop_error and not outcome.stalled and not outcome.timed_out:
             # Сообщение хода с ошибкой пишет сам CLI о провайдере (badkey, down,

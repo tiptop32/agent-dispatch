@@ -95,7 +95,11 @@ def run_case(case: dict, tmp: Path) -> Row:
         events = input["events"]
     stdout = "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events)
     outcome = ProcessOutcome(
-        input.get("exit_code", 0), stdout, "", False, input.get("duration_ms", 1)
+        input.get("exit_code", 0),
+        stdout,
+        "",
+        input.get("timed_out", False),
+        input.get("duration_ms", 1),
     )
     expected = case["expected"]
     result = adapter._parse_result(outcome, input.get("changed", []))
@@ -105,6 +109,8 @@ def run_case(case: dict, tmp: Path) -> Row:
         return Row(case["id"], False, f"model {result.model!r} != {expected['model']!r}")
     if "error" in expected and result.error != expected["error"]:
         return Row(case["id"], False, f"error {result.error!r} != {expected['error']!r}")
+    if "summary" in expected and result.summary != expected["summary"]:
+        return Row(case["id"], False, f"summary {result.summary!r} != {expected['summary']!r}")
     if "usage" in expected:
         if result.usage is None:
             return Row(case["id"], False, "usage is None")

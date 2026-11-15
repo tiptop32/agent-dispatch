@@ -11,6 +11,7 @@ from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.executors.base import RunContext
 from agent_dispatch.executors.omp import OmpAdapter
+from agent_dispatch.executors.process import ProcessOutcome
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
     DispatchRequest,
@@ -157,16 +158,15 @@ async def test_partial_after_reediting_dirty_file_does_not_escalate(
     # видна и эскалации `no_result` нет: иначе новый запуск лёг бы поверх работы.
     from agent_dispatch.executors import omp as module
 
-    class Outcome:
-        exit_code = 0
-        stdout = "raw stdout tail without a result block"
-        stderr = ""
-        timed_out = False
-        duration_ms = 1
-
     async def fake_run_cli(argv, **kwargs):
         (Path(kwargs["cwd"]) / "a.py").write_text("x = 3\n")
-        return Outcome()
+        return ProcessOutcome(
+            exit_code=0,
+            stdout="raw stdout tail without a result block",
+            stderr="",
+            timed_out=False,
+            duration_ms=1,
+        )
 
     (git_repo / "a.py").write_text("x = 2\n")
     monkeypatch.setattr(module, "run_cli", fake_run_cli)
