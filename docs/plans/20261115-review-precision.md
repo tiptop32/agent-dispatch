@@ -85,8 +85,8 @@ fail нестабильны (тот же ревьюер после раунда 
 - Modify: `CLAUDE.md`
 - Modify: `docs/architecture.md`
 
-- [ ] CLAUDE.md проекта и `docs/architecture.md` (`:49,51,179`): дельта раунда, `review_inputs`, то, что по метрике решает человек
-- [ ] Полный прогон `uv run pytest tests -q`, `ruff check`, `ruff format --check`
+- [x] CLAUDE.md проекта и `docs/architecture.md` (`:49,51,179`): дельта раунда, `review_inputs`, то, что по метрике решает человек
+- [x] Полный прогон `uv run pytest tests -q`, `ruff check`, `ruff format --check`
 
 ### Task 5: предупреждение doctor о размере review_inputs
 **Depends on:** Task 2
