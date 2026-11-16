@@ -4,7 +4,6 @@ import ast
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -50,18 +49,13 @@ DECISIONS_NOISE_SHARE = 0.2
 
 
 def _mentions_fork(text: str) -> bool:
-    """Текст решения называет выбранное имя или развилку имён.
+    """Запись называет выбор имени API из задачи: parse_date или to_date.
 
-    Имена из задачи и «развилк(а|и)»: подстрока 'fork' шире — 'forked repo'
-    или 'forkserver' не про выбор имени функции.
+    Слово «fork» или «развилка» само по себе не доказывает, что записан именно
+    выбор имени («chose fork over subprocess» прошёл бы порог без нужного решения).
     """
     lowered = text.lower()
-    return (
-        "parse_date" in lowered
-        or "to_date" in lowered
-        or "развилк" in lowered
-        or re.search(r"\bfork\b", lowered) is not None
-    )
+    return "parse_date" in lowered or "to_date" in lowered
 
 
 def decisions_counts(results: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, int]]:

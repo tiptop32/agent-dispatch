@@ -75,8 +75,11 @@ def test_mentions_fork_rejects_unrelated_fork_words() -> None:
 
     assert not _mentions_fork("used forkserver internally")
     assert not _mentions_fork("forked the repo first")
-    assert _mentions_fork("chose fork over subprocess")
+    # Слово fork без имени API не засчитывается: это не выбор parse_date/to_date.
+    assert not _mentions_fork("chose fork over subprocess")
+    assert not _mentions_fork("развилка: fork или spawn")
     assert not _mentions_fork("no naming choice here")
+    assert _mentions_fork("Picked to_date")
 
 
 def test_decisions_counts_noise_on_trivial_task_with_decisions() -> None:

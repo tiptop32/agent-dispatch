@@ -872,3 +872,28 @@ async def test_review_not_started_has_no_input_patch(tmp_path, git_repo, monkeyp
     finally:
         await dispatcher.shutdown()
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_supervision_stop_in_fix_round_keeps_first_attempt_decisions(tmp_path, git_repo):
+    """Надзор остановил раунд правки: решения первой попытки не стираются."""
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path)
+    adapters["first"].result = result("first", changed_files=[], verdict="fail")
+    first = {"kind": "decision", "text": "Сохранить API", "why": "Совместимость"}
+    adapters["worker"].result = result(meta={"session_id": "work-session", "decisions": [first]})
+
+    async def work(ctx):
+        if len(adapters["worker"].calls) == 2:
+            adapters["worker"].result = result(
+                status="partial", meta={"supervision": {"reason": "stop"}}
+            )
+
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(request(git_repo, allow_escalation=False))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.result.meta["supervision"]["reason"] == "stop"
+        assert done.result.meta["decisions"] == [first]
+    finally:
+        await dispatcher.shutdown()
+        await storage.close()

@@ -41,6 +41,7 @@ async def run(args: argparse.Namespace) -> int:
                                 source_agent="cli",
                                 wait_seconds=args.timeout,
                                 allow_escalation=False,
+                                decision_log=False,
                             )
                         )
                         verdict = verify(repo, view, task)

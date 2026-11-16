@@ -46,7 +46,7 @@ def _usage(first: Usage | None, second: Usage | None) -> Usage | None:
     )
 
 
-def _decision_meta(
+def decision_meta(
     original: ExecutionResult, continuation: ExecutionResult
 ) -> dict[str, list[dict[str, str | None]]]:
     """Объединить нормализованные записи; при дубле сохранить первую причину."""
@@ -81,7 +81,7 @@ def merge_report(original: ExecutionResult, report: ExecutionResult) -> Executio
     failure = report.error or report.meta.get("parse_error")
     if failure:
         meta = {**original.meta, "report_recovery": f"failed: {str(failure)[:200]}"}
-        meta.update(_decision_meta(original, report))
+        meta.update(decision_meta(original, report))
         # Остывание, включённое сбоем дозапроса, видно в итоге задачи.
         for key in ("executor_failure", "cooldown_until"):
             if key in report.meta:
@@ -90,7 +90,7 @@ def merge_report(original: ExecutionResult, report: ExecutionResult) -> Executio
     # Метаданные запуска (лог, длительность, сессия) остаются от первого: работа
     # была там. От отчёта берётся только то, что говорит о нём самом.
     meta = {key: value for key, value in original.meta.items() if key != "parse_error"}
-    meta.update(_decision_meta(original, report))
+    meta.update(decision_meta(original, report))
     if report.meta.get("coerced"):
         meta["coerced"] = report.meta["coerced"]
     meta["report_recovery"] = "recovered"

@@ -122,6 +122,9 @@ def _failed_result(
 #: и в контекст следующего звена; полный отчёт остаётся у задачи-потомка.
 REVIEW_SUMMARY_LIMIT = 2000
 
+#: Предел ожидания замка журнала решений: CLI держит его на одну запись.
+DECISION_LOG_LOCK_SECONDS = 2.0
+
 #: Снимки остаются датасетом разметки после удаления worktree.
 REVIEW_INPUT_LIMIT_BYTES = 1 << 20
 
@@ -1258,6 +1261,8 @@ class Dispatcher:
                         set(result.changed_files) | set(fixed.changed_files)
                     )
                     fixed.usage = report_recovery._usage(result.usage, fixed.usage)
+                    # Остановка надзором не стирает решения первой попытки.
+                    fixed.meta.update(report_recovery.decision_meta(result, fixed))
                     return fixed
                 # Ответ только с отчётом не делает прерванную правку успешной.
                 round_status, round_error = fixed.status, fixed.error
@@ -1272,6 +1277,8 @@ class Dispatcher:
                         set(result.changed_files) | set(fixed.changed_files)
                     )
                     fixed.usage = report_recovery._usage(result.usage, fixed.usage)
+                    # Остановка надзором не стирает решения первой попытки.
+                    fixed.meta.update(report_recovery.decision_meta(result, fixed))
                     return fixed
                 finished = time.monotonic()
                 if round_snapshot is not None:
@@ -1305,7 +1312,7 @@ class Dispatcher:
             usage = fixed.usage.model_dump() if fixed.usage else None
             files = list(dict.fromkeys([*result.changed_files, *fixed.changed_files]))
             meta = dict(result.meta)
-            decisions = report_recovery._decision_meta(result, fixed)
+            decisions = report_recovery.decision_meta(result, fixed)
             meta.update(decisions)
             pending = {
                 "round": rounds,
@@ -2278,7 +2285,11 @@ class Dispatcher:
     async def _log_decisions(
         self, record: TaskRecord, result: ExecutionResult, *, prod: bool
     ) -> None:
-        if record.request.kind != "task" or not result.meta.get("decisions"):
+        if (
+            record.request.kind != "task"
+            or not record.request.decision_log
+            or not result.meta.get("decisions")
+        ):
             return
         try:
             repo = Path(record.request.cwd).name
@@ -2312,7 +2323,8 @@ class Dispatcher:
                 "why": None if prod else redact.redact_text(item.get("why"))[0],
                 "ref": None,
             }
-            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.settings.decision_log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            folder.mkdir(mode=0o700, exist_ok=True)
             payload = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
                 "utf-8"
             )
@@ -2320,7 +2332,17 @@ class Dispatcher:
                 folder / f"{now:%Y-%m-%d}.jsonl", os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600
             )
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                # Чужой зависший писатель не держит _finalize вечно: ждём не дольше
+                # DECISION_LOG_LOCK_SECONDS, затем запись пропускается с ошибкой в логе.
+                deadline = time.monotonic() + DECISION_LOG_LOCK_SECONDS
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.05)
                 # Совместимо с CLI: прерванный хвост не поглощает новую строку.
                 size = os.fstat(fd).st_size
                 if size and os.pread(fd, 1, size - 1) != b"\n":
@@ -2353,8 +2375,10 @@ class Dispatcher:
             # Отчёт продовой задачи читают вызывающий и следующие звенья: явные
             # секреты маскируются до записи и до передачи в эскалацию.
             redact.redact_result(result)
-        await self._log_decisions(record, result, prod=prod)
+        # Результат присваивается до записи журнала: отмена во время ожидания
+        # flock не должна терять работу и итог интеграции (_note_kept_worktree).
         record.result = result
+        await self._log_decisions(record, result, prod=prod)
         if plan is not None:
             # The heir reads its predecessor through storage during startup.
             await self.storage.update_task(record)

@@ -121,6 +121,9 @@ class DispatchRequest(_Model):
     #: эскалация, переадресация, follow-up, вложенные задачи) остаётся у
     #: исполнителей `corporate: true`, даже при `routing.corporate_perimeter: false`.
     prod: bool = False
+    # False: решения исполнителя остаются в meta.decisions, но не идут в журнал
+    # пользователя (платный eval decisions гоняет фейковые задачи через демон).
+    decision_log: bool = True
     #: Только демон ставит этот маркер; публичный ввод с таким ключом запрещён.
     _automatic_review: bool = PrivateAttr(default=False)
 

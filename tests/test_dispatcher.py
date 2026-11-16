@@ -883,3 +883,41 @@ async def test_decision_log_escalation_and_followup_keep_root_session(tmp_path, 
     assert all(
         entry["session"] == root.task_id and entry["source"] == "claude" for entry in entries
     )
+
+
+@pytest.mark.asyncio
+async def test_decision_log_skipped_when_request_opts_out(tmp_path, git_repo):
+    """Платный eval decisions гоняет фейковые задачи: в журнал пользователя они не идут."""
+    settings, _, adapters, dispatcher = await _make(tmp_path)
+    decisions = [{"kind": "decision", "text": "to_date", "why": "короче"}]
+    adapters["omp"].result = ExecutionResult(
+        status="completed", executor="omp", model=None, summary="ok", meta={"decisions": decisions}
+    )
+    task = await dispatcher.submit(_req(git_repo, decision_log=False))
+    done = await dispatcher.wait(task.task_id, WAIT)
+    assert done.result.meta["decisions"] == decisions
+    assert not settings.decision_log_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_result_is_assigned_before_decision_log_write(tmp_path, git_repo, monkeypatch):
+    """Отмена во время записи журнала не теряет результат: он уже в record.result."""
+    settings, _, adapters, dispatcher = await _make(tmp_path)
+    adapters["omp"].result = ExecutionResult(
+        status="completed",
+        executor="omp",
+        model=None,
+        summary="ok",
+        meta={"decisions": [{"kind": "decision", "text": "x", "why": None}]},
+    )
+    seen = {}
+    real = dispatcher._log_decisions
+
+    async def spy(record, result, *, prod):
+        seen["assigned"] = record.result is result
+        await real(record, result, prod=prod)
+
+    monkeypatch.setattr(dispatcher, "_log_decisions", spy)
+    task = await dispatcher.submit(_req(git_repo))
+    await dispatcher.wait(task.task_id, WAIT)
+    assert seen == {"assigned": True}
