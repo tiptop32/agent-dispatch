@@ -9,6 +9,33 @@ import pytest
 FAKES_DIR = Path(__file__).parent / "fakes"
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
+#: Настоящий журнал решений пользователя (`Settings.decision_log_dir` по умолчанию).
+REAL_DECISION_LOG = Path("~/.local/state/decisions").expanduser()
+
+
+def _decision_log_state() -> list[tuple[str, int, int]]:
+    if not REAL_DECISION_LOG.exists():
+        return []
+    return sorted(
+        (str(path), stat.st_size, stat.st_mtime_ns)
+        for path in REAL_DECISION_LOG.rglob("*")
+        if path.is_file() and (stat := path.stat())
+    )
+
+
+@pytest.fixture(autouse=True)
+def real_decision_log_untouched() -> Iterator[None]:
+    """Тест, построивший Settings без decision_log_dir, писал бы в журнал пользователя.
+
+    2026-11-16 так полный прогон дописал фейковые решения в ~/.local/state/decisions:
+    фикстура тестов раунда правки не задавала каталог. Сторож ловит любую такую утечку.
+    """
+    before = _decision_log_state()
+    yield
+    assert _decision_log_state() == before, (
+        "тест записал в настоящий журнал решений: задайте Settings(decision_log_dir=tmp_path / ...)"
+    )
+
 
 @pytest.fixture(scope="session", autouse=True)
 def warm_fake_cli() -> None:

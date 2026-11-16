@@ -48,6 +48,7 @@ async def make_dispatcher(
 ):
     settings = Settings(
         server=ServerSettings(data_dir=tmp_path / "data"),
+        decision_log_dir=tmp_path / "decisions",
         execution=ExecutionSettings(review_fix_rounds=rounds, **(execution or {})),
         routing=RoutingSettings(
             fallback_executor="worker", corporate_perimeter=False, **(routing or {})
