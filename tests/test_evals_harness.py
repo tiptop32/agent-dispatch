@@ -284,7 +284,7 @@ def test_routing_help_exposes_router_option():
 
 
 def test_smoke_tasks_are_complete():
-    assert set(TASKS) == {"fix", "docstring", "rename"}
+    assert set(TASKS) == {"fix", "docstring", "rename", "decisions_fork", "decisions_none"}
 
 
 def test_verify_broken_calc_is_failed_verdict_not_exception(tmp_path):

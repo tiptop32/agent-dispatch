@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,15 @@ TASKS = {
         "rename function add to add_numbers in smoke_target/calc.py and update "
         "tests/test_calc.py; run pytest"
     ),
+    "decisions_fork": (
+        "add a function to smoke_target/calc.py that converts a date string in "
+        "'YYYY-MM-DD' form into a datetime.date; two equally good names for it are "
+        "parse_date and to_date — pick either one; run pytest"
+    ),
+    "decisions_none": (
+        "add a function sub(a, b) to smoke_target/calc.py that returns a - b, and a test "
+        "sub(2, 3) == -1 in tests/test_calc.py; run pytest"
+    ),
 }
 
 
@@ -26,6 +38,102 @@ TASKS = {
 class Verdict:
     ok: bool
     reasons: list[str]
+
+
+# Пороги eval'а записей решений (docs/plans/20261115-decision-log.md): N=10 прогонов
+# каждой задачи на исполнителя, позитив не ниже 8, шум не выше 2.
+DECISIONS_RUNS_PER_EXECUTOR = 10
+DECISIONS_POSITIVE_MIN = 8
+DECISIONS_NOISE_MAX = 2
+
+
+def _mentions_fork(text: str) -> bool:
+    """Текст решения называет выбранное имя или развилку имён.
+
+    Имена из задачи и «развилк(а|и)»: подстрока 'fork' шире — 'forked repo'
+    или 'forkserver' не про выбор имени функции.
+    """
+    lowered = text.lower()
+    return (
+        "parse_date" in lowered
+        or "to_date" in lowered
+        or "развилк" in lowered
+        or re.search(r"\bfork\b", lowered) is not None
+    )
+
+
+def decisions_counts(results: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
+    """Позитив, шум и число прогонов каждой задачи по готовым результатам.
+
+    Позитив — прогон decisions_fork, где среди result.meta.decisions есть запись
+    kind=decision, чей text называет выбранное имя или развилку. Шум — прогон
+    decisions_none с непустым meta.decisions. Ровно эти ключи кладёт
+    make_row/__main__ при живом прогоне; функция также принимает готовые строки
+    отчёта, где decisions лежат плоским ключом.
+    """
+    counts: dict[str, dict[str, int]] = {}
+    for result in results:
+        per_executor = counts.setdefault(
+            str(result.get("executor", "")),
+            {"positive": 0, "noise": 0, "fork_runs": 0, "none_runs": 0},
+        )
+        meta = result.get("meta") or {}
+        decisions = meta.get("decisions") or result.get("decisions") or []
+        task = result.get("task")
+        if task == "decisions_fork":
+            per_executor["fork_runs"] += 1
+            if any(
+                decision.get("kind") == "decision" and _mentions_fork(str(decision.get("text", "")))
+                for decision in decisions
+            ):
+                per_executor["positive"] += 1
+        elif task == "decisions_none":
+            per_executor["none_runs"] += 1
+            if decisions:
+                per_executor["noise"] += 1
+    return counts
+
+
+def decisions_threshold_ok(
+    counts: Mapping[str, Mapping[str, int]],
+    *,
+    runs: int = DECISIONS_RUNS_PER_EXECUTOR,
+    positive_min: int = DECISIONS_POSITIVE_MIN,
+    noise_max: int = DECISIONS_NOISE_MAX,
+) -> bool:
+    """Порог: у каждого исполнителя полная серия N прогонов, позитив не ниже
+    positive_min, шум не выше noise_max. Неполная серия — fail, иначе 2 прогона
+    из 2 выглядели бы как 10 из 10."""
+    return bool(counts) and all(
+        per_executor["fork_runs"] == runs
+        and per_executor["none_runs"] == runs
+        and per_executor["positive"] >= positive_min
+        and per_executor["noise"] <= noise_max
+        for per_executor in counts.values()
+    )
+
+
+def make_row(task: str, executor: str, verdict: Verdict, view: Any) -> dict[str, Any]:
+    """Строка отчёта: meta.decisions из result исполнителя рядом с вердиктом.
+
+    Без meta.decisions строку не посчитать: у TaskView.result решения лежат
+    в result.meta.decisions (models.py), плоского поля decisions нет.
+    """
+    result = getattr(view, "result", None)
+    meta = getattr(result, "meta", None) or {}
+    decisions = meta.get("decisions")
+    if decisions is None and isinstance(result, Mapping):
+        decisions = result.get("decisions")
+    row: dict[str, Any] = {
+        "executor": executor,
+        "task": task,
+        "ok": verdict.ok,
+        "reasons": verdict.reasons,
+    }
+    if decisions is not None:
+        # Готово к json.dumps: записи {kind, text, why} — только JSON-типы.
+        row["meta"] = {"decisions": json.loads(json.dumps(decisions))}
+    return row
 
 
 BUGGY_CALC = "def add(a, b):\n    return a - b\n"
@@ -116,6 +224,8 @@ def verify(repo: Path, view: Any, task: str) -> Verdict:
             return Verdict(ok=False, reasons=reasons)
         if "add_numbers" not in functions:
             reasons.append("add_numbers not defined")
+        else:
+            _check_calculation(repo, "add_numbers", reasons)
         if "add" in functions:
             reasons.append("old add definition remains")
         if not _tests_import_add_numbers(tests_tree):
@@ -125,13 +235,40 @@ def verify(repo: Path, view: Any, task: str) -> Verdict:
             for node in ast.walk(tests_tree)
         ):
             reasons.append("tests still call add")
-        _check_calculation(repo, "add_numbers", reasons)
+    elif task == "decisions_fork":
+        # Имя выбирает исполнитель, поведение функции — нет: `return s` без
+        # проверки даты не считается. Сравнение по ISO-строке: JSON-совместимо.
+        chosen = next((name for name in ("parse_date", "to_date") if name in functions), None)
+        if chosen is None:
+            reasons.append("no parse_date/to_date function defined")
+        else:
+            _check_calculation(
+                repo,
+                chosen,
+                reasons,
+                calls=(("2026-11-16",),),
+                expected=("2026-11-16",),
+                returns_date=True,
+            )
+    elif task == "decisions_none":
+        if "sub" not in functions:
+            reasons.append("sub not defined")
+        else:
+            _check_calculation(repo, "sub", reasons, calls=((2, 3), (5, 1)), expected=(-1, 4))
     return Verdict(not reasons, reasons)
 
 
-def _check_calculation(repo: Path, function_name: str, reasons: list[str]) -> None:
+def _check_calculation(
+    repo: Path,
+    function_name: str,
+    reasons: list[str],
+    calls: tuple[tuple[object, ...], ...] = ((2, 3), (-1, 1)),
+    expected: tuple[object, ...] = (5, 0),
+    returns_date: bool = False,
+) -> None:
     script = """
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -143,13 +280,33 @@ source = spec.loader.get_source(spec.name)
 assert source is not None
 exec(compile(source, str(path), "exec"), module.__dict__)
 function = getattr(module, sys.argv[2])
-if function(2, 3) != 5:
-    raise AssertionError(f"{sys.argv[2]}(2, 3) != 5")
-if function(-1, 1) != 0:
-    raise AssertionError(f"{sys.argv[2]}(-1, 1) != 0")
+import datetime
+args = json.loads(sys.argv[3])
+expected = json.loads(sys.argv[4])
+returns_date = sys.argv[5] == "1"
+for call, want in zip(args, expected):
+    got = function(*call)
+    if returns_date:
+        # `return s` без разбора даты не проходит: нужен datetime.date.
+        if not isinstance(got, datetime.date):
+            raise AssertionError(f"{sys.argv[2]} returned {type(got).__name__}, not a date")
+        got = got.isoformat()
+    if got != want:
+        # Прежний формат причины («add(2, 3) != 5»): его читают отчёты и тесты.
+        shown = ", ".join(str(value) for value in call)
+        raise AssertionError(f"{sys.argv[2]}({shown}) != {want}")
 """
     result = subprocess.run(
-        [sys.executable, "-c", script, str(repo / "smoke_target/calc.py"), function_name],
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(repo / "smoke_target/calc.py"),
+            function_name,
+            json.dumps([list(call) for call in calls]),
+            json.dumps(list(expected)),
+            "1" if returns_date else "0",
+        ],
         capture_output=True,
         text=True,
     )
