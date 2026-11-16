@@ -2282,16 +2282,36 @@ class Dispatcher:
                 return record.task_id
         return record.task_id
 
+    async def _decision_log_opted_out(self, record: TaskRecord) -> bool:
+        """Отказ от журнала наследуется всей линией: вложенная задача платного
+        eval по умолчанию просила бы журнал и писала бы фейковые решения."""
+        queue, seen = [record], set()
+        while queue:
+            current = queue.pop()
+            if current.task_id in seen:
+                continue
+            seen.add(current.task_id)
+            if not current.request.decision_log:
+                return True
+            for parent_id in (
+                current.escalated_from,
+                current.request.followup_of,
+                current.parent_task_id or current.request.parent_task_id,
+            ):
+                if parent_id and parent_id not in seen:
+                    parent = await self.storage.get_task(parent_id)
+                    if parent is not None:
+                        queue.append(parent)
+        return False
+
     async def _log_decisions(
         self, record: TaskRecord, result: ExecutionResult, *, prod: bool
     ) -> None:
-        if (
-            record.request.kind != "task"
-            or not record.request.decision_log
-            or not result.meta.get("decisions")
-        ):
+        if record.request.kind != "task" or not result.meta.get("decisions"):
             return
         try:
+            if await self._decision_log_opted_out(record):
+                return
             repo = Path(record.request.cwd).name
             for event in await self.storage.list_events(record.task_id):
                 if event["kind"] == "git" and event["payload"].get("common_dir"):

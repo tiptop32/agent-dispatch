@@ -921,3 +921,22 @@ async def test_result_is_assigned_before_decision_log_write(tmp_path, git_repo, 
     task = await dispatcher.submit(_req(git_repo))
     await dispatcher.wait(task.task_id, WAIT)
     assert seen == {"assigned": True}
+
+
+@pytest.mark.asyncio
+async def test_decision_log_opt_out_is_inherited_by_nested_tasks(tmp_path, git_repo):
+    """Вложенная задача eval-задачи с decision_log=False тоже не пишет в журнал."""
+    settings, _, adapters, dispatcher = await _make(tmp_path)
+    parent = await dispatcher.submit(_req(git_repo, decision_log=False))
+    await dispatcher.wait(parent.task_id, WAIT)
+    adapters["omp"].result = ExecutionResult(
+        status="completed",
+        executor="omp",
+        model=None,
+        summary="ok",
+        meta={"decisions": [{"kind": "decision", "text": "to_date", "why": None}]},
+    )
+    child = await dispatcher.submit(_req(git_repo, parent_task_id=parent.task_id, hop=1))
+    done = await dispatcher.wait(child.task_id, WAIT)
+    assert done.result.meta["decisions"]
+    assert not settings.decision_log_dir.exists()
