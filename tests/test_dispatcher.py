@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,7 @@ from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
 
 WAIT = 2.0
+DEFAULT_AGTERM_KIT = Path(__file__).resolve().parents[2] / "agterm-kit"
 
 
 def _settings(
@@ -35,6 +38,7 @@ def _settings(
 ) -> Settings:
     names = {"omp": "omp", "claude": "claude", "omp/kimi": "omp"}
     return Settings(
+        decision_log_dir=tmp_path / "decisions",
         server=ServerSettings(
             data_dir=tmp_path,
             max_concurrent_tasks=max_tasks,
@@ -452,7 +456,7 @@ async def test_external_failure_is_recorded(tmp_path, git_repo, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_wait_cancel_and_recover_stale_without_worker(tmp_path, git_repo):
-    _, st, _, d = await _make(tmp_path)
+    settings, st, _, d = await _make(tmp_path)
     record = await d.submit(_req(git_repo))
     worker = d._tasks.pop(record.task_id)
     worker.cancel()
@@ -469,9 +473,17 @@ async def test_wait_cancel_and_recover_stale_without_worker(tmp_path, git_repo):
     await asyncio.gather(worker2, return_exceptions=True)
     stale2 = await st.get_task(record2.task_id)
     stale2.status = TaskStatus.running
+    stale2.result = ExecutionResult(
+        status="partial",
+        executor="omp",
+        model=None,
+        summary="unfinished",
+        meta={"decisions": [{"kind": "decision", "text": "Не завершено", "why": None}]},
+    )
     await st.update_task(stale2)
     assert await d.recover_stale() == 1
     assert (await d.get(record2.task_id)).status == TaskStatus.failed
+    assert not settings.decision_log_dir.exists()
 
 
 @pytest.mark.asyncio
@@ -638,3 +650,236 @@ async def test_failed_git_event_write_does_not_fail_a_running_submit(tmp_path, g
     done = await d.wait(record.task_id, WAIT)
 
     assert done.status == "completed"
+
+
+def _journal(settings: Settings) -> list[dict]:
+    return [
+        json.loads(line)
+        for path in settings.decision_log_dir.glob("*/*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_decision_log_records_redacted_decisions_and_questions(tmp_path, git_repo):
+    settings, st, adapters, dispatcher = await _make(tmp_path)
+    decisions = [
+        {"kind": "decision", "text": "Выбрать API: password=hunter2", "why": "Bearer abc123"},
+        {"kind": "question", "text": "Нужен экспорт?", "why": None},
+    ]
+    adapters["omp"].result = ExecutionResult(
+        status="completed", executor="omp", model=None, summary="ok", meta={"decisions": decisions}
+    )
+    submitted = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(submitted.task_id, WAIT)
+    assert done.status == "completed"
+    entries = _journal(settings)
+    assert [(item["kind"], item["text"], item["why"]) for item in entries] == [
+        ("decision", "Выбрать API: password=[REDACTED]", "Bearer [REDACTED]"),
+        ("question", "Нужен экспорт?", None),
+    ]
+    for entry in entries:
+        assert entry["repo"] == git_repo.name
+        assert entry["session"] == entry["task_id"] == submitted.task_id
+        assert entry["source"] == "omp" and entry["ref"] is None
+        assert len(entry["id"]) == 10 and int(entry["id"], 16) >= 0
+        moment = datetime.fromisoformat(entry["ts"])
+        assert moment.utcoffset() is not None
+        path = settings.decision_log_dir / git_repo.name / f"{moment:%Y-%m-%d}.jsonl"
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.parent.stat().st_mode & 0o777 == 0o700
+        assert json.dumps(entry, ensure_ascii=False, separators=(",", ":")) in path.read_text()
+    assert entries[0]["id"] != entries[1]["id"]
+    stored = await st.get_task(submitted.task_id)
+    assert stored.result.meta["decisions"] == decisions
+    assert "hunter2" in stored.result.meta["decisions"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_decision_log_matches_cli_golden_format(tmp_path, git_repo):
+    kit = Path(os.environ.get("AGTERM_KIT_DIR", DEFAULT_AGTERM_KIT))
+    golden_path = kit / "decision" / "decision_log.example.jsonl"
+    if not golden_path.is_file():
+        pytest.skip(f"golden журнала не найден: {golden_path}; задайте AGTERM_KIT_DIR")
+    golden = [json.loads(line) for line in golden_path.read_text().splitlines()]
+    settings, _, adapters, dispatcher = await _make(tmp_path)
+    adapters["omp"].result = ExecutionResult(
+        status="completed",
+        executor="omp",
+        model=None,
+        summary="ok",
+        meta={"decisions": [{"kind": "decision", "text": "Выбрать stdlib", "why": None}]},
+    )
+    submitted = await dispatcher.submit(_req(git_repo))
+    await dispatcher.wait(submitted.task_id, WAIT)
+    [entry] = _journal(settings)
+    assert entry.keys() == golden[0].keys()
+    for key, value in entry.items():
+        if key in {"session", "task_id", "why", "ref"}:
+            assert value is None or isinstance(value, str), key
+        else:
+            assert type(value) is type(golden[0][key]), key
+    assert entry["kind"] in {item["kind"] for item in golden}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,decisions",
+    [
+        ("task", []),
+        ("task", None),
+        ("review", [{"kind": "decision", "text": "Ревью не должно попасть в журнал", "why": None}]),
+        ("task", [{"kind": "answer", "text": "Не запись демона", "why": None}]),
+        ("task", [{"kind": "verdict", "text": "keep", "why": None}]),
+    ],
+)
+async def test_decision_log_skips_empty_results_and_review_children(
+    tmp_path, git_repo, kind, decisions
+):
+    settings, _, adapters, dispatcher = await _make(tmp_path)
+    parent = await dispatcher.submit(_req(git_repo))
+    await dispatcher.wait(parent.task_id, WAIT)
+    adapters["omp"].result = ExecutionResult(
+        status="completed",
+        executor="omp",
+        model=None,
+        summary="ok",
+        meta={"decisions": decisions} if decisions is not None else {},
+    )
+    child = await dispatcher.submit(_req(git_repo, kind=kind, parent_task_id=parent.task_id, hop=1))
+    done = await dispatcher.wait(child.task_id, WAIT)
+    assert done.status == "completed" and done.result.meta.get("decisions") == decisions
+    assert not settings.decision_log_dir.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inherited", [False, True])
+async def test_decision_log_hides_prod_but_database_keeps_redacted_decisions(
+    tmp_path, git_repo, inherited
+):
+    settings, st, adapters, dispatcher = await _make(tmp_path)
+    settings.executors["omp"].corporate = True
+    parent = await dispatcher.submit(_req(git_repo, prod=True))
+    await dispatcher.wait(parent.task_id, WAIT)
+    adapters["omp"].result = ExecutionResult(
+        status="completed",
+        executor="omp",
+        model=None,
+        summary="ok",
+        meta={
+            "decisions": [
+                {"kind": "decision", "text": "42 rows password=hunter2", "why": "token=abc123"}
+            ]
+        },
+    )
+    submitted = await dispatcher.submit(
+        _req(
+            git_repo,
+            prod=not inherited,
+            **({"parent_task_id": parent.task_id, "hop": 1} if inherited else {}),
+        )
+    )
+    done = await dispatcher.wait(submitted.task_id, WAIT)
+    assert done.status == "completed"
+    [entry] = _journal(settings)
+    assert entry["text"] == "(prod)" and entry["why"] is None
+    assert entry["session"] == (parent.task_id if inherited else submitted.task_id)
+    stored = await st.get_task(submitted.task_id)
+    assert stored.result.meta["decisions"] == [
+        {"kind": "decision", "text": "42 rows password=[REDACTED]", "why": "token=[REDACTED]"}
+    ]
+    assert stored.result.meta["redacted"]["replacements"] == 2
+
+
+@pytest.mark.asyncio
+async def test_decision_log_error_does_not_break_finalize(tmp_path, git_repo, caplog):
+    settings, st, adapters, dispatcher = await _make(tmp_path)
+    settings.decision_log_dir.write_text("не каталог")
+    adapters["omp"].result = ExecutionResult(
+        status="completed",
+        executor="omp",
+        model=None,
+        summary="ok",
+        meta={"decisions": [{"kind": "decision", "text": "Выбрать API", "why": None}]},
+    )
+    submitted = await dispatcher.submit(_req(git_repo))
+    done = await dispatcher.wait(submitted.task_id, WAIT)
+    assert done.status == "completed" and done.result.summary == "ok"
+    assert (await st.get_task(submitted.task_id)).finished_at is not None
+    assert any(event["kind"] == "exit" for event in await st.list_events(submitted.task_id))
+    assert "Не удалось записать журнал решений" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tail", [b"", b'{"old":true}\n', b'{"old":true}', b'{"interrupted":'])
+async def test_decision_log_appends_one_line_after_unterminated_tail(tmp_path, git_repo, tail):
+    settings, _, adapters, dispatcher = await _make(tmp_path)
+    folder = settings.decision_log_dir / git_repo.name
+    folder.mkdir(parents=True)
+    path = folder / f"{datetime.now().astimezone():%Y-%m-%d}.jsonl"
+    path.write_bytes(tail)
+    adapters["omp"].result = ExecutionResult(
+        status="completed",
+        executor="omp",
+        model=None,
+        summary="ok",
+        meta={"decisions": [{"kind": "question", "text": "Какой API?", "why": None}]},
+    )
+    submitted = await dispatcher.submit(_req(git_repo))
+    assert (await dispatcher.wait(submitted.task_id, WAIT)).status == "completed"
+    data = path.read_bytes()
+    prefix = tail + (b"\n" if tail and not tail.endswith(b"\n") else b"")
+    assert data.startswith(prefix) and data.endswith(b"\n")
+    entry = json.loads(data[len(prefix) :])
+    assert entry["task_id"] == submitted.task_id and entry["text"] == "Какой API?"
+    assert data[len(prefix) :].count(b"\n") == 1
+
+
+@pytest.mark.asyncio
+async def test_decision_log_uses_main_repo_name_for_worktree(tmp_path, git_repo):
+    from agent_dispatch.executors import worktree
+
+    settings, _, adapters, dispatcher = await _make(tmp_path)
+    tree = worktree.create(git_repo, tmp_path / "wt" / "different-name", "decision-task")
+    adapters["omp"].result = ExecutionResult(
+        status="completed",
+        executor="omp",
+        model=None,
+        summary="ok",
+        meta={"decisions": [{"kind": "decision", "text": "Выбрать API", "why": None}]},
+    )
+    submitted = await dispatcher.submit(_req(tree.path))
+    assert (await dispatcher.wait(submitted.task_id, WAIT)).status == "completed"
+    [entry] = _journal(settings)
+    assert entry["repo"] == git_repo.name
+    assert not (settings.decision_log_dir / tree.path.name).exists()
+
+
+@pytest.mark.asyncio
+async def test_decision_log_escalation_and_followup_keep_root_session(tmp_path, git_repo):
+    settings, _, adapters, dispatcher = await _make(tmp_path, escalation={"omp": ["claude"]})
+    adapters["omp"].result = ExecutionResult(
+        status="failed",
+        executor="omp",
+        model=None,
+        summary="cannot finish",
+        error="failed",
+    )
+    adapters["claude"].result = ExecutionResult(
+        status="completed",
+        executor="claude",
+        model=None,
+        summary="ok",
+        meta={"decisions": [{"kind": "decision", "text": "Выбрать API", "why": None}]},
+    )
+    root = await dispatcher.submit(_req(git_repo))
+    heir = await dispatcher.wait(root.task_id, WAIT)
+    assert heir.status == "completed" and heir.escalated_from == root.task_id
+    heir_id = heir.task_id
+    followup = await dispatcher.submit(_req(git_repo, executor="claude", followup_of=heir_id))
+    assert (await dispatcher.wait(followup.task_id, WAIT)).status == "completed"
+    entries = _journal(settings)
+    assert [entry["task_id"] for entry in entries] == [heir_id, followup.task_id]
+    assert all(
+        entry["session"] == root.task_id and entry["source"] == "claude" for entry in entries
+    )

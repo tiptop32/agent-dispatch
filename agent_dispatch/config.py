@@ -276,6 +276,12 @@ class Settings(_ConfigModel):
     limit_groups: dict[str, LimitGroupSettings] = Field(default_factory=dict)
     escalation: dict[str, list[str]] = Field(default_factory=dict)
     secrets: dict[str, SecretStr] = Field(default_factory=dict)
+    decision_log_dir: Path = Path("~/.local/state/decisions")
+
+    @model_validator(mode="after")
+    def normalize_decision_log_dir(self) -> Settings:
+        self.decision_log_dir = self.decision_log_dir.expanduser().resolve()
+        return self
 
     @model_validator(mode="after")
     def validate_references(self) -> Settings:

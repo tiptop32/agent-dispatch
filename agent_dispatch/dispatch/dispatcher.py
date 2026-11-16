@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
+import json
 import logging
+import os
+import secrets
 import subprocess
 import time
 import uuid
@@ -2252,6 +2256,80 @@ class Dispatcher:
             return guard.detail
         return None
 
+    async def _lineage_root(self, record: TaskRecord) -> str:
+        """Корень линии; продолжение попытки важнее родителя её вызывающего."""
+        seen: set[str] = set()
+        while record.task_id not in seen:
+            seen.add(record.task_id)
+            for parent_id in (
+                record.escalated_from,
+                record.request.followup_of,
+                record.parent_task_id or record.request.parent_task_id,
+            ):
+                if parent_id and parent_id not in seen:
+                    parent = await self.storage.get_task(parent_id)
+                    if parent is not None:
+                        record = parent
+                        break
+            else:
+                return record.task_id
+        return record.task_id
+
+    async def _log_decisions(
+        self, record: TaskRecord, result: ExecutionResult, *, prod: bool
+    ) -> None:
+        if record.request.kind != "task" or not result.meta.get("decisions"):
+            return
+        try:
+            repo = Path(record.request.cwd).name
+            for event in await self.storage.list_events(record.task_id):
+                if event["kind"] == "git" and event["payload"].get("common_dir"):
+                    repo = Path(event["payload"]["common_dir"]).parent.name
+                    break
+            session = await self._lineage_root(record)
+            await asyncio.to_thread(self._append_decisions, record, result, repo, session, prod)
+        except Exception:
+            # Как телеметрия MCP: недоступный журнал не отменяет результат задачи.
+            logging.getLogger(__name__).exception("Не удалось записать журнал решений")
+
+    def _append_decisions(
+        self, record: TaskRecord, result: ExecutionResult, repo: str, session: str, prod: bool
+    ) -> None:
+        folder = self.settings.decision_log_dir / repo
+        for item in result.meta["decisions"]:
+            if item["kind"] not in ("decision", "question"):
+                continue
+            now = datetime.now().astimezone()
+            entry = {
+                "id": secrets.token_hex(5),
+                "ts": now.isoformat(),
+                "repo": repo,
+                "session": session,
+                "source": result.executor,
+                "task_id": record.task_id,
+                "kind": item["kind"],
+                "text": "(prod)" if prod else redact.redact_text(item["text"])[0],
+                "why": None if prod else redact.redact_text(item.get("why"))[0],
+                "ref": None,
+            }
+            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            payload = (json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+            fd = os.open(
+                folder / f"{now:%Y-%m-%d}.jsonl", os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600
+            )
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                # Совместимо с CLI: прерванный хвост не поглощает новую строку.
+                size = os.fstat(fd).st_size
+                if size and os.pread(fd, 1, size - 1) != b"\n":
+                    payload = b"\n" + payload
+                if os.write(fd, payload) != len(payload):
+                    raise OSError("неполная запись строки журнала")
+            finally:
+                os.close(fd)
+
     async def _finalize(
         self,
         record: TaskRecord,
@@ -2270,10 +2348,12 @@ class Dispatcher:
         if failure_class is not None:
             result.meta.setdefault("failure_class", failure_class)
             result.meta.setdefault("error_code", failure_class)
-        if record.request.prod or decision.meta.get("perimeter") == "prod":
+        prod = record.request.prod or decision.meta.get("perimeter") == "prod"
+        if prod:
             # Отчёт продовой задачи читают вызывающий и следующие звенья: явные
             # секреты маскируются до записи и до передачи в эскалацию.
             redact.redact_result(result)
+        await self._log_decisions(record, result, prod=prod)
         record.result = result
         if plan is not None:
             # The heir reads its predecessor through storage during startup.

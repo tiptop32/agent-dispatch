@@ -101,13 +101,13 @@
 - Modify: `tests/test_dispatcher.py`
 - Modify: `tests/test_redact.py`
 
-- [ ] `Settings.decision_log_dir` (по умолчанию `~/.local/state/decisions`), синхронно `config_default.yaml` и `config.example.yaml`
-- [ ] `redact_result` дополнительно чистит `decisions[].text/why` в `meta` (для БД при prod); запись в журнал идёт после него
-- [ ] `_finalize` пишет журнал только при непустом `decisions` и только для `kind: task`: ревью-дети идут через тот же `_finalize` (`:738`), их записи отсекает фильтр, а не только отсутствие поля в промпте. Пишет сам (`source` = `result.executor`, `task_id`, `session` = `_lineage_root`); при prod-линии пишется `(prod)`, иначе текст проходит `redact_text`; ошибка записи не ломает `_finalize` (как `mcp_responses.jsonl`); `recover_stale` журнал не пишет, задача не завершена исполнителем
-- [ ] Запись совместима с CLI `agterm-decision` (agterm-kit `ca99675`): файл открывается `O_RDWR|O_APPEND`, под `flock` проверяется последний байт и при хвосте без LF перед записью добавляется `\n` (иначе запись склеивается с прерванной строкой и теряется); строка пишется одним `write()`; `verdict`/`answer` демон не пишет. CLI маскирует копией `redact_text` и сверяет её тестом паритета, поэтому правки `redact.py` проверяются и `bats tests/decision.bats` в agterm-kit
-- [ ] Тесты всегда задают `decision_log_dir` в `tmp_path`, а не только `data_dir` (`test_dispatcher.py:39`): gate и второй демон не должны писать в настоящий журнал
-- [ ] Тесты `tests/test_dispatcher*.py`: запись, ревью-ребёнок с `decisions` не пишет, пустой список не пишет, redact вне prod, prod → `(prod)`, ошибка записи, `repo` worktree-задачи равен имени основной репы, `session` эскалированного звена равен корню; golden-формат
-- [ ] Прогнать тесты, должны пройти
+- [x] `Settings.decision_log_dir` (по умолчанию `~/.local/state/decisions`), синхронно `config_default.yaml` и `config.example.yaml`
+- [x] `redact_result` дополнительно чистит `decisions[].text/why` в `meta` (для БД при prod); запись в журнал идёт после него
+- [x] `_finalize` пишет журнал только при непустом `decisions` и только для `kind: task`: ревью-дети идут через тот же `_finalize` (`:738`), их записи отсекает фильтр, а не только отсутствие поля в промпте. Пишет сам (`source` = `result.executor`, `task_id`, `session` = `_lineage_root`); при prod-линии пишется `(prod)`, иначе текст проходит `redact_text`; ошибка записи не ломает `_finalize` (как `mcp_responses.jsonl`); `recover_stale` журнал не пишет, задача не завершена исполнителем
+- [x] Запись совместима с CLI `agterm-decision` (agterm-kit `ca99675`): файл открывается `O_RDWR|O_APPEND`, под `flock` проверяется последний байт и при хвосте без LF перед записью добавляется `\n` (иначе запись склеивается с прерванной строкой и теряется); строка пишется одним `write()`; `verdict`/`answer` демон не пишет. CLI маскирует копией `redact_text` и сверяет её тестом паритета, поэтому правки `redact.py` проверяются и `bats tests/decision.bats` в agterm-kit
+- [x] Тесты всегда задают `decision_log_dir` в `tmp_path`, а не только `data_dir` (`test_dispatcher.py:39`): gate и второй демон не должны писать в настоящий журнал
+- [x] Тесты `tests/test_dispatcher*.py`: запись, ревью-ребёнок с `decisions` не пишет, пустой список не пишет, redact вне prod, prod → `(prod)`, ошибка записи, `repo` worktree-задачи равен имени основной репы, `session` эскалированного звена равен корню; golden-формат
+- [x] Прогнать тесты, должны пройти
 
 ### Task 4: replay
 **Depends on:** Task 3

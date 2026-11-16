@@ -132,7 +132,7 @@ def redact_text(text: str | None) -> tuple[str | None, int]:
 
 
 def redact_result(result: ExecutionResult) -> None:
-    """Очистить `summary` и `error`; факт и число замен идут в `meta.redacted`."""
+    """Очистить `summary`, `error` и решения; факт и число замен идут в `meta.redacted`."""
     fields: list[str] = []
     total = 0
     summary, count = redact_text(result.summary)
@@ -143,5 +143,12 @@ def redact_result(result: ExecutionResult) -> None:
     if count:
         result.error, total = error, total + count
         fields.append("error")
+    for index, item in enumerate(result.meta.get("decisions", [])):
+        for field in ("text", "why"):
+            value, count = redact_text(item.get(field))
+            if count:
+                item[field] = value
+                total += count
+                fields.append(f"decisions[{index}].{field}")
     if total:
         result.meta["redacted"] = {"replacements": total, "fields": fields}

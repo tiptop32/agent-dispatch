@@ -83,12 +83,27 @@ def test_result_records_the_fact_without_values():
         model=None,
         summary=f"password=hunter2 and {JWT}",
         error="Bearer abcdef1234567890",
+        meta={
+            "decisions": [
+                {"kind": "decision", "text": "password=hunter2", "why": "Bearer abc123"},
+                {"kind": "question", "text": "Нужен экспорт?", "why": None},
+                {"kind": "decision", "text": "Сохранить API"},
+            ]
+        },
     )
     redact_result(result)
 
     assert "hunter2" not in result.summary and JWT not in result.summary
     assert "abcdef1234567890" not in (result.error or "")  # pragma: allowlist secret
-    assert result.meta["redacted"] == {"replacements": 3, "fields": ["summary", "error"]}
+    assert result.meta["decisions"] == [
+        {"kind": "decision", "text": "password=[REDACTED]", "why": "Bearer [REDACTED]"},
+        {"kind": "question", "text": "Нужен экспорт?", "why": None},
+        {"kind": "decision", "text": "Сохранить API"},
+    ]
+    assert result.meta["redacted"] == {
+        "replacements": 5,
+        "fields": ["summary", "error", "decisions[0].text", "decisions[0].why"],
+    }
     assert "hunter2" not in repr(result.meta)
 
 

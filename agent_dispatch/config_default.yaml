@@ -1,3 +1,6 @@
+# Журнал решений и вопросов исполнителей, общий с agterm-decision.
+decision_log_dir: ~/.local/state/decisions
+
 server:
   host: 127.0.0.1
   port: 7433
