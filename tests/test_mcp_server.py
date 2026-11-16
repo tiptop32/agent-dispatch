@@ -464,6 +464,54 @@ async def test_followup_tool_posts_the_message_and_shows_the_link(tmp_path):
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_compact_output_shows_decisions_count_only(tmp_path):
+    # Компактный ответ перечитывается вызывающим на каждом ходе: решения
+    # исполнителя показываются числом, сами записи отдаёт только verbose.
+    payload = view().model_dump(mode="json")
+    payload["result"]["meta"]["decisions"] = [
+        {"kind": "rename", "text": "renamed fn", "why": "clearer"},
+        {"kind": "skip", "text": "skipped lint", "why": "unused"},
+    ]
+    respx.get("http://127.0.0.1:7433/tasks/t1").mock(return_value=httpx.Response(200, json=payload))
+    r = await call(settings(tmp_path), "status", {"task_id": "t1"})
+    text = r.content[0].text
+    assert "decisions: 2" in text
+    assert "renamed fn" not in text
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize("decisions", [[], None])
+async def test_compact_output_omits_empty_decisions(tmp_path, decisions):
+    # Пустые поля компактный ответ не печатает — в том числе отсутствующий
+    # ключ `meta.decisions`.
+    payload = view().model_dump(mode="json")
+    if decisions is None:
+        payload["result"]["meta"].pop("decisions", None)
+    else:
+        payload["result"]["meta"]["decisions"] = decisions
+    respx.get("http://127.0.0.1:7433/tasks/t1").mock(return_value=httpx.Response(200, json=payload))
+    r = await call(settings(tmp_path), "status", {"task_id": "t1"})
+    assert "decisions" not in r.content[0].text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_verbose_output_keeps_decisions_list(tmp_path):
+    # verbose отдаёт весь meta через model_dump_json, включая сами записи решений.
+    payload = view().model_dump(mode="json")
+    payload["result"]["meta"]["decisions"] = [
+        {"kind": "rename", "text": "renamed fn", "why": "clearer"}
+    ]
+    respx.get("http://127.0.0.1:7433/tasks/t1").mock(return_value=httpx.Response(200, json=payload))
+    r = await call(settings(tmp_path), "status", {"task_id": "t1", "verbose": True})
+    text = r.content[0].text
+    assert "renamed fn" in text
+    assert '"decisions"' in text
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_followup_tool_reports_a_refusal(tmp_path):
     respx.post("http://127.0.0.1:7433/tasks/t0/followup").mock(
         return_value=httpx.Response(409, json={"detail": "task t0 is still running"})

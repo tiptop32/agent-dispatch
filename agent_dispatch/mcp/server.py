@@ -245,6 +245,10 @@ def _task_text(view: TaskView, verbose: bool = False) -> str:
             if key == "error_code" and value == result.meta.get("failure_class"):
                 continue  # тот же код, что и в failure_class
             lines.append(f"{key}: {value}")
+        if decisions := result.meta.get("decisions") or None:
+            # Записи решений вызывающий не читает на каждом ходе: компактный
+            # ответ показывает только их число, verbose отдаёт весь meta.
+            lines.append(f"decisions: {len(decisions)}")
         if summary:
             limit = 8000 if view.request.kind == "review" else 800
             if len(summary) > limit:
