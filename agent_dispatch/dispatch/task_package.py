@@ -216,6 +216,14 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         files = _rewrite_file_list(files, root, worktree)
         checks = _rewrite_file_list(checks, root, worktree)
     instructions = result_instructions(adapter_kind)
+    if req.kind != "review":
+        instructions += (
+            '\nOptional `decisions`: an array of {kind: "decision|question", text: string, '
+            "why?: string|null}. Record decisions made without the user and questions asked: "
+            "choices between options with different behavior, deviations from the plan, "
+            "assumptions about requirements, irreversible actions, or dropped scope. "
+            "Omit formatting, names, and obvious plan steps; omit the field if there are none."
+        )
     # Тот же порядок, что у жёсткого таймаута: запрос, исполнитель, routing.
     budget_seconds = settings.timeout_for(package.executor or "", req.timeout_seconds)
     followup = package.followup

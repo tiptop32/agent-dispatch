@@ -267,6 +267,27 @@ def test_review_prompt_asks_for_a_verdict():
     assert '"verdict"' not in task
 
 
+@pytest.mark.parametrize("adapter", ["claude", "omp"])
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("kind", ["task", "review"])
+def test_decisions_instructions_are_only_in_task_prompts(adapter, resumed, kind):
+    followup = (
+        Followup(task_id="t1", executor=adapter, status="completed", resumed=True)
+        if resumed
+        else None
+    )
+    package = TaskPackage(request=request(kind=kind), followup=followup)
+    prompt = render_prompt(package, adapter, settings())
+    if kind == "review":
+        assert "decisions" not in prompt
+    else:
+        assert "`decisions`" in prompt
+        assert "decision|question" in prompt
+        assert "why" in prompt
+        assert "irreversible" in prompt
+        assert "formatting" in prompt
+
+
 @pytest.mark.parametrize("base", ["--output=/tmp/pwned", "-p", "HEAD; rm -rf /", "a b", ""])
 def test_review_base_rejects_options_and_shell_text(base):
     # review_base приходит из MCP и идёт в `git diff <review_base>`: значение с

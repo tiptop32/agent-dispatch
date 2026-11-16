@@ -126,6 +126,8 @@ def normalize(
             meta=meta,
         )
     tests = raw.get("tests")
+    if "decisions" in raw:
+        meta["decisions"] = [dict(item) for item in raw["decisions"]]
     return ExecutionResult(
         status=raw["status"],
         executor=executor,
@@ -217,6 +219,36 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
             raw = {**raw, "confidence": mapped_confidence}
         shown = "dropped" if mapped_confidence is None else mapped_confidence
         coerced.append(f"confidence: {confidence!r} -> {shown}")
+    if "decisions" in raw:
+        decisions = raw["decisions"]
+        if not isinstance(decisions, list):
+            raw = {name: value for name, value in raw.items() if name != "decisions"}
+            coerced.append(f"decisions: {type(decisions).__name__} -> dropped")
+        else:
+            normalized = []
+            for index, item in enumerate(decisions):
+                prefix = f"decisions[{index}]"
+                if not isinstance(item, dict):
+                    coerced.append(f"{prefix}: not an object -> dropped")
+                    continue
+                if item.get("kind") not in ("decision", "question"):
+                    coerced.append(f"{prefix}: invalid kind -> dropped")
+                    continue
+                text = item.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    coerced.append(f"{prefix}: invalid text -> dropped")
+                    continue
+                decision = {
+                    key: value for key, value in item.items() if key in ("kind", "text", "why")
+                }
+                if len(decision) != len(item):
+                    coerced.append(f"{prefix}: extra keys -> dropped")
+                why = decision.get("why")
+                if why is not None and not isinstance(why, str):
+                    decision["why"] = None
+                    coerced.append(f"{prefix}.why: {type(why).__name__} -> None")
+                normalized.append(decision)
+            raw = {**raw, "decisions": normalized}
     if isinstance(tests, dict) and isinstance(tests.get("result"), str):
         value = tests["result"].strip().lower()
         if value not in ("passed", "failed", "not_run"):
@@ -230,7 +262,7 @@ def _coerce(raw: dict) -> tuple[dict, list[str]]:
     return raw, coerced
 
 
-_OPTIONAL_FIELDS = ("changed_files", "tests", "confidence", "needs_escalation")
+_OPTIONAL_FIELDS = ("changed_files", "tests", "confidence", "needs_escalation", "decisions")
 
 #: Уверенность словами: модели пишут «high» вместо числа.
 _CONFIDENCE_WORDS = {"high": 0.9, "medium": 0.6, "moderate": 0.6, "low": 0.3}

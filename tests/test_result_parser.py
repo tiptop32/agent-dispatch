@@ -270,6 +270,99 @@ def _block(**fields):
 
 
 @pytest.mark.parametrize(
+    "decisions",
+    [
+        [],
+        [
+            {"kind": "decision", "text": "Сохранять порядок", "why": "Он влияет на выбор"},
+            {"kind": "question", "text": "Менять контракт?", "why": None},
+            {"kind": "decision", "text": "Оставить контракт"},
+        ],
+    ],
+)
+def test_normalize_preserves_valid_decisions_in_meta(decisions):
+    result = normalize(_block(decisions=decisions), outcome(), ["a.py"], "omp", None)
+    assert result.status == "completed"
+    assert result.meta["decisions"] == decisions
+    assert "coerced" not in result.meta
+    assert "parse_error" not in result.meta
+
+
+def test_normalize_without_decisions_remains_compatible():
+    result = normalize(_block(), outcome(), [], "omp", None)
+    assert result.status == "completed"
+    assert "decisions" not in result.meta
+    assert "coerced" not in result.meta
+
+
+@pytest.mark.parametrize("decisions", [None, False, 7, "decision", {}])
+def test_normalize_drops_non_list_decisions(decisions):
+    result = normalize(_block(decisions=decisions), outcome(), ["a.py"], "omp", None)
+    assert result.status == "completed"
+    assert result.changed_files == ["a.py"]
+    assert "decisions" not in result.meta
+    assert "parse_error" not in result.meta
+    kind = "None" if decisions is None else type(decisions).__name__
+    assert result.meta["coerced"] == [f"decisions: {kind} -> dropped"]
+
+
+@pytest.mark.parametrize(
+    ("item", "reason"),
+    [
+        (None, "not an object"),
+        (False, "not an object"),
+        (7, "not an object"),
+        ("decision", "not an object"),
+        ([], "not an object"),
+        ({"text": "Выбор"}, "invalid kind"),
+        *[
+            ({"kind": kind, "text": "Выбор"}, "invalid kind")
+            for kind in (None, False, 7, [], {}, "answer", "Decision")
+        ],
+        ({"kind": "decision"}, "invalid text"),
+        *[
+            ({"kind": "decision", "text": text}, "invalid text")
+            for text in (None, False, 7, [], {}, "", " \t\n")
+        ],
+    ],
+)
+def test_normalize_drops_invalid_decision_items_without_losing_valid_neighbors(item, reason):
+    valid = {"kind": "decision", "text": "Сохранять порядок"}
+    result = normalize(_block(decisions=[valid, item, valid]), outcome(), ["a.py"], "omp", None)
+    assert result.status == "completed"
+    assert result.meta["decisions"] == [valid, valid]
+    assert result.meta["coerced"] == [f"decisions[1]: {reason} -> dropped"]
+    assert "parse_error" not in result.meta
+
+
+@pytest.mark.parametrize("why", [False, 7, [], {}])
+def test_normalize_replaces_non_string_decision_why_with_null(why):
+    item = {"kind": "question", "text": "Менять контракт?", "why": why}
+    result = normalize(_block(decisions=[item]), outcome(), [], "omp", None)
+    assert result.status == "completed"
+    assert result.meta["decisions"] == [{**item, "why": None}]
+    assert result.meta["coerced"] == [f"decisions[0].why: {type(why).__name__} -> None"]
+    assert "parse_error" not in result.meta
+
+
+def test_normalize_strips_extra_decision_keys():
+    item = {"kind": "decision", "text": "Сохранять порядок", "extra": {"nested": True}}
+    result = normalize(_block(decisions=[item]), outcome(), [], "omp", None)
+    assert result.status == "completed"
+    assert result.meta["decisions"] == [{"kind": "decision", "text": "Сохранять порядок"}]
+    assert result.meta["coerced"] == ["decisions[0]: extra keys -> dropped"]
+    assert "parse_error" not in result.meta
+
+
+def test_normalize_keeps_report_when_all_decisions_are_invalid():
+    result = normalize(_block(decisions=[{}]), outcome(), [], "omp", None)
+    assert result.status == "completed"
+    assert result.meta["decisions"] == []
+    assert result.meta["coerced"] == ["decisions[0]: invalid kind -> dropped"]
+    assert "parse_error" not in result.meta
+
+
+@pytest.mark.parametrize(
     ("confidence", "expected"),
     [
         pytest.param("high", 0.9, id="word"),

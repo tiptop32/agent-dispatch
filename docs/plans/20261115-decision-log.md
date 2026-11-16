@@ -71,12 +71,12 @@
 - Modify: `tests/test_result_parser.py`
 - Modify: `tests/test_task_package.py`
 
-- [ ] `agent_result.schema.json`: необязательное `decisions: array`, элементы `{kind: decision|question, text: string, why?: string|null}`, `required: [kind, text]`
-- [ ] `result_parser._coerce` приводит или отбрасывает всё, что схема отвергнет: не список, элемент не объект, неизвестный `kind`, пустой или нестроковый `text`, нестроковый `why` (→ `null`), лишние ключи элемента (срезаются); `decisions` входит в `_OPTIONAL_FIELDS` (:233), `null` удаляется; причины в `meta.coerced`
-- [ ] Сборка результата (:128-142): нормализованный список копируется в `meta.decisions`
-- [ ] Инструкция поля добавляется в `render_prompt` только при `review=False` (`task_package.py:203/:226`); сигнатура `result_instructions` не меняется
-- [ ] Тесты `tests/test_result_parser.py`: валидно → `completed` и assert на `meta.decisions`; нет поля; `null`; не список; каждый вид мусора → `completed` + `coerced`; `tests/test_task_package.py`: у review поля нет, у задачи есть
-- [ ] Прогнать тесты, должны пройти
+- [x] `agent_result.schema.json`: необязательное `decisions: array`, элементы `{kind: decision|question, text: string, why?: string|null}`, `required: [kind, text]`
+- [x] `result_parser._coerce` приводит или отбрасывает всё, что схема отвергнет: не список, элемент не объект, неизвестный `kind`, пустой или нестроковый `text`, нестроковый `why` (→ `null`), лишние ключи элемента (срезаются); `decisions` входит в `_OPTIONAL_FIELDS` (:233), `null` удаляется; причины в `meta.coerced`
+- [x] Сборка результата (:128-142): нормализованный список копируется в `meta.decisions`
+- [x] Инструкция поля добавляется в `render_prompt` только при `review=False` (`task_package.py:203/:226`); сигнатура `result_instructions` не меняется
+- [x] Тесты `tests/test_result_parser.py`: валидно → `completed` и assert на `meta.decisions`; нет поля; `null`; не список; каждый вид мусора → `completed` + `coerced`; `tests/test_task_package.py`: у review поля нет, у задачи есть
+- [x] Прогнать тесты, должны пройти
 
 ### Task 2: слияния
 **Depends on:** Task 1
