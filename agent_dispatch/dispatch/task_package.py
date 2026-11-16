@@ -160,12 +160,29 @@ def result_instructions(adapter_kind: AdapterKind) -> str:
     return 'End your final message with a fenced block tagged `agent-dispatch-result` containing a JSON object with fields: status (completed|partial|failed|needs_context|needs_escalation), summary, changed_files, tests {command, result: passed|failed|not_run}, confidence (0..1), needs_escalation. Example:\n```agent-dispatch-result\n{"status": "completed", "summary": "...", "changed_files": [], "tests": {"command": "pytest", "result": "passed"}, "confidence": 0.9, "needs_escalation": false}\n```'  # noqa: E501
 
 
+#: Поле журнала решений. Только у задач: ревью их не пишет. Дозапрос отчёта и раунд
+#: правки бывают только у задач и тоже его просят, иначе решения правки терялись бы.
+DECISIONS_INSTRUCTION = (
+    '\nOptional `decisions`: an array of {kind: "decision|question", text: string, '
+    "why?: string|null}. Record decisions made without the user and questions asked: "
+    "choices between options with different behavior or public API (for example, "
+    "which of two function names to use), deviations from the plan, assumptions about "
+    "requirements, irreversible actions, or dropped scope. Omit formatting, local "
+    "variable names, and obvious plan steps; omit the field if there are none."
+)
+
+
+def task_result_instructions(adapter_kind: AdapterKind) -> str:
+    """Инструкция отчёта для задачи: блок результата и поле `decisions`."""
+    return result_instructions(adapter_kind) + DECISIONS_INSTRUCTION
+
+
 def render_report_prompt(adapter_kind: AdapterKind) -> str:
     """Промпт дозапроса отчёта в той же сессии, когда запуск кончился без блока."""
     return (
         _templates()
         .get_template("report_only.md.j2")
-        .render(result_instructions=result_instructions(adapter_kind))
+        .render(result_instructions=task_result_instructions(adapter_kind))
     )
 
 
@@ -183,7 +200,7 @@ def render_review_fix_prompt(
             feedback=feedback,
             prod=prod,
             task=task,
-            result_instructions=result_instructions(adapter_kind),
+            result_instructions=task_result_instructions(adapter_kind),
         )
     )
 
@@ -215,15 +232,11 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
         context = rewrite_repo_prefix(context, root, worktree)
         files = _rewrite_file_list(files, root, worktree)
         checks = _rewrite_file_list(checks, root, worktree)
-    instructions = result_instructions(adapter_kind)
-    if req.kind != "review":
-        instructions += (
-            '\nOptional `decisions`: an array of {kind: "decision|question", text: string, '
-            "why?: string|null}. Record decisions made without the user and questions asked: "
-            "choices between options with different behavior, deviations from the plan, "
-            "assumptions about requirements, irreversible actions, or dropped scope. "
-            "Omit formatting, names, and obvious plan steps; omit the field if there are none."
-        )
+    instructions = (
+        result_instructions(adapter_kind)
+        if req.kind == "review"
+        else task_result_instructions(adapter_kind)
+    )
     # Тот же порядок, что у жёсткого таймаута: запрос, исполнитель, routing.
     budget_seconds = settings.timeout_for(package.executor or "", req.timeout_seconds)
     followup = package.followup

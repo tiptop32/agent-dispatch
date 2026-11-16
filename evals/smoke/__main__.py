@@ -64,7 +64,8 @@ async def run(args: argparse.Namespace) -> int:
             print(
                 f"{executor:20} positive={per_executor['positive']}/{runs} "
                 f"noise={per_executor['noise']}/{runs} "
-                f"fork_runs={per_executor['fork_runs']} none_runs={per_executor['none_runs']}"
+                f"fork_runs={per_executor['fork_runs']} none_runs={per_executor['none_runs']} "
+                f"failed_runs={per_executor['failed_runs']}"
             )
         print(f"decisions threshold: {'pass' if ok else 'fail'}")
         return 0 if ok else 1

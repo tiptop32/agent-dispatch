@@ -231,6 +231,23 @@ def test_report_prompt_asks_only_for_the_report_in_the_adapter_format(adapter, f
     assert format_hint in prompt
 
 
+def test_report_and_fix_round_prompts_ask_for_decisions() -> None:
+    """Без поля в этих промптах решения дозапроса и правки терялись бы до слияния."""
+    from agent_dispatch.dispatch.task_package import render_review_fix_prompt
+
+    assert "`decisions`" in render_report_prompt("omp")
+    fix = render_review_fix_prompt("omp", "замечание", prod=False, task="задача")
+    assert "`decisions`" in fix
+
+
+def test_decisions_instruction_keeps_public_api_choices() -> None:
+    """Выбор имени API это решение: eval decisions_fork требует его записать."""
+    from agent_dispatch.dispatch.task_package import DECISIONS_INSTRUCTION
+
+    assert "function names" in DECISIONS_INSTRUCTION
+    assert "Omit formatting, names" not in DECISIONS_INSTRUCTION
+
+
 def test_review_package_diffs_against_review_base(git_repo):
     repo = Path(git_repo)
     base = subprocess.run(

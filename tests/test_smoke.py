@@ -47,7 +47,9 @@ def test_decisions_counts_empty_results() -> None:
 
 def test_decisions_counts_positive_on_fork_mention() -> None:
     counts = decisions_counts([_fork_row("omp/sol")])
-    assert counts == {"omp/sol": {"positive": 1, "noise": 0, "fork_runs": 1, "none_runs": 0}}
+    assert counts == {
+        "omp/sol": {"positive": 1, "noise": 0, "fork_runs": 1, "none_runs": 0, "failed_runs": 0}
+    }
 
 
 def test_decisions_counts_positive_accepts_russian_and_flat_decisions() -> None:
@@ -137,8 +139,14 @@ def test_decisions_counts_full_run_n10_meets_threshold() -> None:
         results += [_row(executor, task="decisions_none") for _ in range(8)]
     counts = decisions_counts(results)
     assert counts == {
-        "omp/sol": {"positive": 9, "noise": 2, "fork_runs": 10, "none_runs": 10},
-        "omp/x5-code-large": {"positive": 9, "noise": 2, "fork_runs": 10, "none_runs": 10},
+        "omp/sol": {"positive": 9, "noise": 2, "fork_runs": 10, "none_runs": 10, "failed_runs": 0},
+        "omp/x5-code-large": {
+            "positive": 9,
+            "noise": 2,
+            "fork_runs": 10,
+            "none_runs": 10,
+            "failed_runs": 0,
+        },
     }
     assert decisions_threshold_ok(counts)
 
@@ -161,7 +169,7 @@ def test_make_row_lifts_meta_decisions_from_task_view() -> None:
 
 def test_make_row_without_decisions_omits_meta() -> None:
     view = SimpleNamespace(status="completed", result=SimpleNamespace(changed_files=[], meta={}))
-    row = make_row("decisions_none", "omp/sol", Verdict(ok=False, reasons=["x"]), view)
+    row = make_row("decisions_none", "omp/sol", Verdict(ok=True, reasons=[]), view)
     assert "meta" not in row
     # И плоский ключ готового отчёта тоже читается.
     row["decisions"] = [{"kind": "decision", "text": "x"}]
@@ -296,3 +304,26 @@ def test_main_accepts_executors_argument(monkeypatch) -> None:
     except SystemExit as exc:
         assert exc.code == 0
     assert seen["executors"] == "omp/sol"
+
+
+def test_decisions_counts_skip_failed_runs_and_threshold_fails() -> None:
+    """Проваленный decisions_none без решений не «шум 0»: серия неполная, порог fail."""
+    results = [_row(task="decisions_fork", decisions=[{"kind": "decision", "text": "to_date"}])]
+    results *= 10
+    results += [_row(task="decisions_none") for _ in range(9)]
+    failed = _row(task="decisions_none")
+    failed["ok"] = False
+    results.append(failed)
+    counts = decisions_counts(results)
+    assert counts["omp/sol"]["none_runs"] == 9
+    assert counts["omp/sol"]["failed_runs"] == 1
+    assert not decisions_threshold_ok(counts)
+
+
+def test_decisions_threshold_scales_with_runs() -> None:
+    """При --runs 20 нужен позитив 16 и шум не выше 4, а не абсолютные 8 и 2."""
+    base = {"fork_runs": 20, "none_runs": 20, "failed_runs": 0}
+    assert not decisions_threshold_ok({"omp/sol": {**base, "positive": 8, "noise": 0}}, runs=20)
+    assert decisions_threshold_ok({"omp/sol": {**base, "positive": 16, "noise": 4}}, runs=20)
+    five = {"fork_runs": 5, "none_runs": 5, "failed_runs": 0, "positive": 5, "noise": 1}
+    assert decisions_threshold_ok({"omp/sol": five}, runs=5)

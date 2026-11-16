@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 import re
 import shutil
@@ -41,10 +42,11 @@ class Verdict:
 
 
 # Пороги eval'а записей решений (docs/plans/20261115-decision-log.md): N=10 прогонов
-# каждой задачи на исполнителя, позитив не ниже 8, шум не выше 2.
+# каждой задачи на исполнителя, позитив не ниже 80%, шум не выше 20% серии. Доли,
+# а не абсолютные 8 и 2: при --runs 20 позитив 8/20 иначе проходил бы порог.
 DECISIONS_RUNS_PER_EXECUTOR = 10
-DECISIONS_POSITIVE_MIN = 8
-DECISIONS_NOISE_MAX = 2
+DECISIONS_POSITIVE_SHARE = 0.8
+DECISIONS_NOISE_SHARE = 0.2
 
 
 def _mentions_fork(text: str) -> bool:
@@ -75,8 +77,13 @@ def decisions_counts(results: Iterable[Mapping[str, Any]]) -> dict[str, dict[str
     for result in results:
         per_executor = counts.setdefault(
             str(result.get("executor", "")),
-            {"positive": 0, "noise": 0, "fork_runs": 0, "none_runs": 0},
+            {"positive": 0, "noise": 0, "fork_runs": 0, "none_runs": 0, "failed_runs": 0},
         )
+        # Невыполненная задача не прогон серии: проваленный decisions_none без
+        # решений иначе считался бы «шум 0», и порог проходил бы на поломке.
+        if not result.get("ok", True):
+            per_executor["failed_runs"] += 1
+            continue
         meta = result.get("meta") or {}
         decisions = meta.get("decisions") or result.get("decisions") or []
         task = result.get("task")
@@ -98,12 +105,16 @@ def decisions_threshold_ok(
     counts: Mapping[str, Mapping[str, int]],
     *,
     runs: int = DECISIONS_RUNS_PER_EXECUTOR,
-    positive_min: int = DECISIONS_POSITIVE_MIN,
-    noise_max: int = DECISIONS_NOISE_MAX,
+    positive_min: int | None = None,
+    noise_max: int | None = None,
 ) -> bool:
-    """Порог: у каждого исполнителя полная серия N прогонов, позитив не ниже
-    positive_min, шум не выше noise_max. Неполная серия — fail, иначе 2 прогона
-    из 2 выглядели бы как 10 из 10."""
+    """Порог: у каждого исполнителя полная серия N успешных прогонов, позитив не ниже
+    positive_min, шум не выше noise_max (по умолчанию 80% и 20% от N). Неполная серия,
+    в том числе из-за проваленных прогонов, — fail, иначе 2 из 2 выглядели бы как 10 из 10."""
+    if positive_min is None:
+        positive_min = math.ceil(DECISIONS_POSITIVE_SHARE * runs)
+    if noise_max is None:
+        noise_max = math.floor(DECISIONS_NOISE_SHARE * runs)
     return bool(counts) and all(
         per_executor["fork_runs"] == runs
         and per_executor["none_runs"] == runs

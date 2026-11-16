@@ -1,5 +1,6 @@
-# Журнал решений и вопросов исполнителей, общий с agterm-decision.
-decision_log_dir: ~/.local/state/decisions
+# Журнал решений и вопросов исполнителей, общий с agterm-decision. По умолчанию
+# $AGENT_DISPATCH_DECISION_LOG_DIR или ~/.local/state/decisions; явный ключ сильнее env.
+# decision_log_dir: ~/.local/state/decisions
 
 server:
   host: 127.0.0.1

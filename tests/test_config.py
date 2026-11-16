@@ -494,3 +494,24 @@ def test_review_fix_timeout_loads_packaged_default_and_zero_override(tmp_config_
     assert settings.execution.review_fix_timeout_seconds == 600
     (tmp_config_dir / "config.yaml").write_text("execution:\n  review_fix_timeout_seconds: 0\n")
     assert load_settings(tmp_config_dir).execution.review_fix_timeout_seconds == 0
+
+
+def test_decision_log_dir_default_follows_env(monkeypatch, tmp_path) -> None:
+    """Тесты и второй демон уводят журнал из ~/.local/state/decisions через env."""
+    from agent_dispatch.config import Settings
+
+    default = Settings.model_fields["decision_log_dir"].default_factory
+    monkeypatch.setenv("AGENT_DISPATCH_DECISION_LOG_DIR", str(tmp_path / "log"))
+    assert default() == tmp_path / "log"
+    monkeypatch.delenv("AGENT_DISPATCH_DECISION_LOG_DIR")
+    assert default() == Path("~/.local/state/decisions")
+
+
+def test_default_config_does_not_pin_decision_log_dir() -> None:
+    """Явный ключ в config_default.yaml перебил бы env, и тесты писали бы в журнал пользователя."""
+    import yaml
+
+    import agent_dispatch.config as config
+
+    default_path = Path(config.__file__).with_name("config_default.yaml")
+    assert "decision_log_dir" not in (yaml.safe_load(default_path.read_text()) or {})
