@@ -27,6 +27,7 @@ from evals.replay.harness import (
     caller_bytes,
     children_refusals,
     cost_drift,
+    decision_log,
     delegations,
     exploration_comparison,
     feedback_summary,
@@ -2329,7 +2330,21 @@ def test_review_stability_warn_requires_share_and_measured_sample(unstable, meas
 def test_replay_command_outputs_new_sections(tmp_path, monkeypatch, capsys, as_json):
     import sys
 
+    from agent_dispatch.config import load_settings
+    from evals.replay import __main__ as replay_main
     from evals.replay.__main__ import main
+
+    settings = load_settings()
+    settings.decision_log_dir = tmp_path / "journal"
+    _write_decision_journal(
+        settings.decision_log_dir,
+        "2026-09-24",
+        [
+            {"kind": "decision", "id": "root-choice", "task_id": "root"},
+            {"kind": "verdict", "ref": "root-choice", "text": "keep"},
+        ],
+    )
+    monkeypatch.setattr(replay_main, "load_settings", lambda: settings)
 
     db = _db(
         tmp_path,
@@ -2401,6 +2416,8 @@ def test_replay_command_outputs_new_sections(tmp_path, monkeypatch, capsys, as_j
         assert report["review_stages"]["works"] == 1
         assert report["review_stability"]["unstable_share"] == 1
         assert report["review_stability"]["by_reviewer"]["reviewer"]["unstable"] == 1
+        assert report["decision_log"]["keep_share"] == 1
+        assert report["decision_log"]["share"] is None
     else:
         assert "caller bytes (MCP responses): 1 of 1 roots" in text
         assert "watchdog: 1, idle 1" in text
@@ -2410,3 +2427,157 @@ def test_replay_command_outputs_new_sections(tmp_path, monkeypatch, capsys, as_j
         assert "review stability: 1 fail verdicts, unstable 1 of 1 measured pass (100%)" in text
         assert "unstable round cost $0.2500 (subset of fix rounds, not additive)" in text
         assert "  reviewer: no_round 0" in text
+        assert "decision log: 0 of 0 completed tasks (n/a), empty why n/a; keep 100%" in text
+
+
+def _write_decision_journal(log_dir, day, rows):
+    folder = log_dir / "repo"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{day}.jsonl"
+    path.write_text(
+        "\n".join(row if isinstance(row, str) else json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_decision_log_meta_metrics_exclude_reviews_and_unfinished_tasks(tmp_path):
+    rows = [
+        {"kind": "decision", "text": "A", "why": "reason"},
+        {"kind": "decision", "text": "B", "why": ""},
+        {"kind": "decision", "text": "C", "why": None},
+        {"kind": "decision", "text": "D", "why": "  "},
+        {"kind": "question", "text": "Which?", "why": None},
+    ]
+    task = _task("done", "completed", result=_result("completed", meta={"decisions": rows}))
+    tasks = [
+        task,
+        _task("legacy", "completed"),
+        _task("empty", "completed", result=_result("completed", meta={"decisions": []})),
+        _task("running", "running"),
+        replace(task, task_id="review", kind="review"),
+        replace(task, task_id="failed", status="failed"),
+    ]
+    report = decision_log(tasks, tmp_path / "missing")
+    assert report == {
+        "completed": 3,
+        "with_decisions": 1,
+        "share": 1 / 3,
+        "decisions": 4,
+        "empty_why_share": 0.75,
+        "verdicts": "unmeasured",
+        "keep_share": "unmeasured",
+        "change_revert_share": "unmeasured",
+    }
+    text = render({**replay([], 1800), "decision_log": report})
+    assert "empty why 75%; keep unmeasured, change/revert unmeasured" in text
+
+
+@pytest.mark.parametrize("question_only", [False, True])
+def test_decision_log_empty_denominators_are_not_zero(tmp_path, question_only):
+    tasks = (
+        [
+            _task(
+                "question",
+                "completed",
+                result=_result(
+                    "completed", meta={"decisions": [{"kind": "question", "text": "Which?"}]}
+                ),
+            )
+        ]
+        if question_only
+        else []
+    )
+    report = decision_log(tasks, tmp_path)
+    assert report["share"] == (1 if question_only else None)
+    assert report["empty_why_share"] is None
+    assert report["verdicts"] == {}
+    assert report["keep_share"] is None
+    assert report["change_revert_share"] is None
+
+
+def test_decision_log_preserves_verdicts_around_corrupt_lines_and_filters_refs(tmp_path):
+    _write_decision_journal(
+        tmp_path,
+        "2026-09-23",
+        [
+            {"kind": "verdict", "ref": "a", "text": "keep"},
+            "{broken",
+            {"kind": "decision", "id": "a", "task_id": "task"},
+            {"kind": "decision", "id": "b", "task_id": "review"},
+            {"kind": "decision", "id": "c", "task_id": "failed"},
+            {"kind": "decision", "id": "other", "task_id": "outside-window"},
+            {"kind": "question", "id": "question", "task_id": "task"},
+            {"kind": "verdict", "ref": "b", "text": "change", "task_id": "outside-window"},
+            {"kind": "verdict", "ref": "c", "text": "revert"},
+            {"kind": "verdict", "ref": "other", "text": "keep", "task_id": "task"},
+            {"kind": "verdict", "ref": "question", "text": "keep"},
+            {"kind": "answer", "ref": "a", "text": "change"},
+            {"kind": "verdict", "ref": "missing", "text": "keep"},
+            {"kind": "verdict", "ref": "a", "text": "invalid"},
+            {"kind": "verdict", "ref": [], "text": "keep"},
+            {"kind": "decision", "id": [], "task_id": []},
+            [],
+            None,
+        ],
+    )
+    _write_decision_journal(tmp_path, "2026-09-24", ["{broken"])
+    (tmp_path / "repo" / "2026-09-25.jsonl").write_bytes(b"\xff")
+    tasks = [
+        _task("task", "completed"),
+        replace(_task("review", "completed"), kind="review"),
+        _task("failed", "failed"),
+    ]
+    report = decision_log(tasks, tmp_path)
+    assert report["verdicts"] == {"keep": 1, "change": 1, "revert": 1}
+    assert report["keep_share"] == pytest.approx(1 / 3)
+    assert report["change_revert_share"] == pytest.approx(2 / 3)
+    assert report["share"] == 0
+
+
+def test_decision_log_latest_verdict_labels_each_decision_once(tmp_path):
+    _write_decision_journal(
+        tmp_path,
+        "2026-09-23",
+        [
+            {"kind": "decision", "id": "a", "task_id": "task"},
+            {"kind": "verdict", "ref": "a", "text": "keep"},
+        ],
+    )
+    _write_decision_journal(
+        tmp_path,
+        "2026-09-24",
+        [
+            {"kind": "verdict", "ref": "a", "text": "change"},
+        ],
+    )
+    report = decision_log([_task("task", "completed")], tmp_path)
+    assert report["verdicts"] == {"change": 1}
+    assert report["keep_share"] == 0
+    assert report["change_revert_share"] == 1
+
+
+@pytest.mark.parametrize("unreadable", ["root", "repo", "file"])
+def test_decision_log_unreadable_journal_is_unmeasured(tmp_path, monkeypatch, unreadable):
+    path = _write_decision_journal(
+        tmp_path,
+        "2026-09-23",
+        [
+            {"kind": "decision", "id": "a", "task_id": "task"},
+            {"kind": "verdict", "ref": "a", "text": "keep"},
+        ],
+    )
+    target = {"root": tmp_path, "repo": path.parent, "file": path}[unreadable]
+    method = "read_text" if unreadable == "file" else "iterdir"
+    original = getattr(Path, method)
+
+    def denied(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError("journal unavailable")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method, denied)
+    report = decision_log([_task("task", "completed")], tmp_path)
+    assert report["keep_share"] == "unmeasured"
+    assert report["change_revert_share"] == "unmeasured"
+    assert report["share"] == 0

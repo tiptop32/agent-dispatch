@@ -116,9 +116,9 @@
 - Modify: `evals/replay/__main__.py`
 - Modify: `tests/test_replay.py`
 
-- [ ] `evals/replay/harness.py`: секция `decision_log` (`share`, `keep_share`, `empty_why_share`, `change_revert_share`; вердикты читаются из файла журнала, если он есть, иначе `unmeasured`)
-- [ ] Тесты `tests/test_replay*.py`
-- [ ] Прогнать тесты, должны пройти
+- [x] `evals/replay/harness.py`: секция `decision_log` (`share`, `keep_share`, `empty_why_share`, `change_revert_share`; вердикты читаются из файла журнала, если он есть, иначе `unmeasured`)
+- [x] Тесты `tests/test_replay*.py`
+- [x] Прогнать тесты, должны пройти
 
 ### Task 5: prod-правило
 **Depends on:** Task 1

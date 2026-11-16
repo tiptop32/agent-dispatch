@@ -1732,6 +1732,90 @@ def review_stability(tasks: list[Task]) -> dict:
     }
 
 
+def _journal_verdicts(log_dir: Path, task_ids: set[str]) -> Counter[str] | None:
+    """Битая строка не отменяет соседние записи; недоступный журнал не измерен."""
+    try:
+        files = sorted(
+            path
+            for folder in log_dir.iterdir()
+            if folder.is_dir()
+            for path in folder.iterdir()
+            if path.suffix == ".jsonl"
+        )
+    except OSError:
+        return None
+    rows: list[dict] = []
+    readable = False
+    for path in files:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        readable = True
+        for line in content.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    if files and not readable:
+        return None
+    decision_ids = {
+        row["id"]
+        for row in rows
+        if row.get("kind") == "decision"
+        and isinstance(row.get("task_id"), str)
+        and row["task_id"] in task_ids
+        and isinstance(row.get("id"), str)
+        and row["id"]
+    }
+    # Повторная разметка заменяет прежний вердикт, а не увеличивает знаменатель.
+    verdicts = {}
+    for row in rows:
+        ref = row.get("ref")
+        if (
+            row.get("kind") == "verdict"
+            and isinstance(ref, str)
+            and ref in decision_ids
+            and row.get("text") in ("keep", "change", "revert")
+        ):
+            verdicts[ref] = row["text"]
+    return Counter(verdicts.values())
+
+
+def decision_log(tasks: list[Task], log_dir: Path) -> dict:
+    """Покрытие из meta, польза из разметки решений задач текущей выборки."""
+    completed = [task for task in tasks if task.kind == "task" and task.status == "completed"]
+    with_decisions = 0
+    decisions = []
+    for task in completed:
+        rows = _meta_rows(task, "decisions")
+        with_decisions += bool(rows)
+        decisions.extend(row for row in rows if row.get("kind") == "decision")
+    empty_why = sum(not (row.get("why") or "").strip() for row in decisions)
+    verdicts = _journal_verdicts(log_dir, {task.task_id for task in tasks})
+    labeled = sum(verdicts.values()) if verdicts is not None else 0
+    return {
+        "completed": len(completed),
+        "with_decisions": with_decisions,
+        "share": with_decisions / len(completed) if completed else None,
+        "decisions": len(decisions),
+        "empty_why_share": empty_why / len(decisions) if decisions else None,
+        "verdicts": dict(verdicts) if verdicts is not None else "unmeasured",
+        "keep_share": (
+            "unmeasured" if verdicts is None else verdicts["keep"] / labeled if labeled else None
+        ),
+        "change_revert_share": (
+            "unmeasured"
+            if verdicts is None
+            else (verdicts["change"] + verdicts["revert"]) / labeled
+            if labeled
+            else None
+        ),
+    }
+
+
 _REVIEW_STABILITY_OUTCOMES = (
     "no_round",
     "round_failed",
@@ -2311,6 +2395,17 @@ def render(report: dict) -> str:
             f"({row['unstable_cost']['samples']} priced)"
             for name, row in info["by_reviewer"].items()
         ]
+    if "decision_log" in report:
+        info = report["decision_log"]
+        keep, changed = (
+            "unmeasured" if info[key] == "unmeasured" else _pct(info[key])
+            for key in ("keep_share", "change_revert_share")
+        )
+        lines.append(
+            f"decision log: {info['with_decisions']} of {info['completed']} completed tasks "
+            f"({_pct(info['share'])}), empty why {_pct(info['empty_why_share'])}; "
+            f"keep {keep}, change/revert {changed}"
+        )
     if "post_review" in report:
         info = report["post_review"]
         verdicts = info["verdicts"]

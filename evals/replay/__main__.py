@@ -17,6 +17,7 @@ from .harness import (
     caller_bytes,
     children_refusals,
     cost_drift,
+    decision_log,
     default_limit_group,
     delegations,
     exploration_comparison,
@@ -147,6 +148,7 @@ def main() -> int:
     report["fix_round"] = fix_round(tasks)
     report["review_stages"] = review_stages(tasks)
     report["review_stability"] = review_stability(tasks)
+    report["decision_log"] = decision_log(tasks, settings.decision_log_dir)
     # Один locator на прогон: дифы эксперимента судятся второй раз из кэша.
     locator = GitLocator()
     if not args.no_git:
