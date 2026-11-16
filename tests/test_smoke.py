@@ -309,18 +309,39 @@ def test_main_accepts_executors_argument(monkeypatch) -> None:
     assert seen["executors"] == "omp/sol"
 
 
-def test_decisions_counts_skip_failed_runs_and_threshold_fails() -> None:
-    """Проваленный decisions_none без решений не «шум 0»: серия неполная, порог fail."""
-    results = [_row(task="decisions_fork", decisions=[{"kind": "decision", "text": "to_date"}])]
-    results *= 10
+def _failed(task: str, decisions=None) -> dict[str, object]:
+    row = _row(task=task, decisions=decisions)
+    row["ok"] = False
+    return row
+
+
+def test_failed_runs_count_against_the_executor() -> None:
+    """Упавший прогон в серии, но в худшую сторону: без позитива, как шум."""
+    fork = [{"kind": "decision", "text": "to_date"}]
+    results = [_row(task="decisions_fork", decisions=fork) for _ in range(9)]
+    results.append(_failed("decisions_fork", decisions=fork))
     results += [_row(task="decisions_none") for _ in range(9)]
-    failed = _row(task="decisions_none")
-    failed["ok"] = False
-    results.append(failed)
-    counts = decisions_counts(results)
-    assert counts["omp/sol"]["none_runs"] == 9
-    assert counts["omp/sol"]["failed_runs"] == 1
-    assert not decisions_threshold_ok(counts)
+    results.append(_failed("decisions_none"))
+    counts = decisions_counts(results)["omp/sol"]
+    assert counts == {"positive": 9, "noise": 1, "fork_runs": 10, "none_runs": 10, "failed_runs": 2}
+
+
+def test_single_failed_run_does_not_sink_the_series() -> None:
+    """Eval 2026-11-16: 9/9 успешных развилок x5 и один обрыв — порог пройден."""
+    fork = [{"kind": "decision", "text": "parse_date"}]
+    results = [_row(task="decisions_fork", decisions=fork) for _ in range(9)]
+    results.append(_failed("decisions_fork"))
+    results += [_row(task="decisions_none") for _ in range(10)]
+    assert decisions_threshold_ok(decisions_counts(results))
+
+
+def test_failed_trivial_runs_cannot_hide_noise() -> None:
+    """Три упавших тривиальных прогона — шум 3/10, порог fail."""
+    fork = [{"kind": "decision", "text": "parse_date"}]
+    results = [_row(task="decisions_fork", decisions=fork) for _ in range(10)]
+    results += [_row(task="decisions_none") for _ in range(7)]
+    results += [_failed("decisions_none") for _ in range(3)]
+    assert not decisions_threshold_ok(decisions_counts(results))
 
 
 def test_decisions_threshold_scales_with_runs() -> None:
