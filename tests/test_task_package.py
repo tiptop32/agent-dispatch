@@ -328,6 +328,7 @@ def test_prod_prompt_carries_the_data_rule(package):
     assert "# Prod data rule" in rendered
     assert "conclusions and numbers only" in rendered
     assert "tokens, passwords, keys" in rendered and "personal data" in rendered
+    assert "`decisions`" in rendered and "conclusions only" in rendered
     assert REFUSAL_RULE in rendered
 
 

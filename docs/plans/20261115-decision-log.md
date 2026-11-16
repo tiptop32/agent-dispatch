@@ -126,8 +126,8 @@
 - Modify: `agent_dispatch/templates/prod_data_rule.md.j2`
 - Modify: `tests/test_task_package.py`
 
-- [ ] Строка в `templates/prod_data_rule.md.j2`: в `decisions` только выводы, без данных; тест шаблона в `tests/test_task_package.py`
-- [ ] Прогнать тесты, должны пройти
+- [x] Строка в `templates/prod_data_rule.md.j2`: в `decisions` только выводы, без данных; тест шаблона в `tests/test_task_package.py`
+- [x] Прогнать тесты, должны пройти
 
 ### Task 6: eval
 **Depends on:** Task 3
