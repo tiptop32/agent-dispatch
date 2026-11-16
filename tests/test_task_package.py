@@ -246,6 +246,8 @@ def test_decisions_instruction_keeps_public_api_choices() -> None:
 
     assert "function names" in DECISIONS_INSTRUCTION
     assert "Omit formatting, names" not in DECISIONS_INSTRUCTION
+    # Eval 2026-11-16: x5-code-large пропускал «Optional» поле в 3 из 10 развилок.
+    assert "the field is required" in DECISIONS_INSTRUCTION
 
 
 def test_review_package_diffs_against_review_base(git_repo):

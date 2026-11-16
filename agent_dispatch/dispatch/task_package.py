@@ -167,8 +167,9 @@ DECISIONS_INSTRUCTION = (
     "why?: string|null}. Record decisions made without the user and questions asked: "
     "choices between options with different behavior or public API (for example, "
     "which of two function names to use), deviations from the plan, assumptions about "
-    "requirements, irreversible actions, or dropped scope. Omit formatting, local "
-    "variable names, and obvious plan steps; omit the field if there are none."
+    "requirements, irreversible actions, or dropped scope. If the task left a choice "
+    "to you and you made it, the field is required, not optional. Omit formatting, local "
+    "variable names, and obvious plan steps; omit the field only if there are none."
 )
 
 
