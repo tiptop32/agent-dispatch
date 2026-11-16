@@ -145,8 +145,8 @@
 - Modify: `CLAUDE.md`
 - Modify: `docs/architecture.md`
 
-- [ ] CLAUDE.md проекта и `docs/architecture.md`: поле `decisions`, кто пишет журнал, prod-правило
-- [ ] Полный прогон `uv run pytest tests -q`, `ruff check`, `ruff format --check`
+- [x] CLAUDE.md проекта и `docs/architecture.md`: поле `decisions`, кто пишет журнал, prod-правило
+- [x] Полный прогон `uv run pytest tests -q`, `ruff check`, `ruff format --check`
 
 ### Task 8: компактная строка MCP
 **Depends on:** Task 3
