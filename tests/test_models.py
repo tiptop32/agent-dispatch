@@ -167,3 +167,15 @@ def test_source_agent_keeps_legacy_values_and_omp():
     assert SourceAgent.omp.value == "omp"
     assert SourceAgent.codex.value == "codex"
     assert SourceAgent.opencode.value == "opencode"
+
+
+def test_decision_log_default_is_not_serialized_for_old_clients() -> None:
+    """Старый MCP-прокси со строгой моделью падал на новом поле в ответе демона."""
+    from agent_dispatch.models import DispatchRequest
+
+    default = DispatchRequest(task="t", cwd="/tmp")
+    assert "decision_log" not in default.model_dump()
+    assert "decision_log" not in default.model_dump_json()
+    opted_out = DispatchRequest(task="t", cwd="/tmp", decision_log=False)
+    assert opted_out.model_dump()["decision_log"] is False
+    assert DispatchRequest.model_validate_json(opted_out.model_dump_json()).decision_log is False

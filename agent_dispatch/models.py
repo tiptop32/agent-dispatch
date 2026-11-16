@@ -123,7 +123,10 @@ class DispatchRequest(_Model):
     prod: bool = False
     # False: решения исполнителя остаются в meta.decisions, но не идут в журнал
     # пользователя (платный eval decisions гоняет фейковые задачи через демон).
-    decision_log: bool = True
+    # Значение по умолчанию не сериализуется: модели строгие (extra="forbid"), и
+    # MCP-прокси, запущенный до обновления демона, падал на лишнем поле в ответе
+    # (2026-11-16, все открытые сессии после рестарта демона).
+    decision_log: bool = Field(True, exclude_if=lambda value: value is True)
     #: Только демон ставит этот маркер; публичный ввод с таким ключом запрещён.
     _automatic_review: bool = PrivateAttr(default=False)
 
