@@ -130,6 +130,7 @@ async def test_failed_review_resumes_and_merges_the_fix(tmp_path, git_repo, work
     assert done.result.usage.cost_usd == pytest.approx(0.3)
     assert done.result.verification.result == "passed"
     assert done.result.meta["review"]["verdict"] == "pass"
+    assert "decisions" not in done.result.meta
     [repair] = done.result.meta["fix_rounds"]
     assert repair["trigger"] == "review_failed"
     assert repair["stage"] == "first" and repair["round"] == 1
@@ -153,6 +154,60 @@ async def test_failed_review_resumes_and_merges_the_fix(tmp_path, git_repo, work
     assert (git_repo / "a.py").read_text() == "x = 2\n"
     assert await storage.count_children(task.task_id) == 0
     await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["both", "original", "fix", "empty"])
+@pytest.mark.parametrize("fix_status", ["completed", "partial"])
+async def test_fix_round_preserves_decisions_from_both_attempts(
+    tmp_path, git_repo, source, fix_status
+):
+    storage, adapters, dispatcher = await make_dispatcher(tmp_path)
+    adapters["first"].result = result("first", changed_files=[], verdict="fail")
+    original_meta = {"session_id": "work-session"}
+    fixed_meta = {"session_id": "work-session"}
+    if source in ("both", "original"):
+        original_meta["decisions"] = [
+            {"kind": "decision", "text": "Сохранить API", "why": "Совместимость"},
+            {"kind": "decision", "text": "Сохранить API", "why": None},
+        ]
+    if source in ("both", "fix"):
+        fixed_meta["decisions"] = [
+            {"kind": "decision", "text": "Сохранить API", "why": "Новая причина"},
+            {"kind": "question", "text": "Сохранить API", "why": None},
+            {"kind": "question", "text": "Сохранить API", "why": None},
+        ]
+    if source == "empty":
+        original_meta["decisions"] = []
+        fixed_meta["decisions"] = []
+    adapters["worker"].result = result(meta=original_meta)
+
+    async def work(ctx):
+        (Path(ctx.cwd) / "a.py").write_text("x = 1\n")
+        if len(adapters["worker"].calls) == 2:
+            adapters["worker"].result = result(meta=fixed_meta, status=fix_status)
+            adapters["first"].result = result("first", changed_files=[], verdict="pass")
+
+    adapters["worker"].on_execute = work
+    try:
+        task = await dispatcher.submit(request(git_repo, allow_escalation=False))
+        done = await dispatcher.wait(task.task_id, 10)
+        assert done.status == TaskStatus(fix_status)
+        expected = {
+            "both": [
+                {"kind": "decision", "text": "Сохранить API", "why": "Совместимость"},
+                {"kind": "question", "text": "Сохранить API", "why": None},
+            ],
+            "original": [{"kind": "decision", "text": "Сохранить API", "why": "Совместимость"}],
+            "fix": [
+                {"kind": "decision", "text": "Сохранить API", "why": "Новая причина"},
+                {"kind": "question", "text": "Сохранить API", "why": None},
+            ],
+            "empty": [],
+        }
+        assert done.result.meta["decisions"] == expected[source]
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio

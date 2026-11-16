@@ -75,6 +75,50 @@ def test_recovered_report_takes_status_and_keeps_the_work_of_the_first_run():
     assert merged.meta["report_recovery"] == "recovered"
     assert "parse_error" not in merged.meta
     assert merged.meta["duration_ms"] == 60000  # метаданные запуска от первого
+    assert "decisions" not in merged.meta
+
+
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_report_recovery_merges_decisions_in_order_without_duplicates(status):
+    original = _missing()
+    original.meta["decisions"] = [
+        {"kind": "decision", "text": "Сохранить API", "why": "Совместимость"},
+        {"kind": "decision", "text": "Сохранить API", "why": None},
+    ]
+    report = _report(status=status, error="timeout" if status == "failed" else None)
+    report.meta["decisions"] = [
+        {"kind": "decision", "text": "Сохранить API", "why": "Новая причина"},
+        {"kind": "question", "text": "Сохранить API", "why": None},
+        {"kind": "decision", "text": "Добавить параметр", "why": None},
+        {"kind": "decision", "text": "Добавить параметр", "why": None},
+    ]
+
+    merged = merge_report(original, report)
+
+    assert merged.meta["decisions"] == [
+        {"kind": "decision", "text": "Сохранить API", "why": "Совместимость"},
+        {"kind": "question", "text": "Сохранить API", "why": None},
+        {"kind": "decision", "text": "Добавить параметр", "why": None},
+    ]
+    assert len(original.meta["decisions"]) == 2
+    assert len(report.meta["decisions"]) == 4
+
+
+@pytest.mark.parametrize("source", ["original", "report", "empty"])
+def test_report_recovery_keeps_decisions_from_only_one_attempt(source):
+    original, report = _missing(), _report()
+    if source == "empty":
+        original.meta["decisions"] = []
+        report.meta["decisions"] = []
+    else:
+        attempt = original if source == "original" else report
+        attempt.meta["decisions"] = [{"kind": "question", "text": "Менять API?", "why": None}]
+
+    merged = merge_report(original, report)
+
+    assert merged.meta["decisions"] == (
+        [] if source == "empty" else [{"kind": "question", "text": "Менять API?", "why": None}]
+    )
 
 
 def test_recovered_report_keeps_its_coercions():

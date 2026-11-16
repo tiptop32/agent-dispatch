@@ -86,9 +86,9 @@
 - Modify: `tests/test_review_fix_round.py`
 - Modify: `tests/test_report_recovery.py`
 
-- [ ] Раунд правки (`dispatcher.py:1298`) и `merge_report` конкатенируют `decisions` первой попытки и продолжения, без дублей по `(kind, text)`
-- [ ] Тесты `tests/test_review_fix_round.py`, `tests/test_report_recovery*.py`: записи обеих попыток сохраняются
-- [ ] Прогнать тесты, должны пройти
+- [x] Раунд правки (`dispatcher.py:1298`) и `merge_report` конкатенируют `decisions` первой попытки и продолжения, без дублей по `(kind, text)`
+- [x] Тесты `tests/test_review_fix_round.py`, `tests/test_report_recovery*.py`: записи обеих попыток сохраняются
+- [x] Прогнать тесты, должны пройти
 
 ### Task 3: журнал и redact
 **Depends on:** Task 1

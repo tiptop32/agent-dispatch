@@ -1301,6 +1301,8 @@ class Dispatcher:
             usage = fixed.usage.model_dump() if fixed.usage else None
             files = list(dict.fromkeys([*result.changed_files, *fixed.changed_files]))
             meta = dict(result.meta)
+            decisions = report_recovery._decision_meta(result, fixed)
+            meta.update(decisions)
             pending = {
                 "round": rounds,
                 "trigger": trigger,
@@ -1347,6 +1349,7 @@ class Dispatcher:
                 meta.pop(key, None)
             meta.pop("review", None)
             meta.update(fixed.meta)
+            meta.update(decisions)
             result = fixed.model_copy(
                 update={
                     "changed_files": files,
