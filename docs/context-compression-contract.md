@@ -145,7 +145,7 @@ class CompressionResult:
     kept_ids: tuple[str, ...]
     metrics: dict[str, object]
 
-BeforeStep = Callable[[StepStart], Awaitable[None]]
+BeforeStep = Callable[[StepStart, Callable[[], None]], Awaitable[None]]
 AfterStep = Callable[[StepOutcome], Awaitable[None]]
 
 async def compress_context(
@@ -160,7 +160,7 @@ The outer monotonic deadline begins on selector entry and covers preparation, al
 
 For the initial set `R` of all stable blocks, iterate the **initial user candidate IDs exactly once in source order**:
 
-1. `before_step(start)` checks budgets from durable costs, then commits the pending step row. If it refuses, do not call HTTP or create a charged step. Persisted row creation happens before the request; duplicate `(task_id, index)` is an error, not a reason to repeat it.
+1. `before_step(start, acknowledge)` checks budgets from durable costs, then commits the pending step row. `acknowledge: Callable[[], None]` is a selector-supplied synchronous, zero-argument callback. The persistence owner must invoke it exactly once immediately after the commit, with no intervening await, including before async lock/context-manager exit. The selector tracks the pending row at acknowledgement, not callback return. HTTP starts only after the callback returns successfully and exactly one acknowledgement was received. Missing or duplicate acknowledgement is `compression_storage`, even if the callback catches the duplicate-ack exception. A budget refusal before commit/ack creates no attempted step. Cancellation/deadline after commit/ack but before callback return closes the tracked pending row with unknown cost, without HTTP or a repeated insert. Other callback failures after ack also close that row as `interrupted` with unknown cost; the original storage/budget failure remains the pass error unless cleanup receives caller cancellation. Duplicate `(task_id, index)` is an error, not a reason to repeat it. No compatibility signature or implicit acknowledgement is supported.
 2. Build `state = {"task": req.task, "files": req.files, "constraints": req.constraints, "success_criteria": req.success_criteria, "blocks": [{"id": b.id, "origin": b.origin, "text": context[b.start:b.end]} for b in R], "candidate_id": candidate_id}`. Service templates, `verify`, logs, raw diffs and secrets are not added. Pinned contextual notes remain in `R` because they can affect whether caller facts are still needed. Their origin is daemon metadata, not a textual hint. No offsets/source paths/task IDs are sent inside state.
 3. POST exactly `{"model": cfg.model, "state": state, "questions": {"delete_safe": QUESTION}}` to configured `cfg.base_url`. The one question is `type=noul`, with these exact instructions:
 
@@ -169,7 +169,7 @@ For the initial set `R` of all stable blocks, iterate the **initial user candida
    Criteria `true`: `Deleting this candidate is safe given the remaining CURRENT blocks and immutable fields.` Criteria `false`: `Deletion loses needed information, an exception, a prohibition or its scope, or safety is uncertain.`
 
 4. Accept only HTTP 200 and a JSON object. Reject duplicate JSON object keys and nonstandard NaN/Infinity literals. `answers` must have exactly the key `delete_safe`; that value must be an object with `type == "noul"` and `noul` a finite JSON number in `[0,1]`, excluding booleans, numeric strings and null. A refusal or any other answer type fails. Non-answer top-level metadata and optional answer metadata do not affect the decision. Missing/non-string generation ID or response model is unknown metadata, not a fabricated ID/model.
-5. Extract safe usage fields from a decodable object even if answer validation fails. A missing, boolean, negative, nonfinite or wrong-type cost/token field is unknown, not zero. Token fields must be nonnegative integers. Do not infer an absent cost from tokens or invent a tariff.
+5. Extract safe usage fields from a decodable object even if answer validation fails. A missing, boolean, negative, nonfinite or wrong-type cost/token field is unknown, not zero. Each token field must be an integer in `[0, 9223372036854775807]`, excluding booleans, so every per-step ledger value fits SQLite's signed INTEGER binding. Larger integers become unknown independently of the other token dimension and cost; a usable finite cost is still persisted. Do not infer an absent cost from tokens or invent a tariff.
 6. If valid and `p >= 0.95`, delete the candidate from `R` immediately. The next request contains the updated retained set, including only alternatives that still exist. Otherwise retain it. Do not revisit retained candidates, batch questions, ask about hypothetical independent deletions or force a compression ratio.
 7. Await `after_step(outcome)` to commit every terminal step including known usage, then recheck budgets. On an invalid response, persist charge first and raise response failure; it does not become success merely because the budget callback also refuses. No later candidate or executor starts.
 
@@ -189,14 +189,16 @@ Add `compression_steps` in `agent_dispatch/telemetry/schema.sql` with:
 - `candidate_id TEXT NOT NULL`, `started_at TEXT NOT NULL` (aware UTC ISO), nullable `completed_at TEXT`;
 - `status TEXT NOT NULL` (`started` or a `StepOutcome.status`), requested `model TEXT NOT NULL`, nullable `response_model TEXT`, `jev_id TEXT`;
 - nullable `p_delete_safe REAL`, `deleted INTEGER`, `latency_ms INTEGER`, `cost_usd REAL`, `input_tokens INTEGER`, `output_tokens INTEGER`, `is_byok INTEGER`;
-- nonnegative/finite validations in the write API, `deleted`/`is_byok` restricted to 0/1 or null; index on `started_at`, primary-key task prefix sufficient for per-task/tree lookup.
+- nonnegative/finite validations in the write API; token fields restricted to integers in `[0, 9223372036854775807]`, excluding booleans; `deleted`/`is_byok` restricted to 0/1 or null; index on `started_at`, primary-key task prefix sufficient for per-task/tree lookup.
 
 No block text, request body, HTTP body, headers, credentials or retained context in this table. A status row is the record of one attempted paid step, not a second executor result. Open/create is additive and idempotent on existing DBs; preserve the existing user_version policy unless an actual migration is needed. No deletion or backfill of old data.
 
 Exact async `Storage` entry points:
 
 ```python
-async def start_compression_step(self, task_id: str, step: StepStart) -> None: ...
+async def start_compression_step(
+    self, task_id: str, step: StepStart, *, acknowledge: Callable[[], None]
+) -> None: ...
 async def finish_compression_step(self, task_id: str, step: StepOutcome) -> None: ...
 async def compression_steps(self, task_id: str) -> list[dict[str, object]]: ...
 async def compression_cost_unknown(
@@ -204,7 +206,7 @@ async def compression_cost_unknown(
 ) -> bool: ...
 ```
 
-Use TYPE_CHECKING imports for dataclass annotations, avoiding storage/dispatcher runtime cycles. `start` inserts once and commits under the existing write lock. `finish` updates exactly one pending row and commits before returning. Repeating an identical final outcome may be idempotent for cleanup; a conflicting final outcome or unknown key is an error. `compression_steps` orders by `step_index`. `compression_cost_unknown` requires exactly one scope: recursive task IDs using the same UNION-deduplicated tree as `tree_cost`, or inclusive UTC `started_at >= since`. Empty ID scope returns False. Pending steps and terminal steps without usable cost mean unknown.
+Use TYPE_CHECKING imports for dataclass annotations, avoiding storage/dispatcher runtime cycles. `start` inserts once and commits under the existing write lock, then invokes the supplied synchronous `acknowledge()` immediately with no intervening await, before releasing any async lock/context manager. The dispatcher passes the selector's acknowledgement through unchanged; a wrapper acknowledging only after an awaitable storage call returns does not meet this contract. `finish` updates exactly one pending row and commits before returning. Repeating an identical final outcome may be idempotent for cleanup; a conflicting final outcome or unknown key is an error. `compression_steps` orders by `step_index`. `compression_cost_unknown` requires exactly one scope: recursive task IDs using the same UNION-deduplicated tree as `tree_cost`, or inclusive UTC `started_at >= since`. Empty ID scope returns False. Pending steps and terminal steps without usable cost mean unknown.
 
 Extend existing aggregates, without changing their float return types:
 
@@ -214,7 +216,7 @@ Extend existing aggregates, without changing their float return types:
 
 Dispatcher supplies callbacks bound to the current task/chain and storage:
 
-- Before each paid step, check daily and chain known totals and unknown flags. A reached limit (`spent >= limit`) rejects. With a configured limit and any unknown compression charge in that scope, reject `compression_budget_unknown` rather than pretending it is free. Then commit the pending row and let HTTP start. A pending row from a different concurrent task counts as unknown for a daily limit. The new step's own pending row does not exist during its before-check.
+- Before each paid step, check daily and chain known totals and unknown flags. A reached limit (`spent >= limit`) rejects. With a configured limit and any unknown compression charge in that scope, reject `compression_budget_unknown` rather than pretending it is free. Then commit the pending row, acknowledge synchronously at commit, and return before HTTP may start. A pending row from a different concurrent task counts as unknown for a daily limit. The new step's own pending row does not exist during its before-check.
 - After **every** HTTP attempt, persist outcome, then check daily and chain totals/unknown flags again before another paid step or executor. Completed valid answers count in `completed_steps` even if their post-charge budget check stops the pass. Invalid answers with usable usage still add their charge. Deadline/cancellation or opaque error bodies leave charge unknown.
 - All compression charges are already in storage by these checks. Do not pass them again as `_daily_budget_guard(extra=...)` or `_budget_stop` current executor usage. Those existing extras represent only the current as-yet-unpersisted executor usage. Chain seeds must include the current task even before it starts an executor, plus the existing chain/subtask scope. Check before and after steps and immediately before launch; the last step exhausting a cap never launches the executor.
 - Unknown costs with budgets disabled may be reported as unknown without inventing a number; they do not invalidate an otherwise valid selection. An enabled relevant cap cannot be proven satisfied in that condition, so launch is forbidden.
@@ -223,7 +225,7 @@ These are thresholds on observed charges, not a price reservation system: a sing
 
 ### Cancellation and persistence
 
-The selector owns one in-flight HTTP coroutine. Cancel/deadline aborts it and schedules no successor. `after_step` closes an already-started row even if no response exists. Shield only the finite local transaction needed to persist the terminal outcome, with a two-second cleanup bound; never shield HTTP, extend the selection deadline, or swallow cancellation. If cleanup cannot complete, leave the durable pending row unknown for recovery and fail closed under enabled budgets. Known prior rows are never discarded. No partial context reaches an adapter.
+The selector owns one in-flight HTTP coroutine. Cancel/deadline aborts it and schedules no successor. `after_step` closes an acknowledged pending row even if the before callback has not returned or no HTTP response exists. Such a row counts as one attempted step with unknown cost and `cost_complete=false`. Shield only the finite local transaction needed to persist the terminal outcome, with a two-second cleanup bound; never shield HTTP, extend the selection deadline, or swallow cancellation. Caller cancellation received during deadline- or failure-triggered cleanup takes precedence: after completing or bounding that same local persistence attempt, raise `CompressionCancelledError` with cancelled metrics, not `compression_deadline` or the earlier failure. Repeated cancellation does not restart or extend cleanup. An already determined terminal outcome remains unchanged, so a deadline row may accompany a cancelled pass, and known response usage is never overwritten. If cleanup cannot complete, leave the durable pending row unknown for recovery and fail closed under enabled budgets. Known prior rows are never discarded. No partial context reaches an adapter.
 
 ## 6. Provenance, escalation, follow-up and rendering
 
@@ -268,6 +270,8 @@ Public unsupported literal values still use the existing schema-validation failu
 - `is_byok` if consistently known for all paid rows, otherwise null.
 
 Telemetry contains no source text, individual block bodies, raw HTTP errors, headers or keys. Generation IDs and numeric/source-order block IDs are allowed. A result summary can say selection failed, but not echo task/context. Per-step records survive failure even when final task result was not yet written. Event/meta mirrors are not the cost source of truth.
+
+Approved aggregate-overflow edge rule: if individually valid finite step costs cannot be summed into a finite float, stop with `compression_response` after persisting the current step and before another HTTP call or executor. Preserve per-step charges. Set aggregate `usage.cost` and `usage.known_cost` to null and `cost_complete=false`; never expose infinity, fabricated zero or an uncaught OverflowError. Error/cancellation metric construction must remain safe even with an overflowing aggregate. Storage integration must treat such an aggregate as unknown for budget admission, not as free. This explicitly qualifies the normal numeric known_cost rule above; no Decimal migration is introduced.
 
 ## 8. Frozen corpus and executable evaluation protocol
 

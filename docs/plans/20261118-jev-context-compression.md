@@ -116,10 +116,10 @@ Offline eval: размеченные обязательные фрагменты
 - Create: `agent_dispatch/dispatch/context_compression.py`
 - Create: `tests/test_context_compression.py`
 
-- [ ] Реализовать bounded последовательный Decisions-проход на существующих настройках и httpx: текущий набор обновляется до следующего запроса, stable ID/порядок сохраняются, effective_context публикуется атомарно. Метрики суммируют цену/usage/latency всех шагов и отмечают незавершённый проход; бюджеты проверяются перед каждым платным шагом и после него.
-- [ ] Проверять внешний preflight и явный effective perimeter до построения state; HTTP-ошибки не возвращают сырые тела.
-- [ ] Добавить success/error/limit/timeout/cancellation/perimeter тесты с MockTransport и отсутствие скрытых повторов/fallback.
-- [ ] Scoped verify: `uv run pytest tests/test_context_blocks.py tests/test_context_compression.py -q`.
+- [x] Реализовать bounded последовательный Decisions-проход на существующих настройках и httpx: текущий набор обновляется до следующего запроса, stable ID/порядок сохраняются, effective_context публикуется атомарно. Метрики суммируют цену/usage/latency всех шагов и отмечают незавершённый проход; бюджеты проверяются перед каждым платным шагом и после него.
+- [x] Проверять внешний preflight и явный effective perimeter до построения state; HTTP-ошибки не возвращают сырые тела.
+- [x] Добавить success/error/limit/timeout/cancellation/perimeter тесты с MockTransport и отсутствие скрытых повторов/fallback.
+- [x] Scoped verify: `uv run pytest tests/test_context_blocks.py tests/test_context_compression.py -q`.
 
 ### Task 4: [агент] Атомарно подключить opt-in от публичных входов до исполнителя
 **Depends on:** Tasks 1-3
