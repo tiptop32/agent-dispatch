@@ -148,11 +148,11 @@ Offline eval: размеченные обязательные фрагменты
 
 Это одна атомарная контрактная задача: нельзя принять промежуточное состояние, которое принимает opt-in и молча передаёт исходный context. Широкий список файлов нужен для полного прохода публичного контракта.
 
-- [ ] Добавить nullable literal-параметр в HTTP/MCP dispatch/dispatch_to и CLI, подключить selector после guards до executor и effective_context без мутации request, с различением None/пустой строки и worktree rewrite.
-- [ ] Отклонять unsupported value, пустой context, prompt mode и review при opt-in; реализовать lineage, escalation/follow-up/resume, fail-fast без cooldown/эскалации и безопасные метрики/учёт цены по контракту Task 1.
-- [ ] Добавить тесты публичных входов: валидация, отсутствие поля по умолчанию в wire JSON, старый строгий прокси и явный отказ старого демона на opt-in.
-- [ ] Добавить интеграционные тесты фактического промпта, неизменности request, отсутствия HTTP/запуска на запретах, defaults, lineage, cancellation и budget. Новое поле не принимается без реализации обработки.
-- [ ] Scoped verify: `uv run pytest tests/test_models.py tests/test_mcp_server.py tests/test_cli.py tests/test_compression_dispatch.py tests/test_task_package.py tests/test_dispatcher.py tests/test_prod.py tests/test_followup.py tests/test_budget.py -q`.
+- [x] Добавить nullable literal-параметр в HTTP/MCP dispatch/dispatch_to и CLI, подключить selector после guards до executor и effective_context без мутации request, с различением None/пустой строки и worktree rewrite.
+- [x] Отклонять unsupported value, пустой context, prompt mode и review при opt-in; реализовать lineage, escalation/follow-up/resume, fail-fast без cooldown/эскалации и безопасные метрики/учёт цены по контракту Task 1.
+- [x] Добавить тесты публичных входов: валидация, отсутствие поля по умолчанию в wire JSON, старый строгий прокси и явный отказ старого демона на opt-in.
+- [x] Добавить интеграционные тесты фактического промпта, неизменности request, отсутствия HTTP/запуска на запретах, defaults, lineage, cancellation и budget. Новое поле не принимается без реализации обработки.
+- [x] Scoped verify: `uv run pytest tests/test_models.py tests/test_mcp_server.py tests/test_cli.py tests/test_compression_dispatch.py tests/test_task_package.py tests/test_dispatcher.py tests/test_prod.py tests/test_followup.py tests/test_budget.py -q`.
 
 ### Task 5: [агент] Добавить offline и live evals
 **Depends on:** Tasks 1, 4

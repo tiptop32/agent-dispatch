@@ -379,6 +379,7 @@ def build_server(
         verify: list[str] | None = None,
         review_base: str | None = None,
         prod: bool = False,
+        context_compression: Literal["jev"] | None = None,
     ) -> str:
         try:
             wait = settings.mcp.wait_seconds if wait_seconds is None else wait_seconds
@@ -402,6 +403,7 @@ def build_server(
                 verify=verify or [],
                 review_base=review_base,
                 prod=prod,
+                context_compression=context_compression,
             )
             view = await client.submit(req)
             return response_text(
@@ -439,6 +441,7 @@ def build_server(
         verify: list[str] | None = None,
         review_base: str | None = None,
         prod: bool = False,
+        context_compression: Literal["jev"] | None = None,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -460,6 +463,7 @@ def build_server(
             verify,
             review_base,
             prod,
+            context_compression,
         )
 
     @server.tool(
@@ -488,6 +492,7 @@ def build_server(
         verify: list[str] | None = None,
         review_base: str | None = None,
         prod: bool = False,
+        context_compression: Literal["jev"] | None = None,
         verbose: bool = False,
     ) -> str:
         return await do_dispatch(
@@ -509,6 +514,7 @@ def build_server(
             verify,
             review_base,
             prod,
+            context_compression,
         )
 
     @server.tool(

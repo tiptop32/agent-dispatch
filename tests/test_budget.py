@@ -29,6 +29,7 @@ from agent_dispatch.models import (
 )
 from agent_dispatch.telemetry.storage import Storage
 from tests.fakes.adapters import FakeAdapter, FakeRouter
+from tests.test_storage import compression_outcome, compression_start
 
 WAIT = 5.0
 
@@ -242,3 +243,63 @@ async def test_daily_limit_stops_escalation_at_planning(tmp_path, git_repo):
     assert "escalated_to" not in done.result.meta
     assert not adapters["claude"].calls
     assert len(await storage.list_tasks()) == 1
+
+
+@pytest.mark.asyncio
+async def test_compression_costs_include_unfinished_failed_cancelled_and_deduplicate(tmp_path):
+    storage = await _storage(tmp_path)
+    now = datetime.now(UTC)
+    root = _record("root", 1.0)
+    await storage.insert_task(root)
+    for index, status in enumerate(("running", "failed", "cancelled")):
+        child = _record(f"child-{index}", None, parent="root")
+        child.status = TaskStatus(status)
+        child.finished_at = None
+        await storage.insert_task(child)
+        await storage.start_compression_step(
+            child.task_id, compression_start(started=now), acknowledge=lambda: None
+        )
+        await storage.finish_compression_step(child.task_id, compression_outcome(cost=0.25))
+        child.result.meta["context_compression"] = {"usage": {"cost": 99}}
+        await storage.update_task(child)
+    assert await storage.tree_cost(["root", "child-0", "root"]) == 1.75
+    assert await storage.cost_since(now - timedelta(minutes=1)) == 1.75
+    assert not await storage.compression_cost_unknown(task_ids=["root", "child-0"])
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_compression_day_uses_inclusive_start_not_finish_time(tmp_path):
+    storage = await _storage(tmp_path)
+    boundary = datetime(2026, 11, 18, tzinfo=UTC)
+    for name, started, cost in (
+        ("before", boundary - timedelta(microseconds=1), 0.5),
+        ("at", boundary, 0.25),
+    ):
+        await storage.insert_task(_record(name, None, finished=boundary + timedelta(hours=1)))
+        await storage.start_compression_step(
+            name, compression_start(started=started), acknowledge=lambda: None
+        )
+        await storage.finish_compression_step(
+            name, compression_outcome(cost=cost, completed_at=boundary + timedelta(hours=1))
+        )
+    assert await storage.cost_since(boundary) == 0.25
+    assert await storage.cost_since(boundary - timedelta(seconds=1)) == 0.75
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_daily_unknown_compression_blocks_even_non_opted_tasks_before_router(
+    tmp_path, git_repo
+):
+    settings = _settings(tmp_path, daily_cost_limit_usd=1)
+    storage, adapters, router, dispatcher = await _dispatcher(tmp_path, settings, {})
+    await storage.insert_task(_record("pending", None))
+    await storage.start_compression_step("pending", compression_start(), acknowledge=lambda: None)
+    task = await dispatcher.submit(DispatchRequest(task="new", cwd=str(git_repo)))
+    done = await dispatcher.wait(task.task_id, WAIT)
+    assert done.result.meta["guard"] == "budget"
+    assert "not fully known" in done.result.error
+    assert router.calls == 0 and not any(adapter.calls for adapter in adapters.values())
+    await dispatcher.shutdown()
+    await storage.close()

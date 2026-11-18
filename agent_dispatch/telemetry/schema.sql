@@ -61,3 +61,25 @@ CREATE INDEX IF NOT EXISTS idx_tasks_finished_at ON tasks(finished_at);
 CREATE INDEX IF NOT EXISTS idx_routing_decisions_created_at ON routing_decisions(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);
 CREATE INDEX IF NOT EXISTS idx_routing_decisions_task_id ON routing_decisions(task_id);
+
+-- One durable attempted selection step; never stores source or HTTP bodies.
+CREATE TABLE IF NOT EXISTS compression_steps (
+    task_id TEXT NOT NULL REFERENCES tasks(task_id),
+    step_index INTEGER NOT NULL,
+    candidate_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    status TEXT NOT NULL,
+    model TEXT NOT NULL,
+    response_model TEXT,
+    jev_id TEXT,
+    p_delete_safe REAL,
+    deleted INTEGER,
+    latency_ms INTEGER,
+    cost_usd REAL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    is_byok INTEGER,
+    PRIMARY KEY (task_id, step_index)
+);
+CREATE INDEX IF NOT EXISTS idx_compression_steps_started_at ON compression_steps(started_at);

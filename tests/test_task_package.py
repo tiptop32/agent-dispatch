@@ -399,3 +399,21 @@ def test_verdict_recovery_example_is_accepted_by_result_parser(prod, verdict):
     )
     assert parsed.status == "completed" and parsed.verdict == verdict
     assert ("Prod data rule" in prompt) is prod
+
+
+@pytest.mark.parametrize("effective", [None, "", "/repo/project/kept.py\r\n😀"])
+def test_effective_context_none_empty_and_worktree_rewrite(effective):
+    req = request(context="ORIGINAL-CONTEXT")
+    package = TaskPackage(
+        request=req,
+        effective_context=effective,
+        repo_root="/repo/project",
+        worktree="/tmp/worktree",
+    )
+    prompt = render_prompt(package, "omp", settings())
+    assert ("ORIGINAL-CONTEXT" in prompt) is (effective is None)
+    if effective:
+        assert "/tmp/worktree/kept.py\r\n😀" in prompt
+        assert "/repo/project/kept.py" not in prompt
+    assert req.context == "ORIGINAL-CONTEXT"
+    assert "do not change public API" in prompt and "targeted tests pass" in prompt

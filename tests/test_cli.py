@@ -661,3 +661,24 @@ def test_cooldown_clear_sends_names(tmp_config_dir, monkeypatch):
 
     result = runner.invoke(app, ["cooldown-clear"])
     assert "name" not in request.calls[1].request.url.params
+
+
+@respx.mock
+def test_cli_compression_choice_and_wire_default(tmp_config_dir, monkeypatch):
+    state = _state()
+    _patch_autostart(monkeypatch, state)
+    endpoint = respx.post(f"http://127.0.0.1:{state.port}/tasks").mock(
+        return_value=httpx.Response(200, json=_view())
+    )
+    default = runner.invoke(app, ["dispatch", "x"])
+    assert default.exit_code == 0
+    assert "context_compression" not in json.loads(endpoint.calls[0].request.content)
+    opted = runner.invoke(
+        app, ["dispatch", "x", "--context-compression", "jev", "--context", "fact"]
+    )
+    assert opted.exit_code == 0
+    assert json.loads(endpoint.calls[1].request.content)["context_compression"] == "jev"
+    invalid = runner.invoke(app, ["dispatch", "x", "--context-compression", "auto"])
+    assert invalid.exit_code == 2
+    assert endpoint.call_count == 2
+    assert runner.invoke(app, ["route", "x", "--context-compression", "jev"]).exit_code == 2
