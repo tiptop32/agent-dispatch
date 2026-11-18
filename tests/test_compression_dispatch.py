@@ -28,7 +28,7 @@ WAIT = 5
 SOURCE = "# A\r\nFirst fact.\r\n\r\n# B\r\nSecond fact. 😀\r\n"
 
 
-def envelope(p=0.95, *, cost=0.125):
+def envelope(p=0.60, *, cost=0.125):
     return {
         "id": "generation-safe",
         "model": "response-model",
@@ -103,7 +103,7 @@ def assert_never_run(done, adapters, code):
 
 @pytest.mark.parametrize(
     ("probabilities", "expected"),
-    [([0.95, 0.94], "# B\r\nSecond fact. 😀\r\n"), ([1, 1], ""), ([0, 0], SOURCE)],
+    [([0.60, 0.5999999999999999], "# B\r\nSecond fact. 😀\r\n"), ([1, 1], ""), ([0, 0], SOURCE)],
 )
 @respx.mock
 async def test_selection_commits_before_http_and_changes_only_prompt_context(
@@ -137,8 +137,9 @@ async def test_selection_commits_before_http_and_changes_only_prompt_context(
     assert ("Second fact." in prompt) is ("Second fact." in expected)
     assert "immutable constraint" in prompt and "a.py" in prompt
     assert [body["state"]["candidate_id"] for body in bodies] == ["b0000", "b0001"]
-    if probabilities[0] >= 0.95:
-        assert [b["id"] for b in bodies[1]["state"]["blocks"]] == ["b0001"]
+    assert [b["id"] for b in bodies[1]["state"]["blocks"]] == (
+        ["b0000", "b0001"] if expected == SOURCE else ["b0001"]
+    )
     rows = await storage.compression_steps(done.task_id)
     assert [row["status"] for row in rows] == ["succeeded", "succeeded"]
     assert await storage.tree_cost([done.task_id]) == 0.25

@@ -54,7 +54,7 @@ from agent_dispatch.telemetry.storage import Storage
 
 CORPUS = Path(__file__).with_name("cases.jsonl")
 CORPUS_SHA256 = (  # Frozen public corpus digest, not a credential.
-    "cb61900eadf73d83a29c77afd422b89485c5e41ac0dbe4bd762f67ae82acbaf2"  # pragma: allowlist secret
+    "f61fc184f2071540b881baf1a643ffb72f7e4ed673080b20f32976827ee1a66d"  # pragma: allowlist secret
 )
 TRUSTED_ROOT = Path("/tmp/plan-dispatch/jev-context-compression")
 MOCK_URL = "https://compression-eval.invalid/decisions"
@@ -370,7 +370,7 @@ def load_corpus(path: Path = CORPUS) -> list[SemanticCase | CodingCase | Control
         if numbers != list(range(1, count + 1)):
             raise ValueError(f"Frozen {kind} ID coverage must be 1..{count}")
     if hashlib.sha256(data).hexdigest() != CORPUS_SHA256:
-        raise ValueError("Corpus differs from frozen revision 2 SHA-256")
+        raise ValueError("Corpus differs from frozen revision 3 SHA-256")
     return cases
 
 
@@ -898,6 +898,9 @@ def check_candidate(case: CodingCase, repo: Path, checker_dir: Path) -> dict[str
         "repo_path": str(repo.resolve()),
     }
     argv = [arg.format(**substitutions) for arg in case.assertion.argv]
+    # -I ignores PYTHONDONTWRITEBYTECODE; the checker must not create fixture files.
+    # Keep the frozen assertion argv unchanged and constrain its interpreter here.
+    argv.insert(1, "-B")
     try:
         result = subprocess.run(
             argv,
@@ -1796,7 +1799,7 @@ def report_document(
     if lane != "paired":
         complete = complete and len({row["id"] for row in rows}) == expected_count
     report = {
-        "corpus_revision": 2,
+        "corpus_revision": 3,
         "corpus_sha256": CORPUS_SHA256,
         "lane": lane,
         "created_at": datetime.now(UTC).isoformat(),

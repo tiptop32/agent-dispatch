@@ -29,7 +29,7 @@ def canonical(value: object) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
 
 
-def answer(p: object = 0.95, *, usage: object = None) -> dict:
+def answer(p: object = 0.60, *, usage: object = None) -> dict:
     return {
         "id": "generation-1",
         "model": "observed-model",
@@ -148,9 +148,9 @@ def assert_incomplete(error: CompressionError | CompressionCancelledError, steps
 @pytest.mark.parametrize(
     ("probabilities", "expected", "current_sets"),
     [
-        ([0.95, 0.94], ("b0001",), [("b0000", "b0001"), ("b0001",)]),
+        ([0.60, 0.5999999999999999], ("b0001",), [("b0000", "b0001"), ("b0001",)]),
         ([1, 1], (), [("b0000", "b0001"), ("b0001",)]),
-        ([0, 0.9499999999999998], ("b0000", "b0001"), [("b0000", "b0001")] * 2),
+        ([0, 0.5999999999999999], ("b0000", "b0001"), [("b0000", "b0001")] * 2),
     ],
 )
 async def test_source_order_threshold_and_atomic_result(

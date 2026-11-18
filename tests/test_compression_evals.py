@@ -41,6 +41,12 @@ async def test_all_frozen_rows_reach_real_selector_or_dispatcher(cases, tmp_path
     assert {row["id"] for row in rows} == {case.id for case in cases}
     report = harness.report_document("offline", rows)
     assert report["ok"] is True
+    assert report["corpus_revision"] == 3
+    assert report["corpus_sha256"] == (
+        "f61fc184f2071540b881baf1a643ffb72"  # pragma: allowlist secret
+        "f7e4ed673080b20f32976827ee1a66d"  # pragma: allowlist secret
+    )
+    assert report["threshold"] == 0.60
     # Recorded envelopes intentionally omit usage; passing replay is not measured free Jev.
     assert report["accounting"]["cost_usd"]["total"] is None
     assert report["accounting"]["cost_usd"]["unknown_components"] > 0
@@ -139,14 +145,43 @@ def test_checker_timeout_is_failed_and_uses_exact_isolated_argv(cases, tmp_path,
     monkeypatch.setattr(harness.subprocess, "run", timeout)
     result = harness.check_candidate(case, repo, tmp_path / "checker")
     argv, kwargs = called[0]
-    assert argv[1] == "-I"
-    assert Path(argv[2]).read_text() == case.assertion.source
-    assert Path(argv[2]).parent != repo
-    assert argv[3] == str(repo.resolve())
+    assert argv[1:3] == ["-B", "-I"]
+    assert Path(argv[3]).read_text() == case.assertion.source
+    assert Path(argv[3]).parent != repo
+    assert argv[4] == str(repo.resolve())
     assert "PYTHONOPTIMIZE" not in kwargs["env"]
     assert "PYTHONPATH" not in kwargs["env"]
     assert kwargs["timeout"] == 5
     assert result["ok"] is False and result["timed_out"] is True
+
+
+@pytest.mark.parametrize("extra", [None, "extra.py", "__pycache__/executor.pyc"])
+def test_valid_checker_creates_no_files_and_preserves_executor_file_violations(
+    cases, tmp_path, extra
+):
+    case = next(case for case in cases if case.id == "code-01-stable-unique")
+    repo = tmp_path / "repo"
+    harness.materialize(case, repo, git=False)
+    (repo / "solution.py").write_text(
+        "def stable_unique(values):\n    return list(dict.fromkeys(values))\n"
+    )
+    if extra is not None:
+        path = repo / extra
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"executor-created extra file")
+    before = {
+        path.relative_to(repo): path.read_bytes() for path in repo.rglob("*") if path.is_file()
+    }
+    check = harness.check_candidate(case, repo, tmp_path / "withheld")
+    after = {
+        path.relative_to(repo): path.read_bytes() for path in repo.rglob("*") if path.is_file()
+    }
+    assert check["executed"] is True and check["ok"] is True and check["exit_code"] == 0
+    assert after == before
+    violations = harness.fixture_violations(case, repo)
+    assert violations == ([] if extra is None else [f"Unexpected file: {extra}"])
+    result = ExecutionResult(status="completed", executor="eval", model="test", summary="ok")
+    assert harness.coding_verdict(result, check, {"complete": True}, violations, []) == violations
 
 
 @pytest.mark.parametrize("dimension", ["cost", "input_tokens", "output_tokens"])
@@ -542,7 +577,9 @@ def test_fixture_symlink_and_immutable_or_extra_files_fail(cases, tmp_path):
         harness.check_candidate(case, repo, repo / "checker")
 
 
-@pytest.mark.parametrize("malformation", ["duplicate_key", "duplicate_id", "missing_row", "no_lf"])
+@pytest.mark.parametrize(
+    "malformation", ["duplicate_key", "duplicate_id", "missing_row", "no_lf", "changed_probability"]
+)
 def test_corpus_malformed_is_rejected_before_replay(tmp_path, malformation):
     data = harness.CORPUS.read_text()
     lines = data.splitlines()
@@ -552,9 +589,12 @@ def test_corpus_malformed_is_rejected_before_replay(tmp_path, malformation):
         lines.append(lines[0])
     elif malformation == "missing_row":
         lines.pop()
+    elif malformation == "changed_probability":
+        lines[21] = lines[21].replace('"noul":0.5999999999999999', '"noul":0.59')
     target = tmp_path / "cases.jsonl"
     target.write_text("\n".join(lines) + ("" if malformation == "no_lf" else "\n"))
-    with pytest.raises(ValueError):
+    match = "frozen revision 3 SHA-256" if malformation == "changed_probability" else None
+    with pytest.raises(ValueError, match=match):
         harness.load_corpus(target)
 
 
