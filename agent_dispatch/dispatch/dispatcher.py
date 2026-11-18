@@ -5,19 +5,24 @@ import contextlib
 import fcntl
 import json
 import logging
+import math
 import os
 import secrets
 import subprocess
 import time
 import uuid
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
+
 from agent_dispatch.config import Settings
+from agent_dispatch.dispatch import context_compression as compression
 from agent_dispatch.dispatch import followup, redact, report_recovery, supervision, verify
 from agent_dispatch.dispatch.concurrency import ExecutorConcurrency
+from agent_dispatch.dispatch.context_blocks import ContextSpan, split_context
 from agent_dispatch.dispatch.escalation import next_executor, should_escalate
 from agent_dispatch.dispatch.task_package import (
     Followup,
@@ -58,6 +63,7 @@ from agent_dispatch.routing.capability import JUDGMENT_ADAPTER, perimeter_applie
 from agent_dispatch.routing.decision import decide_with_fallback
 from agent_dispatch.routing.exploration import apply_exploration
 from agent_dispatch.routing.guards import candidates, pre_guards, review_only_executors
+from agent_dispatch.routing.preflight import external_router_allowed
 from agent_dispatch.telemetry.storage import Storage
 
 
@@ -168,6 +174,8 @@ class Dispatcher:
         # Cleanup-таски из done-колбэка: shutdown их дожидается, иначе они
         # могут обратиться к уже закрытому storage.
         self._cleanup: set[asyncio.Task[None]] = set()
+        self._compressed_contexts: dict[str, compression.CompressionResult] = {}
+        self._executor_started: set[str] = set()
 
     @staticmethod
     def _now() -> datetime:
@@ -341,6 +349,16 @@ class Dispatcher:
         if worker:
             worker.cancel()
         else:
+            if record.request.context_compression is not None:
+                await self._interrupt_compression(record)
+                events = await self.storage.list_events(task_id)
+                started = any(event["kind"] == "executor_started" for event in events)
+                if not started:
+                    await self._compression_terminal(
+                        record, compression.CompressionCancelledError({})
+                    )
+                    return await self.wait(task_id, wait_seconds)
+                record.result = _failed_result(record, "cancelled", {"executor_started": True})
             record.status = TaskStatus.cancelled
             record.finished_at = self._now()
             await self.storage.update_task(record)
@@ -354,12 +372,31 @@ class Dispatcher:
                 record.status in {TaskStatus.queued, TaskStatus.routing, TaskStatus.running}
                 and record.task_id not in self._tasks
             ):
+                if record.request.context_compression is not None:
+                    await self._interrupt_compression(record)
+                    events = await self.storage.list_events(record.task_id)
+                    started = any(event["kind"] == "executor_started" for event in events)
+                    if not started:
+                        code = (
+                            "compression_provenance"
+                            if record.request._context_provenance_invalid
+                            else "compression_interrupted"
+                        )
+                        await self._compression_terminal(record, compression.CompressionError(code))
+                        count += 1
+                        continue
                 record.status = TaskStatus.failed
                 record.finished_at = self._now()
                 # Демон умер вместе со знанием о worktree задачи. Путь
                 # восстанавливается из события, иначе дерево осталось бы
                 # на диске, не упомянутое ни в одной записи.
                 meta = await self._worktree_meta(record.task_id)
+                if record.request.context_compression is not None:
+                    meta["executor_started"] = True
+                    for event in reversed(events):
+                        if event["kind"] == "context_compression":
+                            meta["context_compression"] = event["payload"]
+                            break
                 record.result = _failed_result(record, "daemon restarted", meta)
                 await self.storage.add_event(record.task_id, "exit", {"status": "failed"})
                 await self.storage.update_task(record)
@@ -383,6 +420,8 @@ class Dispatcher:
 
     async def route_only(self, req: DispatchRequest) -> tuple[RouteDecision, list[GuardEvent]]:
         # Вложенный `route` из задачи под периметром наследует его так же, как
+        if req.context_compression is not None:
+            raise compression.CompressionError("compression_unsupported")
         # `_prepare`: иначе при `corporate_perimeter: false` роутер увидел бы
         # внешнего исполнителя и текст продовой задачи.
         located = req if req.parent_task_id else await self._inherit_worktree_parent(req)
@@ -528,11 +567,25 @@ class Dispatcher:
                 # Отмену до первого шага `_run` (shutdown сразу после submit)
                 # или посреди `_mark_cancelled` записывает только этот колбэк.
                 cancelled = worker.cancelled()
+                if record.request.context_compression is not None:
+                    await self._interrupt_compression(record)
+                    events = await self.storage.list_events(task_id)
+                    started = any(event["kind"] == "executor_started" for event in events)
+                    if not started:
+                        exc = (
+                            compression.CompressionCancelledError({})
+                            if cancelled
+                            else compression.CompressionError("compression_interrupted")
+                        )
+                        await self._compression_terminal(record, exc)
+                        return
                 record.status = TaskStatus.cancelled if cancelled else TaskStatus.failed
                 record.finished_at = self._now()
                 record.result = _failed_result(
                     record, "cancelled" if cancelled else "worker stopped unexpectedly"
                 )
+                if record.request.context_compression is not None:
+                    record.result.meta["executor_started"] = started
                 await self.storage.update_task(record)
                 await self.storage.add_event(task_id, "exit", {"status": record.status.value})
         finally:
@@ -563,9 +616,336 @@ class Dispatcher:
                 "next_action": next_action,
             },
         )
+        if record.request.context_compression is not None:
+            result.meta["executor_started"] = False
         record.status, record.result, record.finished_at = TaskStatus.failed, result, self._now()
         await self.storage.add_event(record.task_id, "guard", guard.model_dump(mode="json"))
         await self.storage.update_task(record)
+        self._notify(record.task_id)
+
+    async def _interrupt_compression(self, record: TaskRecord) -> None:
+        for row in await self.storage.compression_steps(record.task_id):
+            if row["status"] == "started":
+                await self.storage.finish_compression_step(
+                    record.task_id,
+                    compression.StepOutcome(
+                        index=row["step_index"],
+                        candidate_id=row["candidate_id"],
+                        status="interrupted",
+                        completed_at=self._now(),
+                        latency_ms=0,
+                        jev_id=None,
+                        response_model=None,
+                        p_delete_safe=None,
+                        deleted=None,
+                        cost_usd=None,
+                        input_tokens=None,
+                        output_tokens=None,
+                        is_byok=None,
+                    ),
+                )
+
+    async def _compression_lineage(self, record: TaskRecord) -> list[TaskRecord]:
+        """Read every durable edge; missing/corrupt/cyclic ancestry fails closed."""
+        records: dict[str, TaskRecord] = {record.task_id: record}
+        if record.request._context_provenance_invalid:
+            raise compression.CompressionError("compression_provenance")
+        active: set[str] = set()
+        done: set[str] = set()
+        pending = [(record, False)]
+        while pending:
+            current, leaving = pending.pop()
+            key = current.task_id
+            if leaving:
+                active.remove(key)
+                done.add(key)
+                continue
+            if (
+                current.request.context_compression is not None
+                and current.escalated_from is not None
+                and current.request._context_provenance is None
+            ):
+                raise compression.CompressionError("compression_provenance")
+            if key in active:
+                raise compression.CompressionError("compression_provenance")
+            if key in done:
+                continue
+            active.add(key)
+            pending.append((current, True))
+            edges = dict.fromkeys(
+                edge
+                for edge in (
+                    current.parent_task_id,
+                    current.request.parent_task_id,
+                    current.escalated_from,
+                    current.request.followup_of,
+                )
+                if edge is not None
+            )
+            for edge in edges:
+                if edge in active:
+                    raise compression.CompressionError("compression_provenance")
+                if edge not in records:
+                    try:
+                        ancestor = await self.storage.get_task(edge)
+                    except (ValueError, TypeError, KeyError):
+                        raise compression.CompressionError("compression_provenance") from None
+                    if ancestor is None or ancestor.request._context_provenance_invalid:
+                        raise compression.CompressionError("compression_provenance")
+                    records[edge] = ancestor
+                pending.append((records[edge], False))
+        return list(records.values())
+
+    async def _compression_admit(self, record: TaskRecord) -> compression.CompressionInput:
+        req = record.request
+        if req._context_provenance_invalid:
+            raise compression.CompressionError("compression_provenance")
+        context = req.context
+        if (
+            req.kind != "task"
+            or req.context_mode not in (ContextMode.prompt_summary, ContextMode.full)
+            or context is None
+            or not context.strip()
+        ):
+            raise compression.CompressionError("compression_unsupported")
+        try:
+            size = len(context.encode("utf-8", errors="strict"))
+        except UnicodeError:
+            raise compression.CompressionError("compression_limit") from None
+        if record.escalated_from and req._context_provenance is None:
+            raise compression.CompressionError("compression_provenance")
+        try:
+            blocks = split_context(context, provenance=req._context_provenance)
+        except (ValueError, TypeError, AttributeError):
+            raise compression.CompressionError("compression_provenance") from None
+        immutable = {
+            "task": req.task,
+            "files": req.files,
+            "constraints": req.constraints,
+            "success_criteria": req.success_criteria,
+        }
+
+        def encoded(value: object) -> bytes:
+            try:
+                return json.dumps(
+                    value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8", errors="strict")
+            except ValueError:
+                raise compression.CompressionError("compression_limit") from None
+
+        if (
+            size > compression.MAX_CONTEXT_BYTES
+            or len(blocks) > compression.MAX_BLOCKS
+            or len(encoded(immutable)) > compression.MAX_IMMUTABLE_BYTES
+        ):
+            raise compression.CompressionError("compression_limit")
+        if not external_router_allowed(req, self.settings):
+            raise compression.CompressionError("compression_privacy")
+        lineage = await self._compression_lineage(record)
+        ancestors = {link.task_id for link in lineage if link.task_id != record.task_id}
+        if any(b.source_task_id not in ancestors for b in blocks if b.origin != "user"):
+            raise compression.CompressionError("compression_provenance")
+        inherited = None
+        for link in lineage:
+            status = link.decision.meta.get("perimeter") if link.decision else None
+            if status not in (None, "prod", "answered", "unknown"):
+                raise compression.CompressionError("compression_provenance")
+            if link.request.prod or status == "prod":
+                raise compression.CompressionError("compression_privacy")
+            if status in ("answered", "unknown") and self.settings.routing.corporate_perimeter:
+                inherited = status
+        if inherited is not None:
+            raise compression.CompressionError("compression_privacy")
+        # Admission covers the largest canonical state/body before routing can pay.
+        for block in blocks:
+            if block.origin != "user":
+                continue
+            state = {
+                **immutable,
+                "blocks": [
+                    {"id": b.id, "origin": b.origin, "text": context[b.start : b.end]}
+                    for b in blocks
+                ],
+                "candidate_id": block.id,
+            }
+            body = {
+                "model": self.settings.router.jev.model,
+                "state": state,
+                "questions": {"delete_safe": compression.QUESTION},
+            }
+            if (
+                len(encoded(state)) > compression.MAX_STATE_BYTES
+                or len(encoded(body)) > compression.MAX_REQUEST_BYTES
+            ):
+                raise compression.CompressionError("compression_limit")
+        if req._context_provenance is None:
+            req._context_provenance = (ContextSpan(0, len(context), "user", None),)
+            try:
+                await self.storage.update_task(record)
+            except Exception:
+                raise compression.CompressionError("compression_storage") from None
+        return compression.CompressionInput(record.task_id, req, blocks, inherited, None)
+
+    async def _compression_budget(self, record: TaskRecord) -> None:
+        try:
+            daily = self.settings.routing.daily_cost_limit_usd
+            if daily is not None:
+                midnight = (
+                    datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+                )
+                spent = await self.storage.cost_since(midnight)
+                if await self.storage.compression_cost_unknown(since=midnight) or not math.isfinite(
+                    spent
+                ):
+                    raise compression.CompressionError("compression_budget_unknown")
+                if spent >= daily:
+                    raise compression.CompressionError("compression_budget")
+            chain = self.settings.routing.max_chain_cost_usd
+            if chain is not None:
+                ids = [link.task_id for link in await self._compression_lineage(record)]
+                spent = await self.storage.tree_cost(ids)
+                if await self.storage.compression_cost_unknown(task_ids=ids) or not math.isfinite(
+                    spent
+                ):
+                    raise compression.CompressionError("compression_budget_unknown")
+                if spent >= chain:
+                    raise compression.CompressionError("compression_budget")
+        except compression.CompressionError:
+            raise
+        except Exception:
+            raise compression.CompressionError("compression_storage") from None
+
+    async def _compress(self, record: TaskRecord, value: compression.CompressionInput) -> None:
+        await self._compression_budget(record)
+
+        async def before_step(step: compression.StepStart, acknowledge: Callable[[], None]) -> None:
+            await self._compression_budget(record)
+            await self.storage.start_compression_step(record.task_id, step, acknowledge=acknowledge)
+
+        async def after_step(step: compression.StepOutcome) -> None:
+            await self.storage.finish_compression_step(record.task_id, step)
+            await self._compression_budget(record)
+
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(retries=0), follow_redirects=False
+        ) as client:
+            await self.storage.add_event(record.task_id, "context_compression_start", {})
+            selected = await compression.compress_context(
+                value,
+                settings=self.settings,
+                client=client,
+                before_step=before_step,
+                after_step=after_step,
+            )
+        await self._compression_budget(record)
+        self._compressed_contexts[record.task_id] = selected
+        await self.storage.add_event(record.task_id, "context_compression", selected.metrics)
+
+    async def _compression_snapshot(
+        self, record: TaskRecord, code: str, status: str
+    ) -> dict[str, object]:
+        rows = await self.storage.compression_steps(record.task_id)
+        context = record.request.context
+        size, blocks = None, ()
+        events = await self.storage.list_events(record.task_id)
+        entered = next(
+            (
+                event["ts"]
+                for event in reversed(events)
+                if event["kind"] == "context_compression_start"
+            ),
+            None,
+        )
+        latency_ms = (
+            max(0, int((self._now() - datetime.fromisoformat(entered)).total_seconds() * 1000))
+            if entered is not None
+            else 0
+        )
+        if context is not None:
+            try:
+                size = len(context.encode("utf-8"))
+                if not record.request._context_provenance_invalid and not (
+                    record.escalated_from and record.request._context_provenance is None
+                ):
+                    blocks = split_context(context, provenance=record.request._context_provenance)
+            except (ValueError, TypeError):
+                pass
+        costs = [row["cost_usd"] for row in rows]
+        try:
+            known = math.fsum(value for value in costs if value is not None)
+        except OverflowError:
+            known = None
+        if known is not None and not math.isfinite(known):
+            known = None
+        complete = known is not None and all(
+            row["status"] != "started" and row["cost_usd"] is not None for row in rows
+        )
+
+        def tokens(key):
+            values = [row[key] for row in rows]
+            return sum(values) if None not in values else None
+
+        byok = [row["is_byok"] for row in rows]
+        return {
+            "version": 1,
+            "status": status,
+            "error_code": code,
+            "model": self.settings.router.jev.model,
+            "response_models": list(
+                dict.fromkeys(
+                    row["response_model"] for row in rows if row["response_model"] is not None
+                )
+            ),
+            "jev_ids": [row["jev_id"] for row in rows if row["jev_id"] is not None],
+            "input_bytes": size,
+            "output_bytes": None,
+            "blocks_total": len(blocks),
+            "blocks_kept": None,
+            "selectable_blocks": sum(b.origin == "user" for b in blocks),
+            "completed_steps": sum(row["status"] == "succeeded" for row in rows),
+            "attempted_steps": len(rows),
+            "latency_ms": latency_ms,
+            "usage": {
+                "cost": known if complete else None,
+                "known_cost": known,
+                "cost_complete": complete,
+                "input_tokens": tokens("input_tokens"),
+                "output_tokens": tokens("output_tokens"),
+            },
+            "is_byok": bool(byok[0]) if byok and None not in byok and len(set(byok)) == 1 else None,
+        }
+
+    async def _compression_terminal(
+        self,
+        record: TaskRecord,
+        exc: compression.CompressionError | compression.CompressionCancelledError,
+    ) -> None:
+        cancelled = isinstance(exc, asyncio.CancelledError)
+        status = "failed"
+        if cancelled:
+            status = "cancelled"
+        elif exc.code == "compression_interrupted":
+            status = "interrupted"
+        metrics = await self._compression_snapshot(record, exc.code, status)
+        selected = self._compressed_contexts.get(record.task_id)
+        observed = exc.metrics or (selected.metrics if selected is not None else {})
+        if "latency_ms" in observed:
+            metrics["latency_ms"] = observed["latency_ms"]
+        meta = dict(record.result.meta) if record.result else {}
+        meta.update(error_code=exc.code, executor_started=False, context_compression=metrics)
+        record.result = ExecutionResult(
+            status="failed",
+            executor=record.decision.executor if record.decision else "",
+            model=None,
+            summary="Context compression did not complete.",
+            error=str(exc),
+            meta=meta,
+        )
+        record.status = TaskStatus.cancelled if cancelled else TaskStatus.failed
+        record.finished_at = self._now()
+        await self.storage.update_task(record)
+        await self.storage.add_event(record.task_id, "context_compression", metrics)
+        await self.storage.add_event(record.task_id, "exit", {"status": record.status.value})
         self._notify(record.task_id)
 
     async def _run(self, task_id: str) -> None:
@@ -577,14 +957,61 @@ class Dispatcher:
             if prepared is None:
                 return
             await self._execute(record, prepared)
+        except compression.CompressionCancelledError as exc:
+            await self._compression_terminal(record, exc)
+            raise
+        except compression.CompressionError as exc:
+            await self._compression_terminal(record, exc)
         except asyncio.CancelledError:
-            await self._mark_cancelled(record)
+            if (
+                record.request.context_compression is not None
+                and task_id not in self._executor_started
+            ):
+                await self._compression_terminal(record, compression.CompressionCancelledError({}))
+            else:
+                await self._mark_cancelled(record)
             raise
         except Exception as exc:
-            await self._mark_failed(record, exc)
+            if (
+                record.request.context_compression is not None
+                and task_id not in self._executor_started
+            ):
+                await self._compression_terminal(
+                    record, compression.CompressionError("compression_storage")
+                )
+            else:
+                await self._mark_failed(record, exc)
+        finally:
+            self._compressed_contexts.pop(task_id, None)
+            self._executor_started.discard(task_id)
 
     async def _prepare(self, record: TaskRecord) -> Routing | None:
         """Маршрутизация и guard'ы. None значит, что задача уже закрыта отказом."""
+        value = None
+        if record.request.context_compression is not None:
+            req = record.request
+            await self.availability.check_all()
+            parent_exists = bool(
+                req.parent_task_id and await self.storage.task_exists(req.parent_task_id)
+            )
+            siblings = 0
+            if req.parent_task_id and record.escalated_from is None:
+                siblings = await self.storage.count_children(
+                    req.parent_task_id, exclude_escalated=True, exclude_task_id=record.task_id
+                )
+            guard = pre_guards(
+                req,
+                self.settings,
+                self.availability.unavailable(),
+                parent_exists,
+                siblings,
+                review_only_executors(req, self.settings),
+            )
+            if isinstance(guard, GuardEvent):
+                await self._guard_failure(record, guard)
+                return None
+            value = await self._compression_admit(record)
+            await self._compression_budget(record)
         record.status = TaskStatus.routing
         await self.storage.update_task(record)
         budget = await self._daily_budget_guard()
@@ -628,6 +1055,11 @@ class Dispatcher:
             await self._guard_failure(record, routing.guard)
             return None
         decision = routing.decision
+        if value is not None and decision.meta.get("perimeter") in ("prod", "answered", "unknown"):
+            record.decision = decision
+            await self.storage.update_task(record)
+            await self.storage.add_decision(record.task_id, decision, routing.candidates)
+            raise compression.CompressionError("compression_privacy")
         refusal = self._perimeter_refusal(decision, inherited, prod=record.request.prod)
         if refusal is not None:
             await self._guard_failure(record, refusal)
@@ -659,6 +1091,8 @@ class Dispatcher:
             )
             return None
         routing.decision = decision
+        if value is not None:
+            await self._compress(record, value)
         return routing
 
     async def _daily_budget_guard(self, extra: float = 0.0) -> GuardEvent | None:
@@ -668,6 +1102,10 @@ class Dispatcher:
             return None
         midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
         spent = extra + await self.storage.cost_since(midnight)
+        if await self.storage.compression_cost_unknown(since=midnight) or not math.isfinite(spent):
+            return GuardEvent(
+                reason=GuardReason.budget, detail="compression spending is not fully known"
+            )
         if spent < limit:
             return None
         return GuardEvent(
@@ -700,6 +1138,8 @@ class Dispatcher:
             adapter = self.adapters[decision.executor]
             # Путь и ветка известны до создания: отмена посреди `worktree.create`
             # бросает ожидание, но поток доводит каталог до конца, и корутина
+            if req.context_compression is not None:
+                await self._compression_budget(record)
             # никогда не узнает о дереве, которое уже есть на диске.
             target = self._worktree_target(task_id) if mode == "worktree" else None
             result: ExecutionResult
@@ -734,6 +1174,10 @@ class Dispatcher:
                 # Отмена задачи это BaseException, её не ловит обычный путь
                 # ошибок. Дерево остаётся намеренно: в нём может лежать
                 # незакоммиченная работа исполнителя.
+                if target is not None:
+                    await self._note_kept_worktree(record, *target, exc)
+                raise
+            except compression.CompressionError as exc:
                 if target is not None:
                     await self._note_kept_worktree(record, *target, exc)
                 raise
@@ -964,7 +1408,12 @@ class Dispatcher:
                 retry_fingerprint = await asyncio.to_thread(workspace.fingerprint, ctx.cwd)
             except (OSError, subprocess.CalledProcessError):
                 retry_fingerprint = None
-        result = await self._call_adapter(adapter, ctx, decision)
+        try:
+            result = await self._call_adapter(adapter, ctx, decision)
+        except (compression.CompressionError, asyncio.CancelledError):
+            if stat_snapshot is not None:
+                stat_snapshot.close()
+            raise
         if ctx.resume_session and self._resume_failed(result):
             # Сессию не нашли или CLI другой версии не понял флаги: один раз
             # с нуля, итог прошлой попытки идёт в промпт.
@@ -1462,6 +1911,7 @@ class Dispatcher:
             source_agent=record.source_agent,
             root_agent=record.root_agent,
             review_base=base,
+            context_compression=None,
         )
         request._automatic_review = True
         timeout = self.settings.timeout_for(reviewer)
@@ -1801,12 +2251,24 @@ class Dispatcher:
                         await self._stop_supervised_descendants(ctx.task_id, result)
                     await self.storage.add_event(ctx.task_id, "supervision", note)
 
+                async def execute() -> ExecutionResult:
+                    if (
+                        record.request.context_compression is not None
+                        and ctx.task_id not in self._executor_started
+                    ):
+                        await self._compression_budget(record)
+                        await self.storage.add_event(ctx.task_id, "executor_started", {})
+                        self._executor_started.add(ctx.task_id)
+                    return await adapter.execute(ctx)
+
                 result = await supervision.supervise(
-                    self.settings, ctx, record.request, lambda: adapter.execute(ctx), emit
+                    self.settings, ctx, record.request, execute, emit
                 )
                 if result.meta.get("supervision"):
                     result.executor = decision.executor
                 return result
+        except compression.CompressionError:
+            raise
         except Exception as exc:
             return ExecutionResult(
                 status="failed",
@@ -1906,6 +2368,11 @@ class Dispatcher:
         # получают правило данных, хотя флага `prod` в своём запросе не имеют.
         prod = req.prod or decision.meta.get("perimeter") == "prod"
         package = package.model_copy(update={"executor": decision.executor, "prod": prod})
+        selected = self._compressed_contexts.get(record.task_id)
+        if req.context_compression is not None and selected is None:
+            raise compression.CompressionError("compression_storage")
+        if selected is not None:
+            package.effective_context = selected.effective_context
         session = None
         if req.followup_of:
             attempt, session = await self._followup(req, decision, tree, resume=resume)
@@ -2250,7 +2717,16 @@ class Dispatcher:
         current = result.usage.cost_usd if result.usage and result.usage.cost_usd else 0.0
         routing = self.settings.routing
         if routing.max_chain_cost_usd is not None:
-            spent = current + await self.storage.tree_cost([task_id for task_id, _ in links])
+            ids = [task_id for task_id, _ in links]
+            spent = current + await self.storage.tree_cost(ids)
+            if await self.storage.compression_cost_unknown(task_ids=ids) or not math.isfinite(
+                spent
+            ):
+                result.meta["budget"] = {
+                    "limit_usd": routing.max_chain_cost_usd,
+                    "cost_complete": False,
+                }
+                return "compression spending is not fully known"
             if spent >= routing.max_chain_cost_usd:
                 result.meta["budget"] = {
                     "chain_cost_usd": round(spent, 4),
@@ -2384,6 +2860,10 @@ class Dispatcher:
             "routing_policy_version",
             decision.meta.get("routing_policy_version", f"{decision.router.value}-v1"),
         )
+        selected = self._compressed_contexts.get(record.task_id)
+        if selected is not None:
+            result.meta["context_compression"] = selected.metrics
+            result.meta["executor_started"] = record.task_id in self._executor_started
         failure_class = (
             None if result.meta.get("supervision") else classify_internal_failure(result)
         )
@@ -2434,6 +2914,21 @@ class Dispatcher:
         )
         # `executor: None` отдаёт задачу роутеру; уже пробовавшие исключает `_prepare`.
         update: dict[str, object] = {"executor": plan.executor}
+        provenance = record.request._context_provenance
+
+        def append_context(note: str, origin: str) -> None:
+            nonlocal provenance
+            context = update.get("context", record.request.context) or ""
+            suffix = f"\n\n{note}" if context else note
+            update["context"] = context + suffix
+            if record.request.context_compression is not None:
+                if provenance is None:
+                    raise compression.CompressionError("compression_provenance")
+                provenance = (
+                    *provenance,
+                    ContextSpan(len(context), len(context) + len(suffix), origin, record.task_id),
+                )
+
         if record.request.followup_of:
             # Звено follow-up продолжает упавшую попытку, а не задачу до неё:
             # иначе следующий исполнитель видел бы устаревший отчёт.
@@ -2443,8 +2938,7 @@ class Dispatcher:
             if record.request.context_mode == ContextMode.prompt:
                 update["task"] = f"{record.request.task}\n\n{note}"
             else:
-                context = record.request.context
-                update["context"] = f"{context}\n\n{note}" if context else note
+                append_context(note, "daemon_handoff")
         reviews = [
             stage
             for stage in result.meta.get("review_stages", [])
@@ -2462,12 +2956,10 @@ class Dispatcher:
                 task = update.get("task", record.request.task)
                 update["task"] = f"{task}\n\n{note}"
             else:
-                context = update.get("context", record.request.context)
-                update["context"] = f"{context}\n\n{note}" if context else note
-        child = await self.submit(
-            record.request.model_copy(update=update),
-            escalated_from=record.task_id,
-        )
+                append_context(note, "daemon_review")
+        request = record.request.model_copy(update=update)
+        request._context_provenance = provenance
+        child = await self.submit(request, escalated_from=record.task_id)
         result.meta["escalated_to"] = child.task_id
 
     async def _note_kept_worktree(
@@ -2530,6 +3022,12 @@ class Dispatcher:
                     "usage": usage.model_dump() if usage else None,
                     "inflight_check_usage": "unknown after cancellation",
                 }
+        if record.request.context_compression is not None:
+            record.result = record.result or _failed_result(record, "cancelled")
+            record.result.meta["executor_started"] = record.task_id in self._executor_started
+            selected = self._compressed_contexts.get(record.task_id)
+            if selected is not None:
+                record.result.meta["context_compression"] = selected.metrics
         record.status, record.finished_at = TaskStatus.cancelled, self._now()
         await self.storage.add_event(record.task_id, "cancel", {})
         await self.storage.update_task(record)
@@ -2537,6 +3035,11 @@ class Dispatcher:
 
     async def _mark_failed(self, record: TaskRecord, exc: BaseException) -> None:
         record.result = _failed_result(record, f"{type(exc).__name__}: {exc}")
+        if record.request.context_compression is not None:
+            record.result.meta["executor_started"] = record.task_id in self._executor_started
+            selected = self._compressed_contexts.get(record.task_id)
+            if selected is not None:
+                record.result.meta["context_compression"] = selected.metrics
         record.status, record.finished_at = TaskStatus.failed, self._now()
         await self.storage.add_event(record.task_id, "exit", {"status": "failed"})
         await self.storage.update_task(record)

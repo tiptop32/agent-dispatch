@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 from jsonschema import Draft202012Validator
-from pydantic import ValidationError
+from pydantic import ValidationError, create_model
 
 from agent_dispatch.models import (
     Availability,
@@ -179,3 +179,35 @@ def test_decision_log_default_is_not_serialized_for_old_clients() -> None:
     opted_out = DispatchRequest(task="t", cwd="/tmp", decision_log=False)
     assert opted_out.model_dump()["decision_log"] is False
     assert DispatchRequest.model_validate_json(opted_out.model_dump_json()).decision_log is False
+
+
+def test_compression_default_roundtrips_through_strict_old_proxy():
+    old_request = create_model(
+        "OldDispatchRequest",
+        __config__=DispatchRequest.model_config,
+        **{
+            name: (field.annotation, field)
+            for name, field in DispatchRequest.model_fields.items()
+            if name != "context_compression"
+        },
+    )
+    default = DispatchRequest(**request_data())
+    assert "context_compression" not in default.model_dump()
+    assert "context_compression" not in default.model_dump_json()
+    assert old_request.model_validate_json(default.model_dump_json()).task == default.task
+    opted = DispatchRequest(**request_data(context_compression="jev"))
+    assert DispatchRequest.model_validate_json(opted.model_dump_json()).context_compression == "jev"
+    with pytest.raises(ValidationError):
+        old_request.model_validate_json(opted.model_dump_json())
+
+
+@pytest.mark.parametrize("value", ["auto", "Jev", "", True, 1, ["jev"]])
+def test_compression_literal_is_not_coerced(value):
+    with pytest.raises(ValidationError):
+        DispatchRequest(**request_data(context_compression=value))
+
+
+@pytest.mark.parametrize("field", ["_context_provenance", "_context_provenance_invalid"])
+def test_caller_cannot_set_private_provenance(field):
+    with pytest.raises(ValidationError):
+        DispatchRequest(**request_data(**{field: False}))

@@ -130,6 +130,16 @@ def build_router() -> APIRouter:
 
     @router.post("/route")
     async def route(req: DispatchRequest, request: Request):
+        if req.context_compression is not None:
+            raise HTTPException(
+                422,
+                detail=_error_detail(
+                    "compression_unsupported",
+                    "Context compression is not supported by /route.",
+                    retryable=False,
+                    next_action="omit context_compression or use POST /tasks for compression",
+                ),
+            )
         decision, _ = await _deps(request).dispatcher.route_only(req)
         return decision
 

@@ -1,0 +1,219 @@
+# Jev: явный отбор блоков context перед делегированием
+
+## Overview
+
+Добавить opt-in сжатие только поля `DispatchRequest.context` перед передачей исполнителю. Jev оценивает необходимость смысловых блоков; код сохраняет выбранный текст дословно и в исходном порядке. Цель: уменьшить вход маленькой модели без потери выполнения задачи. Экономию измерять по полной цене цепочки, включая Jev, проверки, ревью и эскалации.
+
+Согласовано с пользователем:
+- Только явное включение для конкретного dispatch, без автоматики по тиру или длине.
+- Отбор целых блоков, не пересказ и не отбор предложений.
+- `task`, `files`, `constraints`, `success_criteria`, `verify` и служебные инструкции не сжимаются.
+- Нет обязательного коэффициента сжатия: если нужны все блоки, сохраняются все.
+- Сбой/невалидный ответ Jev останавливает задачу до запуска исполнителя. Нет fallback на исходный context, другой сервис или модель.
+- Prod и обязательный корпоративный периметр запрещают внешний вызов; запрет нельзя обходить.
+
+Критерии готовности:
+1. Без opt-in запрос, промпт и число внешних вызовов сохраняют прежнее поведение.
+2. С opt-in исполнитель получает только дословно отобранный context; исходный запрос в хранилище не изменяется.
+3. Невалидный ответ, отказ preflight, таймаут и неподдерживаемый запрос дают явную ошибку сжатия; исполнитель не стартует, ошибка не вызывает обычную эскалацию исполнителя.
+4. Безопасность проверяется до сериализации state и любого HTTP-вызова: trusted roots, реальный путь, prod и унаследованный обязательный периметр.
+5. Телеметрия показывает результат отбора, размер до/после, задержку и цену без копий текста.
+6. Локальный корпус проходит на 100%; живой корпус сохраняет все размеченные обязательные факты. Парный coding-eval сравнивает исходный и сжатый context на одном выбранном пользователем маленьком исполнителе.
+
+Не входит: история чата, чтение репозитория ради сжатия, переписывание task, автоматическое включение, новый роутер, универсальный Markdown-парсер, Extractions API, новый LLM-провайдер.
+
+## Context
+
+- Python, asyncio, Pydantic extra=forbid, httpx, Jinja2; проверки проекта через uv.
+- `agent_dispatch/models.py`: DispatchRequest и совместимость сериализации новых полей со старыми MCP-прокси.
+- `agent_dispatch/mcp/server.py`: dispatch/dispatch_to используют общий do_dispatch; route только выбирает исполнителя.
+- `agent_dispatch/cli.py`: публичный CLI dispatch.
+- `agent_dispatch/dispatch/dispatcher.py`: `_build_context` строит TaskPackage перед render_prompt; prod и периметр наследуются по линии, а не только из req.prod.
+- `agent_dispatch/dispatch/task_package.py`: исходный request внутри пакета; переписывание путей для worktree должно происходить после отбора, как сейчас при рендере.
+- `agent_dispatch/routing/jev.py`: существующий Decisions HTTP-контракт и настройки, не место для отбора контекста.
+- `agent_dispatch/routing/preflight.py`: external_router_allowed проверяет trusted roots и req.prod, но сам по себе не проверяет весь унаследованный периметр.
+- `agent_dispatch/templates/task_package.md.j2`: context не выводится в context_mode=prompt; служебные инструкции вне context.
+- `evals/README.md`: offline корпуса и платный smoke отделены; реальные coding-задачи выполняются через локальный omp/демон, не hosted inference API.
+
+Официальный источник, прочитан 2026-11-18: https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request . Заголовок: Submit a Decisions request. POST /api/alpha/decisions принимает state и карту questions, возвращает typed answers и usage. `noul` подходит для оценки каждого блока. API alpha; конкретные пределы questions/state и реальный batch-ответ текущего Jev не проверены. Платных запросов при планировании не было. На странице также описан отдельный Extractions API; он не нужен выбранному подходу.
+
+## Development Approach
+
+Сначала завершить контракт и корпус, затем TDD на границах блока, HTTP и dispatcher. Не менять маршрутизацию и не извлекать общий HTTP-фреймворк ради двух вызовов. Использовать существующие JevSettings и httpx; отбор живёт отдельно в dispatch.
+
+Каждая задача сдаётся вместе с тестами. Работники не запускают build/lint/tests/formatters по ходу правок: scoped verify выполняет демон, менеджер проверяет интеграцию. Не повторять зелёные проверки без изменений в их области. Не коммитить и не пушить из исполнителя. Все артефакты живых прогонов в /tmp, без секретов и внутренних данных.
+
+## Solution Overview
+
+Публичный opt-in: `context_compression: Literal["jev"] | None = None`, None исключается из сериализации. В CLI: `--context-compression jev`; в MCP dispatch и dispatch_to одноимённый необязательный параметр. HTTP использует DispatchRequest. route не сжимает ничего.
+
+Пользователь выбрал последовательное удаление через Decisions API. Вход каждого шага: неизменные task/files/constraints/success_criteria, текущий сохранённый набор блоков со стабильными ID и ID одного кандидата на удаление. Один noul-вопрос: можно ли удалить кандидата из этого текущего набора без потери необходимых требований, фактов и зависимостей? При p(delete-safe) >= 0.95 удалить кандидата перед следующим вызовом, иначе сохранить. Порог является предложением для калибровки, не гарантией. Обход кандидатов один раз в исходном порядке; сохранённые блоки повторно не оцениваются. Две копии факта больше не оцениваются независимо: после удаления первой второй шаг видит отсутствие первой.
+
+Заголовки включаются с выбранным содержимым; fenced code, списки и таблицы не дробятся внутри структуры. Если надёжную границу найти нельзя, фрагмент сохраняется целиком. Исходные интервалы текста и разделители позволяют не нормализовать пробелы/переводы строк. Пустой результат допустим только по согласованному контракту финального набора. Корпус обязан включать повторяющиеся обязательные факты и альтернативные доказательства: хотя бы одна достаточная опора должна сохраниться.
+
+Отвергнуто: пересказ из-за риска искажения; предложения из-за потери связей; жёсткий бюджет из-за принудительного удаления полезного; автоматическое включение и fallback по выбору пользователя.
+
+## Technical Details
+
+- До `_route` локально отклонять opt-in с req.prod, унаследованным обязательным периметром (prod/answered/unknown) или запрещённым cwd. Проверять до сериализации state и для routing Jev, и для compression Jev. После маршрутизации дополнительно проверять effective perimeter по решению. Тестировать ноль вызовов обоих Jev для запрещённого наследника, включая восстановление линии после рестарта. Не спрашивать внешний сервис о разрешении отправить уже запрещённый текст.
+- Пустой context и context_mode=prompt с opt-in отклоняются как бессмысленное применение параметра. Без opt-in прежнее поведение остаётся.
+- Начальная область: coding dispatch. Явный opt-in для review отклоняется, автоматические review-дети не наследуют параметр.
+- Отбор выполняется после guards и выбора исполнителя, до его старта. Ошибка сжатия не должна выглядеть как сбой/квота исполнителя, включать его cooldown или запускать эскалацию.
+- Исходный DispatchRequest не мутируется. В TaskPackage добавить отдельное необязательное значение effective_context; None означает отсутствие обработки, пустая строка означает валидный пустой отбор. render_prompt подменяет только context.
+- На автоматической эскалации сохранять opt-in только для пользовательского context. Хранить происхождение daemon-generated handoff/review feedback и исключать эти блоки из отбора; не определять их по текстовым префиксам. Даже при удалении всех selectable-блоков служебный материал должен прийти дословно. В dispatch/followup.py явно сбрасывать context_compression. Отказ сжатия до старта помечать как never-run: follow-up корня получает no_executor_run, в цепочке выбирается последнее реально исполнявшееся звено, а не просто назначенный executor. Возобновлённые сессии не пересжимают загруженный Task Package.
+- Прежнее ограничение одним запросом отменено пользователем при выборе последовательного удаления. Не более одного Decisions-вызова на selectable-блок, строго последовательно, без повторов, batching и альтернативного prompt/модели. До первого вызова проверить собственные ограничения размера/числа блоков; Task 1 фиксирует их и общий deadline прохода по ограниченной synthetic-пробе. Превышение означает явный отказ, не обрезание и не выдачу частичного результата.
+- Каждый ответ содержит ровно один ожидаемый answer ID, type=noul и конечный p в [0,1]. Пропуск/лишний ID, NaN, неверные типы, не-JSON или ошибка любого шага прекращают проход и весь dispatch до executor. Публикация effective_context только после завершения всех шагов; уже потраченная цена сохраняется даже при ошибке. Отмена/deadline прекращают текущий HTTP и не запускают следующие шаги.
+- Метрики в result.meta.context_compression и событии: status, model, jev_ids выполненных шагов, input/output UTF-8 bytes исходного/итогового context, blocks_total/kept, completed_steps, суммарные latency_ms и usage.cost/input_tokens/output_tokens всех вызовов. Нет контекста, отдельных блоков, тела HTTP-ошибки или ключей. Bytes не выдавать за токены; при недоступном usage писать unknown, не ноль. Ошибка прохода сохраняет известные расходы завершённых шагов; неизвестную цену оборванного запроса не выдавать за ноль.
+- Стоимость Jev учитывать отдельно от usage исполнителя и включать в проверяемую полную цену eval. Существующие потолки бюджета проверять до и после платного шага; не запускать исполнителя, если известные расходы уже исчерпали лимит. Если текущий учёт не умеет включать такую цену, Task 1 обязан определить точный минимальный путь учёта до реализации.
+- Task 1 обязан определить учёт цены compression в storage-агрегаторах tree_cost и cost_since: одна запись result.meta не влияет на текущие суммы. Включить реальные owning-файлы и тесты в scope до dispatch; проверять суточный и цепочечный бюджеты на цене Jev, не только usage исполнителя.
+
+## Testing Strategy
+
+Локально: интервалы и дословность, Unicode/CRLF, fenced code с пустыми строками, заголовки, списки, таблицы, неразмеченный текст; все/часть/ноль выбранных блоков. HTTP mock проверяет настоящий сериализованный запрос и ответ, не tautology helper-вызовов. Dispatcher fake adapter доказывает полученный промпт, отсутствие запуска/HTTP на ошибках и запретах, неизменный исходный request, worktree и наследование периметра. Проверить сбой сжатия без cooldown/эскалации и отмену во время HTTP.
+
+Offline eval: размеченные обязательные фрагменты и удаления на записанных ответах, без LLM. Live semantic eval: минимум 30 синтетических контекстов, отдельные calibration/holdout, 100% сохранения обязательных фактов на holdout. Парный coding-eval: минимум 20 задач, по 3 запуска каждой руки, одинаковый исполнитель/конфиг/проверки, изолированные репозитории и сбалансированный порядок. До запуска заморозить случаи и пороги: ноль случаев потери обязательного факта; не меньше прошедших независимую проверку задач, чем у baseline; медиана context bytes меньше baseline. Полная цена и latency публикуются, выигрыш в них не обещается. Это ограниченный эксперимент, не доказательство статистической неухудшаемости. При провале не снижать пороги и не объявлять фичу готовой.
+
+Существующие scoped команды: `uv run pytest tests/test_models.py tests/test_mcp_server.py tests/test_cli.py -q`; `uv run pytest tests/test_task_package.py tests/test_dispatcher.py tests/test_prod.py tests/test_followup.py tests/test_budget.py -q`.
+Новые scoped команды после появления модулей: `uv run pytest tests/test_context_blocks.py tests/test_context_compression.py tests/test_compression_dispatch.py tests/test_compression_evals.py -q`; `uv run python -m evals.compression` (offline), `uv run python -m evals.compression --live` (платный, synthetic only).
+Финальный combined gate после интеграции: `uv run pytest tests -q`; `uv run ruff check . && uv run ruff format --check .`. Широкий gate оправдан изменением публичного запроса и общего жизненного цикла dispatcher. Команды новых модулей здесь являются заданием на реализацию, пока не запускались.
+
+## Progress Tracking
+
+Все задачи ниже не выполнены. Галочки ставит менеджер после проверки результата. Изменения контракта и состава файлов уточнять в этом плане до dispatch; новые публичные/безопасностные решения подтверждает пользователь.
+
+## Implementation Steps
+
+### Task 1: [агент] Зафиксировать исполнимый контракт и корпус качества
+**Depends on:** none
+**Complexity:** complex
+**Work type:** judgment
+**Files:**
+- Create: `docs/context-compression-contract.md`
+- Create: `evals/compression/cases.jsonl`
+
+- [x] Проверить первичные источники и ограниченной платной пробой только на синтетике подтвердить собственный консервативный поддерживаемый диапазон state/questions. Не искать максимум экспериментально и не выдавать рабочую границу за лимит провайдера. Неизвестный максимум не блокирует работу; отсутствие успешной пробы блокирует зависимые задачи.
+- [x] Зафиксировать разбиение, правило сохранения зависимостей, пороги, совместимость, error semantics, escalation/follow-up и учёт расходов; включить точные дополнительные пути в план, если они нужны для бюджетов.
+- [x] Создать минимум 30 semantic cases и 20 исполнимых coding cases с обязательными фактами и независимыми критериями; разделить calibration/holdout до настройки порога.
+- [x] Проверить JSONL, уникальные ID и покрытие запретов/отрицаний/связанных блоков/инъекций детерминированной проверкой схемы корпуса; результат и API-evidence сохранить в /tmp.
+
+### Task 2: [агент] Реализовать разбиение и дословную сборку
+**Depends on:** Task 1
+**Complexity:** normal
+**Work type:** implementation
+**Files:**
+- Create: `agent_dispatch/dispatch/context_blocks.py`
+- Create: `tests/test_context_blocks.py`
+
+- [x] Реализовать согласованные интервалы блоков и сборку без переписывания текста; не вводить новый Markdown-фреймворк без доказанной необходимости.
+- [x] Добавить тесты структурного текста, зависимостей заголовков, Unicode/CRLF, всех/части/нуля блоков и неполной разметки.
+- [x] Scoped verify: `uv run pytest tests/test_context_blocks.py -q`.
+
+### Task 3: [агент] Реализовать отдельный Jev selector
+**Depends on:** Tasks 1-2
+**Complexity:** normal
+**Work type:** implementation
+**Files:**
+- Create: `agent_dispatch/dispatch/context_compression.py`
+- Create: `tests/test_context_compression.py`
+
+- [x] Реализовать bounded последовательный Decisions-проход на существующих настройках и httpx: текущий набор обновляется до следующего запроса, stable ID/порядок сохраняются, effective_context публикуется атомарно. Метрики суммируют цену/usage/latency всех шагов и отмечают незавершённый проход; бюджеты проверяются перед каждым платным шагом и после него.
+- [x] Проверять внешний preflight и явный effective perimeter до построения state; HTTP-ошибки не возвращают сырые тела.
+- [x] Добавить success/error/limit/timeout/cancellation/perimeter тесты с MockTransport и отсутствие скрытых повторов/fallback.
+- [x] Scoped verify: `uv run pytest tests/test_context_blocks.py tests/test_context_compression.py -q`.
+
+### Task 4: [агент] Атомарно подключить opt-in от публичных входов до исполнителя
+**Depends on:** Tasks 1-3
+**Complexity:** complex
+**Work type:** implementation
+**Files:**
+- Modify: `agent_dispatch/models.py`
+- Modify: `agent_dispatch/mcp/server.py`
+- Modify: `agent_dispatch/cli.py`
+- Modify: `agent_dispatch/dispatch/dispatcher.py`
+- Modify: `agent_dispatch/dispatch/task_package.py`
+- Modify: `agent_dispatch/dispatch/followup.py`
+- Modify: `agent_dispatch/telemetry/storage.py`
+- Modify: `agent_dispatch/telemetry/schema.sql`
+- Modify: `tests/test_storage.py`
+- Modify: `tests/test_prod.py`
+- Modify: `tests/test_dispatcher.py`
+- Modify: `tests/test_escalation.py`
+- Modify: `tests/test_models.py`
+- Modify: `tests/test_mcp_server.py`
+- Modify: `tests/test_cli.py`
+- Create: `tests/test_compression_dispatch.py`
+- Modify: `tests/test_task_package.py`
+- Modify: `tests/test_followup.py`
+- Modify: `tests/test_budget.py`
+
+Это одна атомарная контрактная задача: нельзя принять промежуточное состояние, которое принимает opt-in и молча передаёт исходный context. Широкий список файлов нужен для полного прохода публичного контракта.
+
+- [x] Добавить nullable literal-параметр в HTTP/MCP dispatch/dispatch_to и CLI, подключить selector после guards до executor и effective_context без мутации request, с различением None/пустой строки и worktree rewrite.
+- [x] Отклонять unsupported value, пустой context, prompt mode и review при opt-in; реализовать lineage, escalation/follow-up/resume, fail-fast без cooldown/эскалации и безопасные метрики/учёт цены по контракту Task 1.
+- [x] Добавить тесты публичных входов: валидация, отсутствие поля по умолчанию в wire JSON, старый строгий прокси и явный отказ старого демона на opt-in.
+- [x] Добавить интеграционные тесты фактического промпта, неизменности request, отсутствия HTTP/запуска на запретах, defaults, lineage, cancellation и budget. Новое поле не принимается без реализации обработки.
+- [x] Scoped verify: `uv run pytest tests/test_models.py tests/test_mcp_server.py tests/test_cli.py tests/test_compression_dispatch.py tests/test_task_package.py tests/test_dispatcher.py tests/test_prod.py tests/test_followup.py tests/test_budget.py -q`.
+
+### Task 5: [агент] Добавить offline и live evals
+**Depends on:** Tasks 1, 4
+**Complexity:** complex
+**Work type:** implementation
+**Files:**
+- Create: `evals/compression/__init__.py`
+- Create: `evals/compression/__main__.py`
+- Create: `evals/compression/harness.py`
+- Create: `tests/test_compression_evals.py`
+
+- [x] Использовать замороженный corpus: offline replay без сети и отдельный явный live-режим; реальные исполнители только через существующий локальный контракт.
+- [x] Парные запуски в независимых репозиториях, проверка обязательных фактов и результата тестами, полный cost/latency/usage/эскалации; unknown не превращается в ноль.
+- [x] Добавить regression cases для ложного успеха харнесса: отсутствие usage, невыполненная проверка, потерянная оговорка и успешный самоотчёт при неверном диффе.
+- [x] Scoped verify: `uv run pytest tests/test_compression_evals.py -q` и offline `uv run python -m evals.compression`; платные прогоны оставляет менеджеру.
+
+### Task 6: [агент] Документировать публичный контракт и ограничения
+**Depends on:** Tasks 4-5
+**Complexity:** normal
+**Work type:** implementation
+**Files:**
+- Modify: `README.md`
+- Modify: `docs/architecture.md`
+- Modify: `evals/README.md`
+- Modify: `docs/context-compression-contract.md`
+
+- [x] Описать opt-in, отказ без fallback, effective perimeter, наследование и отсутствие гарантии экономии; сверить контракт с реализацией.
+- [x] Добавить проверенные CLI/MCP-примеры и команды evals; проверить примеры через parser/локальный fake daemon, не тратя деньги ради документации.
+- [x] Указать переустановку non-editable uv tool и обновление MCP-сессий для нового параметра; эксплуатационное обновление не запускать автоматически.
+
+### Task 7: Final verification
+**Depends on:** Tasks 1-6
+**Complexity:** complex
+**Work type:** judgment
+
+- [ ] Проверить каждый критерий Overview по фактической реализации; получить независимое read-only ревью реализации с frozen контрактом.
+- [ ] Выполнить combined gate и lint один раз на интегрированном результате; запустить CLI и проверить наблюдаемое opt-in поведение через изолированный fake daemon.
+- [ ] Менеджеру выполнить synthetic live semantic и парный coding eval на доступном разрешённом маленьком исполнителе, без подмены модели; сохранить отчёт в /tmp и предъявить полную цену, качество и задержку.
+- [ ] При провале качества исправить причину и подтвердить на holdout, не ослабляя критерии; без доступа к API/исполнителю явно отметить блокер готовности.
+
+## Post-Completion
+
+Этот план не разрешает реализацию, обновление установленного пакета или рестарт рабочего демона. После принятия реализации переустановить non-editable uv tool по действующей процедуре проекта; сообщить пользователю точные команды перезапуска демона и обновления MCP-сессий. До проверки evals не заявлять экономию. Не включать сжатие глобально по результатам этой работы.
+
+## Plan Review
+
+Независимое ревью не запустилось: AgentDispatch отказал с unknown_parent до запуска исполнителя. Пользователь выбрал локальное Sol checklist review. Его результат: NEEDS REVISION; пользователь одобрил все три исправления, внесённые в план: атомарность публичного opt-in и обработки, собственный проверенный диапазон API вместо поиска максимума, разграничение eval и runtime-гарантий.
+
+Нулевые потери обязательных фактов относятся только к размеченному корпусу. Runtime гарантирует дословность выбранных блоков, но не полноту отбора и не сохранение произвольных межблочных связей. Если полная цена не снизилась, результат нельзя описывать как финансовую экономию, даже при сокращении context bytes. Локальное ревью не заменяет независимое ревью реализации перед готовностью фичи.
+
+Независимое ревью omp/astra (agent-lb/gpt-6-astra), task 7c8ea875be474c28aaa8bd2a5a20de54, потребовало ранний privacy guard, совместный отбор, provenance служебного context, never-run/follow-up и учёт compression в storage. Все исправления одобрены пользователем и внесены. После выбора последовательного удаления повторное ревью Astra, followup task 2cae167815054d7abf07740f92a055b8, завершилось APPROVE: блокирующих замечаний нет. Task 1 остаётся обязательным gate перед кодом: финальные пределы/deadline, учёт расходов и точный scope файлов. Dispatcher отметил changed_files плана во время read-only ревью: менеджер одновременно уточнял в нём метрики и статус ревью; этот сигнал сам по себе не доказывает правку ревьюером.
+
+Пользователь выбрал последовательное удаление вместо выбора готовых наборов и Extractions API. Разрешено несколько последовательных Decisions-вызовов; прежнее ограничение одним запросом снято явно. Новая цена: до N вызовов с повторной передачей текущего набора; полная цена и задержка могут превысить пользу сжатия. В корпус и тесты Task 3/5 обязательно включить две копии обязательного факта (после удаления первой сохранить вторую), передачу обновлённого набора следующему шагу, отказ середины прохода без executor, cancellation/deadline и исчерпание бюджета между шагами. Никакой runtime-гарантии семантической полноты это не добавляет.
+
+## Execution outcome and explicit stop
+
+Tasks 1–6 implemented and checked. User explicitly stopped further paid coding evaluation after two retained failed experiments. Task 7 remains open; feature status BLOCKED on the paired coding/full-accounting acceptance gate, not ready for rollout. No further paid execution is authorized by this plan without a new user decision.
+
+At threshold 0.60 calibration preserved facts in 10/10 cases (1800→1221 context bytes); preregistered fresh holdout preserved facts in 24/24 (11602→7762 bytes). Earlier 8060 was a manager aggregation bug treating valid zero output as missing, not another measurement. These finite selector results do not establish coding quality or net savings.
+
+Reports retained under /tmp/plan-dispatch/jev-context-compression: live-semantic.json (0.95, no deletions), calibration-threshold-060.json, holdout-v3-threshold-060.json, paired-x5-code-large.json (checker-created artifact bug), paired-x5-code-large-v2.json (six failed strict attempts; executor itself created forbidden bytecode). Read-only diagnosis task 0e61fc990e2e45c39bda20b475b23f8c found the executor import without -B before independent checker in isolated daemon task logs. The checker was separately fixed to -B, without ignoring executor extra files. Unknown repair/recovery/supervision charges conservatively suppress full totals.
+
+All isolated paid tasks were cancelled and both temporary daemons stopped. Working installed service was not upgraded to feature code. Final code-review fixes cover structured /route rejection and conservative per-check supervision accounting; final review/check evidence is recorded in the execution log. Do not move this plan to completed while Task 7 is blocked.
+

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import time
 from pathlib import Path
@@ -24,6 +25,11 @@ from agent_dispatch.models import (
 )
 from agent_dispatch.server import run_server
 from agent_dispatch.telemetry.storage import Storage
+
+
+class ContextCompression(enum.StrEnum):
+    jev = "jev"
+
 
 app = typer.Typer(
     name="agent-dispatch",
@@ -136,12 +142,14 @@ def _request(
     kind: str = "task",
     verify: list[str] | None = None,
     prod: bool = False,
+    context_compression: Literal["jev"] | None = None,
 ) -> DispatchRequest:
     return DispatchRequest(
         task=task,
         cwd=cwd,
         kind=kind,
         context=context,
+        context_compression=context_compression,
         files=files or [],
         constraints=constraints or [],
         source_agent=SourceAgent.cli,
@@ -251,6 +259,9 @@ def dispatch(
     task: str,
     cwd: str = typer.Option("."),
     context: str | None = typer.Option(None),
+    context_compression: ContextCompression | None = typer.Option(  # noqa: B008
+        None, "--context-compression", help="Jev block selection; fail closed on errors."
+    ),
     files: list[str] | None = typer.Option(None, "--file"),  # noqa: B008
     constraints: list[str] | None = typer.Option(None, "--constraint"),  # noqa: B008
     executor: str | None = typer.Option(None),
@@ -289,6 +300,7 @@ def dispatch(
                 kind=kind,
                 verify=verify,
                 prod=prod,
+                context_compression=context_compression,
             ),
             wait,
             poll_seconds,

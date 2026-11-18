@@ -63,7 +63,12 @@ def continued_link(chain: list[TaskRecord]) -> TaskRecord:
 
 
 def _reached_executor(link: TaskRecord) -> bool:
-    return link.decision is not None and link.result is not None and bool(link.result.executor)
+    return (
+        link.decision is not None
+        and link.result is not None
+        and link.result.meta.get("executor_started") is not False
+        and bool(link.result.executor)
+    )
 
 
 def followup_request(
@@ -95,9 +100,12 @@ def followup_request(
             "timeout_seconds": body.timeout_seconds or previous.timeout_seconds,
             "verify": previous.verify if body.verify is None else body.verify,
             "workspace_mode": "in_place",
+            "context_compression": None,
         }
     )
     request._automatic_review = False
+    request._context_provenance = None
+    request._context_provenance_invalid = False
     return request
 
 

@@ -18,6 +18,7 @@ from typer.testing import CliRunner
 
 from agent_dispatch.cli import app
 from agent_dispatch.config import ExecutorSettings, RoutingSettings, ServerSettings, Settings
+from agent_dispatch.dispatch.context_blocks import ContextSpan
 from agent_dispatch.dispatch.dispatcher import Dispatcher
 from agent_dispatch.executors.registry import AvailabilityCache
 from agent_dispatch.models import (
@@ -38,6 +39,7 @@ from tests.test_cli import _view as cli_view
 from tests.test_escalation import SPEND_LIMIT
 from tests.test_mcp_server import call, view
 from tests.test_mcp_server import settings as mcp_settings
+from tests.test_storage import make_task
 
 WAIT = 2.0
 X5, X5_FAST, SOL = "omp/x5", "omp/x5-fast", "omp/sol"
@@ -721,4 +723,47 @@ async def test_nested_route_only_refuses_an_explicit_external_executor(tmp_path,
 
     assert [event.reason for event in events] == ["perimeter"]
     assert "ancestor prod task" in events[0].detail
+    await storage.close()
+
+
+@pytest.mark.parametrize(
+    ("corporate_perimeter", "status"),
+    [(True, "prod"), (False, "prod"), (True, "answered"), (True, "unknown")],
+)
+@pytest.mark.parametrize("edge", ["parent_task_id", "escalated_from", "followup_of"])
+@pytest.mark.parametrize("executor", [None, SOL])
+@respx.mock
+async def test_compression_admission_reads_persisted_ancestor_before_any_router(
+    tmp_path, git_repo, corporate_perimeter, edge, status, executor
+):
+    settings = _settings(tmp_path, corporate_perimeter=corporate_perimeter)
+    settings.router.external.trusted_roots = [str(git_repo)]
+    storage, adapters, router, dispatcher = await _dispatcher(tmp_path, settings)
+    ancestor = make_task(task_id="ancestor", status="completed", assigned=True)
+    ancestor.request.prod = status == "prod"
+    ancestor.decision.meta["perimeter"] = status
+    await storage.insert_task(ancestor)
+    await storage.close()
+    await storage.open()
+    kwargs = {edge: ancestor.task_id} if edge != "escalated_from" else {}
+    req = _request(
+        git_repo,
+        prod=False,
+        context="caller fact",
+        context_compression="jev",
+        executor=executor,
+        **kwargs,
+    )
+    req._context_provenance = (ContextSpan(0, len(req.context), "user", None),)
+    paid = respx.post(settings.router.jev.base_url)
+    submitted = await dispatcher.submit(
+        req, escalated_from=ancestor.task_id if edge == "escalated_from" else None
+    )
+    done = await dispatcher.wait(submitted.task_id, WAIT)
+    assert done.result.meta["error_code"] == "compression_privacy"
+    assert done.result.meta["executor_started"] is False
+    assert router.candidates == [] and not paid.called
+    assert not any(adapter.calls for adapter in adapters.values())
+    assert await storage.compression_steps(done.task_id) == []
+    await dispatcher.shutdown()
     await storage.close()

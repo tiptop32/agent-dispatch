@@ -1,10 +1,15 @@
 import asyncio
+import json
+import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from agent_dispatch.dispatch.context_blocks import ContextSpan
+from agent_dispatch.dispatch.context_compression import StepOutcome, StepStart
 from agent_dispatch.models import (
     DispatchRequest,
     ExecutionResult,
@@ -255,3 +260,184 @@ async def test_cooldowns_survive_reopen_and_expire(tmp_path):
     await second.delete_cooldowns()
     assert await second.active_cooldowns() == []
     await second.close()
+
+
+def compression_start(index=0, started=None):
+    return StepStart(index, f"b{index:04d}", ("b0000",), started or datetime.now(UTC), "jev")
+
+
+def compression_outcome(index=0, *, cost=0.25, **updates):
+    step = StepOutcome(
+        index=index,
+        candidate_id=f"b{index:04d}",
+        status="succeeded",
+        completed_at=datetime.now(UTC),
+        latency_ms=10,
+        jev_id="generation",
+        response_model="observed",
+        p_delete_safe=0.95,
+        deleted=True,
+        cost_usd=cost,
+        input_tokens=10,
+        output_tokens=2,
+        is_byok=False,
+    )
+    return replace(step, **updates)
+
+
+async def test_compression_ack_is_durable_before_async_lock_exit(storage):
+    task = make_task()
+    await storage.insert_task(task)
+    exiting, release = asyncio.Event(), asyncio.Event()
+    lock = storage._write_lock
+    acknowledged = []
+
+    class PausedExit:
+        async def __aenter__(self):
+            await lock.acquire()
+
+        async def __aexit__(self, *args):
+            exiting.set()
+            await release.wait()
+            lock.release()
+
+    def acknowledge():
+        assert lock.locked()
+        with sqlite3.connect(storage.path) as connection:
+            row = connection.execute("SELECT status FROM compression_steps").fetchone()
+        assert row == ("started",)
+        acknowledged.append(True)
+
+    storage._write_lock = PausedExit()
+    writer = asyncio.create_task(
+        storage.start_compression_step(task.task_id, compression_start(), acknowledge=acknowledge)
+    )
+    await asyncio.wait_for(exiting.wait(), 1)
+    assert acknowledged == [True] and not writer.done()
+    release.set()
+    await writer
+    storage._write_lock = lock
+
+
+async def test_compression_finalization_is_identical_only_and_never_reinserts(storage):
+    task = make_task()
+    await storage.insert_task(task)
+    start = compression_start()
+    await storage.start_compression_step(task.task_id, start, acknowledge=lambda: None)
+    with pytest.raises(sqlite3.IntegrityError):
+        await storage.start_compression_step(task.task_id, start, acknowledge=lambda: pytest.fail())
+    terminal = compression_outcome()
+    await storage.finish_compression_step(task.task_id, terminal)
+    await storage.finish_compression_step(task.task_id, terminal)
+    with pytest.raises(ValueError, match="Conflicting"):
+        await storage.finish_compression_step(task.task_id, replace(terminal, cost_usd=0.5))
+    with pytest.raises(KeyError):
+        await storage.finish_compression_step(task.task_id, compression_outcome(1))
+    assert await storage.tree_cost([task.task_id, task.task_id]) == 0.25
+    assert len(await storage.compression_steps(task.task_id)) == 1
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"cost_usd": True},
+        {"cost_usd": -1},
+        {"cost_usd": float("inf")},
+        {"p_delete_safe": float("nan")},
+        {"p_delete_safe": 1.1},
+        {"input_tokens": True},
+        {"input_tokens": 9223372036854775808},
+        {"output_tokens": -1},
+        {"output_tokens": 1.5},
+        {"deleted": 2},
+        {"is_byok": "false"},
+        {"latency_ms": -1},
+    ],
+)
+async def test_compression_rejects_invalid_bindings_without_losing_pending(storage, updates):
+    task = make_task()
+    await storage.insert_task(task)
+    await storage.start_compression_step(
+        task.task_id, compression_start(), acknowledge=lambda: None
+    )
+    with pytest.raises(ValueError):
+        await storage.finish_compression_step(task.task_id, compression_outcome(**updates))
+    assert (await storage.compression_steps(task.task_id))[0]["status"] == "started"
+    assert await storage.compression_cost_unknown(task_ids=[task.task_id])
+
+
+async def test_compression_unknown_scopes_and_reported_zero(storage):
+    task = make_task()
+    await storage.insert_task(task)
+    assert not await storage.compression_cost_unknown(task_ids=[])
+    for kwargs in ({}, {"task_ids": [], "since": datetime.now(UTC)}):
+        with pytest.raises(ValueError):
+            await storage.compression_cost_unknown(**kwargs)
+    await storage.start_compression_step(
+        task.task_id, compression_start(), acknowledge=lambda: None
+    )
+    assert await storage.compression_cost_unknown(task_ids=[task.task_id])
+    await storage.finish_compression_step(task.task_id, compression_outcome(cost=0))
+    assert not await storage.compression_cost_unknown(task_ids=[task.task_id])
+    assert await storage.tree_cost([task.task_id]) == 0
+
+
+async def test_typed_private_provenance_survives_restart_without_public_wire_key(storage):
+    task = make_task()
+    task.request.context_compression = "jev"
+    task.request.context = "caller\n\ndaemon"
+    task.request._context_provenance = (
+        ContextSpan(0, 6, "user", None),
+        ContextSpan(6, 14, "daemon_review", "ancestor"),
+    )
+    await storage.insert_task(task)
+    with sqlite3.connect(storage.path) as connection:
+        raw = json.loads(connection.execute("SELECT request_json FROM tasks").fetchone()[0])
+    assert raw["_context_provenance"]["version"] == 1
+    assert len(raw["_context_provenance"]["context_sha256"]) == 64
+    await storage.close()
+    await storage.open()
+    loaded = await storage.get_task(task.task_id)
+    assert loaded.request._context_provenance == task.request._context_provenance
+    assert "_context_provenance" not in loaded.model_dump_json()
+
+
+@pytest.mark.parametrize("corruption", ["digest", "cover", "origin", "source", "version", "null"])
+async def test_stored_provenance_is_validated_not_reclassified(storage, corruption):
+    task = make_task()
+    task.request.context_compression = "jev"
+    task.request.context = "caller"
+    task.request._context_provenance = (ContextSpan(0, 6, "user", None),)
+    await storage.insert_task(task)
+    raw = json.loads(storage._db.execute("SELECT request_json FROM tasks").fetchone()[0])
+    value = raw["_context_provenance"]
+    if corruption == "digest":
+        raw["context"] = "edited"
+    elif corruption == "cover":
+        value["spans"][0]["end"] = 5
+    elif corruption == "origin":
+        value["spans"][0]["origin"] = "pinned"
+    elif corruption == "source":
+        value["spans"][0].update(origin="daemon_review", source_task_id="")
+    elif corruption == "version":
+        value["version"] = True
+    else:
+        raw["_context_provenance"] = None
+    storage._db.execute("UPDATE tasks SET request_json=?", (json.dumps(raw),))
+    storage._db.commit()
+    loaded = await storage.get_task(task.task_id)
+    assert loaded.request._context_provenance_invalid is True
+    assert loaded.request._context_provenance is None
+    loaded.status = TaskStatus.failed
+    loaded.result = ExecutionResult(
+        status="failed",
+        executor="",
+        model=None,
+        summary="provenance refused",
+        meta={"error_code": "compression_provenance", "executor_started": False},
+    )
+    await storage.update_task(loaded)
+    preserved = json.loads(storage._db.execute("SELECT request_json FROM tasks").fetchone()[0])
+    assert preserved == raw
+    with pytest.raises(ValueError):
+        await storage.insert_task(loaded.model_copy(update={"task_id": "new-invalid"}))

@@ -3,9 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
+
+if TYPE_CHECKING:
+    from agent_dispatch.dispatch.context_blocks import ContextSpan
 
 
 class _Model(BaseModel):
@@ -91,6 +94,7 @@ class DispatchRequest(_Model):
     cwd: str
     kind: TaskKind = "task"
     context: str | None = None
+    context_compression: Literal["jev"] | None = Field(None, exclude_if=lambda value: value is None)
     files: list[str] = Field(default_factory=list)
     constraints: list[str] = Field(default_factory=list)
     success_criteria: list[str] = Field(default_factory=list)
@@ -129,6 +133,8 @@ class DispatchRequest(_Model):
     decision_log: bool = Field(True, exclude_if=lambda value: value is True)
     #: Только демон ставит этот маркер; публичный ввод с таким ключом запрещён.
     _automatic_review: bool = PrivateAttr(default=False)
+    _context_provenance: tuple[ContextSpan, ...] | None = PrivateAttr(default=None)
+    _context_provenance_invalid: bool = PrivateAttr(default=False)
 
     @field_validator("files")
     @classmethod

@@ -601,3 +601,51 @@ async def test_compact_output_skips_empty_meta_and_duplicate_error_code(tmp_path
     assert "error_code" not in text
     assert "branch:" not in text and "patch:" not in text
     assert "retryable: False" in text
+
+
+@pytest.mark.parametrize("tool", ["dispatch", "dispatch_to"])
+@pytest.mark.asyncio
+@respx.mock
+async def test_compression_opt_in_is_forwarded_only_when_explicit(tmp_path, tool):
+    endpoint = respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(200, json=view().model_dump(mode="json"))
+    )
+    args = {"task": "fix", "cwd": ".", "context": "caller fact"}
+    if tool == "dispatch_to":
+        args["executor"] = "omp"
+    assert not (await call(settings(tmp_path), tool, args)).is_error
+    assert "context_compression" not in json.loads(endpoint.calls[0].request.content)
+    args["context_compression"] = "jev"
+    assert not (await call(settings(tmp_path), tool, args)).is_error
+    assert json.loads(endpoint.calls[1].request.content)["context_compression"] == "jev"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_compression_schema_rejects_invalid_before_daemon_and_route_has_no_option(tmp_path):
+    endpoint = respx.post("http://127.0.0.1:7433/tasks")
+    result = await call(
+        settings(tmp_path), "dispatch", {"task": "fix", "cwd": ".", "context_compression": "auto"}
+    )
+    assert result.is_error and not endpoint.called
+    srv = build_server(settings(tmp_path), ensure=lambda _: _state())
+    async with Client(InMemoryTransport(srv)) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+    route_schema = tools["route"].model_dump(by_alias=True)
+    followup_schema = tools["followup"].model_dump(by_alias=True)
+    assert "context_compression" not in route_schema["inputSchema"]["properties"]
+    assert "context_compression" not in followup_schema["inputSchema"]["properties"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_old_daemon_rejection_is_not_silently_retried_without_compression(tmp_path):
+    endpoint = respx.post("http://127.0.0.1:7433/tasks").mock(
+        return_value=httpx.Response(422, json={"detail": "extra field context_compression"})
+    )
+    result = await call(
+        settings(tmp_path), "dispatch", {"task": "fix", "cwd": ".", "context_compression": "jev"}
+    )
+    assert result.is_error
+    assert endpoint.call_count == 1
+    assert "context_compression" in result.content[0].text

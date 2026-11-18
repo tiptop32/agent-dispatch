@@ -41,6 +41,7 @@ FOLLOWUP_SUMMARY_LIMIT = 3000
 class TaskPackage(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request: DispatchRequest
+    effective_context: str | None = None
     git_status: str | None = None
     git_diff_stat: str | None = None
     #: Дифф рабочей копии против HEAD (или `review_base`) для ревью: ревьюер
@@ -222,7 +223,8 @@ def render_prompt(package: TaskPackage, adapter_kind: AdapterKind, settings: Set
     env = _templates()
     req = package.request
     worktree = package.worktree
-    task, context, files, checks = req.task, req.context, req.files, req.verify
+    context = req.context if package.effective_context is None else package.effective_context
+    task, files, checks = req.task, req.files, req.verify
     if worktree:
         # В worktree-режиме вызывающий мог написать абсолютные пути исходной
         # рабочей копии: переписываем их на пути worktree, иначе агент правит

@@ -4,6 +4,7 @@ import asyncio
 import json
 import socket
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -115,14 +116,41 @@ async def test_executors(api):
 
 
 @pytest.mark.asyncio
-async def test_route_and_export_null_task(api):
+@pytest.mark.parametrize("extra", [{}, {"context_compression": None}])
+async def test_route_and_export_null_task(api, extra):
     client, _, storage, _, repo, _ = api
-    response = await client.post("/route", headers=headers(), json=payload(repo))
+    response = await client.post("/route", headers=headers(), json=payload(repo, **extra))
     assert response.status_code == 200
     assert response.json()["executor"] == "omp"
     RouteDecision.model_validate(response.json())
     rows = [x async for x in storage.export()]
     assert any(x["task"] is None for x in rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("executor", [None, "omp"])
+async def test_route_rejects_context_compression_before_routing(api, monkeypatch, executor):
+    client, dispatcher, storage, _, repo, _ = api
+    route_only = AsyncMock(wraps=dispatcher.route_only)
+    monkeypatch.setattr(dispatcher, "route_only", route_only)
+
+    response = await client.post(
+        "/route",
+        headers=headers(),
+        json=payload(repo, context_compression="jev", executor=executor),
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {
+            "code": "compression_unsupported",
+            "message": "Context compression is not supported by /route.",
+            "retryable": False,
+            "next_action": "omit context_compression or use POST /tasks for compression",
+        }
+    }
+    route_only.assert_not_called()
+    assert [row async for row in storage.export()] == []
 
 
 @pytest.mark.asyncio

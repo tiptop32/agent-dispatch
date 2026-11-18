@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterable
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from agent_dispatch.dispatch.context_blocks import ContextSpan, split_context
 from agent_dispatch.models import (
     FINAL_STATUSES,
     DispatchRequest,
@@ -15,6 +19,55 @@ from agent_dispatch.models import (
     RouteDecision,
     TaskRecord,
 )
+
+if TYPE_CHECKING:
+    from agent_dispatch.dispatch.context_compression import StepOutcome, StepStart
+
+
+def _cost_sum(values: Iterable[float | None]) -> float:
+    try:
+        return math.fsum(value for value in values if value is not None)
+    except OverflowError:
+        return math.inf
+
+
+def _nonnegative_number(value: object) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
+def _provenance(context: str | None, value: object) -> tuple[ContextSpan, ...]:
+    """Decode only the versioned, digest-bound storage envelope, never public JSON."""
+    if (
+        not isinstance(context, str)
+        or not isinstance(value, dict)
+        or set(value) != {"version", "context_sha256", "spans"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or value["context_sha256"] != hashlib.sha256(context.encode("utf-8")).hexdigest()
+        or not isinstance(value["spans"], list)
+    ):
+        raise ValueError("Invalid context provenance")
+    spans = []
+    for item in value["spans"]:
+        if not isinstance(item, dict) or set(item) != {
+            "start",
+            "end",
+            "origin",
+            "source_task_id",
+        }:
+            raise ValueError("Invalid context provenance")
+        span = ContextSpan(**item)
+        if span.origin == "user" and span.source_task_id is not None:
+            raise ValueError("Invalid context provenance")
+        spans.append(span)
+    result = tuple(spans)
+    split_context(context, provenance=result)
+    return result
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -67,6 +120,18 @@ class Storage:
         request = task.request.model_dump(mode="json")
         if task.request._automatic_review:
             request["_automatic_review"] = True
+        spans = task.request._context_provenance
+        if spans is not None:
+            context = task.request.context
+            if not isinstance(context, str):
+                raise ValueError("Invalid context provenance")
+            envelope = {
+                "version": 1,
+                "context_sha256": hashlib.sha256(context.encode("utf-8")).hexdigest(),
+                "spans": [asdict(span) for span in spans],
+            }
+            _provenance(context, envelope)
+            request["_context_provenance"] = envelope
         return {
             "task_id": task.task_id,
             "parent_task_id": task.parent_task_id,
@@ -99,8 +164,15 @@ class Storage:
         )
         request_data = json.loads(row["request_json"])
         automatic_review = request_data.pop("_automatic_review", False)
+        has_provenance = "_context_provenance" in request_data
+        provenance = request_data.pop("_context_provenance", None)
         request = DispatchRequest.model_validate(request_data)
         request._automatic_review = automatic_review is True and request.kind == "review"
+        if has_provenance:
+            try:
+                request._context_provenance = _provenance(request.context, provenance)
+            except (ValueError, TypeError, AttributeError):
+                request._context_provenance_invalid = True
         return TaskRecord(
             task_id=row["task_id"],
             parent_task_id=row["parent_task_id"],
@@ -119,6 +191,8 @@ class Storage:
         )
 
     async def insert_task(self, task: TaskRecord) -> None:
+        if task.request._context_provenance_invalid:
+            raise ValueError("Invalid context provenance")
         async with self._write_lock:
             values = self._task_values(task)
             columns = tuple(values)
@@ -136,6 +210,9 @@ class Storage:
             duration = max(0, int((task.finished_at - task.started_at).total_seconds() * 1000))
         values["duration_ms"] = duration
         update_values = {key: value for key, value in values.items() if key != "task_id"}
+        if task.request._context_provenance_invalid:
+            # Refusal must not erase or reclassify the corrupt source envelope.
+            update_values.pop("request_json")
         async with self._write_lock:
             cur = self._db.execute(
                 f"UPDATE tasks SET {', '.join(f'{column}=?' for column in update_values)} "
@@ -211,38 +288,170 @@ class Storage:
             current = row[0]
         return result
 
-    async def tree_cost(self, task_ids: list[str]) -> float:
-        """Расходы задач и всех их подзадач по `parent_task_id`, в долларах."""
+    def _compression_scope(
+        self, *, task_ids: list[str] | None = None, since: datetime | None = None
+    ) -> list[sqlite3.Row]:
+        if (task_ids is None) == (since is None):
+            raise ValueError("Exactly one compression cost scope is required")
+        if since is not None:
+            return self._db.execute(
+                "SELECT * FROM compression_steps WHERE started_at >= ?", (_dt(since),)
+            ).fetchall()
         if not task_ids:
-            return 0.0
+            return []
         marks = ", ".join("?" for _ in task_ids)
-        row = self._db.execute(
+        return self._db.execute(
             "WITH RECURSIVE tree(task_id) AS ("
             f" SELECT task_id FROM tasks WHERE task_id IN ({marks})"
             " UNION SELECT t.task_id FROM tasks t JOIN tree ON t.parent_task_id = tree.task_id)"
-            " SELECT COALESCE(SUM(json_extract(result_json, '$.usage.cost_usd')), 0)"
+            " SELECT * FROM compression_steps WHERE task_id IN (SELECT task_id FROM tree)",
+            task_ids,
+        ).fetchall()
+
+    async def tree_cost(self, task_ids: list[str]) -> float:
+        """Known executor and compression charges in the deduplicated task tree."""
+        if not task_ids:
+            return 0.0
+        marks = ", ".join("?" for _ in task_ids)
+        rows = self._db.execute(
+            "WITH RECURSIVE tree(task_id) AS ("
+            f" SELECT task_id FROM tasks WHERE task_id IN ({marks})"
+            " UNION SELECT t.task_id FROM tasks t JOIN tree ON t.parent_task_id = tree.task_id)"
+            " SELECT json_extract(result_json, '$.usage.cost_usd')"
             " FROM tasks WHERE task_id IN (SELECT task_id FROM tree)",
             task_ids,
-        ).fetchone()
-        return float(row[0])
+        ).fetchall()
+        return _cost_sum(
+            [row[0] for row in rows]
+            + [row["cost_usd"] for row in self._compression_scope(task_ids=task_ids)]
+        )
 
     async def cost_since(self, since: datetime) -> float:
-        """Расходы исполнителей и роутера с момента `since`, в долларах.
-
-        Задача считается по времени завершения: цена известна только с
-        результатом. Незавершённые задачи сюда не попадают.
-        """
+        """Known executor completion, routing and compression-start day charges."""
         stamp = _dt(since)
         tasks = self._db.execute(
-            "SELECT COALESCE(SUM(json_extract(result_json, '$.usage.cost_usd')), 0)"
+            "SELECT json_extract(result_json, '$.usage.cost_usd')"
             " FROM tasks WHERE finished_at >= ?",
             (stamp,),
-        ).fetchone()
+        ).fetchall()
         decisions = self._db.execute(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM routing_decisions WHERE created_at >= ?",
-            (stamp,),
-        ).fetchone()
-        return float(tasks[0]) + float(decisions[0])
+            "SELECT cost_usd FROM routing_decisions WHERE created_at >= ?", (stamp,)
+        ).fetchall()
+        return _cost_sum(
+            [row[0] for row in tasks + decisions]
+            + [row["cost_usd"] for row in self._compression_scope(since=since)]
+        )
+
+    async def compression_cost_unknown(
+        self, *, task_ids: list[str] | None = None, since: datetime | None = None
+    ) -> bool:
+        rows = self._compression_scope(task_ids=task_ids, since=since)
+        return any(row["status"] == "started" or row["cost_usd"] is None for row in rows) or (
+            not math.isfinite(_cost_sum(row["cost_usd"] for row in rows))
+        )
+
+    async def start_compression_step(
+        self, task_id: str, step: StepStart, *, acknowledge: Callable[[], None]
+    ) -> None:
+        if (
+            type(step.index) is not int
+            or not 0 <= step.index <= 9223372036854775807
+            or not isinstance(step.candidate_id, str)
+            or not step.candidate_id
+            or not isinstance(step.model, str)
+            or not step.model
+            or step.started_at.tzinfo is None
+            or not callable(acknowledge)
+        ):
+            raise ValueError("Invalid compression step start")
+        async with self._write_lock:
+            self._db.execute(
+                "INSERT INTO compression_steps"
+                "(task_id,step_index,candidate_id,started_at,status,model) VALUES (?,?,?,?,?,?)",
+                (
+                    task_id,
+                    step.index,
+                    step.candidate_id,
+                    _dt(step.started_at),
+                    "started",
+                    step.model,
+                ),
+            )
+            self._db.commit()
+            # No await, including lock exit, between durable commit and ownership transfer.
+            acknowledge()
+
+    async def finish_compression_step(self, task_id: str, step: StepOutcome) -> None:
+        values = asdict(step)
+        index = values.pop("index")
+        candidate = values.pop("candidate_id")
+        statuses = {
+            "succeeded",
+            "response_error",
+            "http_error",
+            "transport_error",
+            "cancelled",
+            "deadline",
+            "interrupted",
+        }
+        if (
+            type(index) is not int
+            or not 0 <= index <= 9223372036854775807
+            or step.completed_at.tzinfo is None
+            or step.status not in statuses
+        ):
+            raise ValueError("Invalid compression step outcome")
+        for name in ("cost_usd", "p_delete_safe"):
+            value = values[name]
+            if value is not None and (
+                not _nonnegative_number(value) or (name == "p_delete_safe" and value > 1)
+            ):
+                raise ValueError("Invalid compression numeric field")
+            if value is not None:
+                values[name] = float(value)
+        for name in ("input_tokens", "output_tokens", "latency_ms"):
+            value = values[name]
+            if value is not None and (
+                type(value) is not int or not 0 <= value <= 9223372036854775807
+            ):
+                raise ValueError("Invalid compression integer field")
+        for name in ("deleted", "is_byok"):
+            value = values[name]
+            if value is not None and not (
+                type(value) is bool or (type(value) is int and value in (0, 1))
+            ):
+                raise ValueError("Invalid compression boolean field")
+        for name in ("jev_id", "response_model"):
+            if values[name] is not None and not isinstance(values[name], str):
+                raise ValueError("Invalid compression metadata")
+        values["completed_at"] = _dt(step.completed_at)
+        async with self._write_lock:
+            row = self._db.execute(
+                "SELECT * FROM compression_steps WHERE task_id=? AND step_index=?",
+                (task_id, index),
+            ).fetchone()
+            if row is None:
+                raise KeyError((task_id, index))
+            if row["candidate_id"] != candidate:
+                raise ValueError("Conflicting compression candidate")
+            if row["status"] != "started":
+                if any(row[key] != value for key, value in values.items()):
+                    raise ValueError("Conflicting compression outcome")
+                return
+            self._db.execute(
+                f"UPDATE compression_steps SET {', '.join(f'{key}=?' for key in values)}"
+                " WHERE task_id=? AND step_index=?",
+                (*values.values(), task_id, index),
+            )
+            self._db.commit()
+
+    async def compression_steps(self, task_id: str) -> list[dict[str, object]]:
+        return [
+            dict(row)
+            for row in self._db.execute(
+                "SELECT * FROM compression_steps WHERE task_id=? ORDER BY step_index", (task_id,)
+            ).fetchall()
+        ]
 
     async def list_tasks(self, since: datetime | None = None, limit: int = 100) -> list[TaskRecord]:
         if since is None:
