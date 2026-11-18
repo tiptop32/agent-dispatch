@@ -412,6 +412,107 @@ def test_report_recovery_missing_attempt_usage_invalidates_total(location, recov
     assert any("usage unavailable" in reason for reason in accounted["unknowns"])
 
 
+@pytest.mark.parametrize(
+    ("started", "finished", "cancelled"),
+    [(1, 0, True), (2, 1, True), (2, 1, False), (1, 1, True), (2, 2, False), (None, 1, True)],
+)
+def test_supervision_completeness_preserves_merged_known_charge(started, finished, cancelled):
+    snapshot = accounting_fixture()
+    result = json.loads(snapshot["tasks"][0]["result_json"])
+    result["meta"].pop("fix_rounds")
+    initial = Usage(cost_usd=0.6, input_tokens=10, output_tokens=2)
+    supervisor = None
+    for _ in range(finished):
+        supervisor = report_recovery._usage(
+            supervisor, Usage(cost_usd=0.1, input_tokens=3, output_tokens=1)
+        )
+    # supervision.finish merges only finished checks, then cancels the in-flight
+    # check without observing its bill. _mark_cancelled has no started counter.
+    result["usage"] = report_recovery._usage(initial, supervisor).model_dump()
+    metadata = {
+        "checks_finished": finished,
+        "usage": supervisor.model_dump() if supervisor else None,
+    }
+    if started is None:
+        metadata["inflight_check_usage"] = "unknown after cancellation"
+    else:
+        metadata.update(checks_started=started, inflight_check_cancelled=cancelled)
+    result["meta"]["supervision_usage"] = metadata
+    snapshot["tasks"][0]["result_json"] = json.dumps(result)
+    accounted = harness.account_chain(snapshot)
+    known_cost = 1.02 + 0.1 * finished
+    assert accounted["cost_usd"]["known_total"] == pytest.approx(known_cost)
+    assert accounted["input_tokens"]["known_total"] == 50 + 3 * finished
+    assert accounted["output_tokens"]["known_total"] == 7 + finished
+    if cancelled or started != finished or (started is not None and started > 1):
+        assert accounted["complete"] is False and accounted["full_cost_usd"] is None
+        assert accounted["cost_usd"]["total"] is None
+        assert accounted["input_tokens"]["total"] is None
+        assert accounted["output_tokens"]["total"] is None
+        assert "Unobserved supervision usage root" in accounted["unknowns"]
+    else:
+        assert accounted["complete"] is True
+        assert accounted["full_cost_usd"] == pytest.approx(known_cost)
+        assert accounted["unknowns"] == []
+
+
+@pytest.mark.parametrize("missing", [None, "cost_usd", "input_tokens", "output_tokens"])
+def test_finished_supervision_missing_usage_cannot_make_merged_total_complete(missing):
+    snapshot = accounting_fixture()
+    result = json.loads(snapshot["tasks"][0]["result_json"])
+    result["meta"].pop("fix_rounds")
+    initial = Usage(cost_usd=0.6, input_tokens=10, output_tokens=2)
+    supervisor = Usage(cost_usd=0.1, input_tokens=3, output_tokens=1) if missing else None
+    if supervisor is not None:
+        setattr(supervisor, missing, None)
+    result["usage"] = report_recovery._usage(initial, supervisor).model_dump()
+    result["meta"]["supervision_usage"] = {
+        "checks_started": 1,
+        "checks_finished": 1,
+        "usage": supervisor.model_dump() if supervisor else None,
+        "inflight_check_cancelled": False,
+    }
+    snapshot["tasks"][0]["result_json"] = json.dumps(result)
+    accounted = harness.account_chain(snapshot)
+    assert accounted["cost_usd"]["known_total"] == pytest.approx(
+        1.02 if missing in (None, "cost_usd") else 1.12
+    )
+    assert accounted["input_tokens"]["known_total"] == (
+        50 if missing in (None, "input_tokens") else 53
+    )
+    assert accounted["output_tokens"]["known_total"] == (
+        7 if missing in (None, "output_tokens") else 8
+    )
+    assert accounted["complete"] is False and accounted["full_cost_usd"] is None
+    dimension = "cost_usd" if missing is None else missing
+    assert accounted[dimension]["total"] is None
+    assert "Unobserved supervision usage root" in accounted["unknowns"]
+
+
+@pytest.mark.parametrize("first", [None, Usage(cost_usd=0.1, input_tokens=4, output_tokens=2)])
+def test_multiple_supervision_checks_have_unknown_per_attempt_completeness(first):
+    snapshot = accounting_fixture()
+    result = json.loads(snapshot["tasks"][0]["result_json"])
+    result["meta"].pop("fix_rounds")
+    second = Usage(cost_usd=0.2, input_tokens=3, output_tokens=1)
+    aggregate = report_recovery._usage(first, second)
+    result["usage"] = report_recovery._usage(
+        Usage(cost_usd=0.6, input_tokens=10, output_tokens=2), aggregate
+    ).model_dump()
+    result["meta"]["supervision_usage"] = {
+        "checks_started": 2,
+        "checks_finished": 2,
+        "usage": aggregate.model_dump(),
+        "inflight_check_cancelled": False,
+    }
+    snapshot["tasks"][0]["result_json"] = json.dumps(result)
+    accounted = harness.account_chain(snapshot)
+    assert accounted["cost_usd"]["known_total"] == pytest.approx(1.32 if first else 1.22)
+    assert accounted["complete"] is False
+    assert accounted["full_cost_usd"] is None
+    assert accounted["cost_usd"]["total"] is None
+
+
 @pytest.mark.parametrize("missing", ["executor_cost", "compression_cost", "byok", "verification"])
 def test_unknown_cost_bill_or_missing_verification_cannot_be_success(missing):
     snapshot = accounting_fixture()

@@ -1182,7 +1182,8 @@ def account_chain(snapshot: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
 
     Merged usage preserves known values even when a contributing attempt is
     unobserved. Repaired runs lack independent initial usage; recovery outcome
-    metadata/events lack per-attempt usage. Both force unknown full totals without
+    metadata/events lack per-attempt usage. Supervision metadata identifies
+    unfinished checks and missing usage. These force unknown full totals without
     adding their known charges again. Inclusive durations overlap wall time.
     """
     tasks = {row["task_id"]: row for row in snapshot["tasks"]}
@@ -1228,6 +1229,36 @@ def account_chain(snapshot: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
             if not any(row["task_id"] == task_id for row in routes.values()):
                 unknowns.append(f"Missing paid routing ledger {task_id}")
                 components.append(unknown_component(task_id, "routing"))
+        supervision_usage = meta.get("supervision_usage")
+        if supervision_usage is not None:
+            started = finite_nonnegative(supervision_usage.get("checks_started"), integer=True)
+            finished = finite_nonnegative(supervision_usage.get("checks_finished"), integer=True)
+            interrupted = (
+                started is None
+                or finished is None
+                or started != finished
+                or started > 1
+                or supervision_usage.get("inflight_check_cancelled")
+                or supervision_usage.get("inflight_check_usage")
+            )
+            # finish() already merges known supervisor charges into result.usage.
+            # Only mark unobserved dimensions; never add the metadata mirror again.
+            usage = supervision_usage.get("usage") or {}
+            category = "review" if request.get("kind") == "review" else "executor"
+            missing = unknown_component(f"{task_id}:supervision", category)
+            for dimension, key in (
+                ("cost", "cost_usd"),
+                ("input_tokens", "input_tokens"),
+                ("output_tokens", "output_tokens"),
+            ):
+                if not interrupted and (
+                    started == 0
+                    or finite_nonnegative(usage.get(key), integer=dimension != "cost") is not None
+                ):
+                    missing[dimension] = 0
+            if any(missing[key] is None for key in ("cost", "input_tokens", "output_tokens")):
+                components.append(missing)
+                unknowns.append(f"Unobserved supervision usage {task_id}")
         if meta.get("fix_rounds"):
             # The production merge does not persist the initial attempt's usage.
             # Complete repair usage cannot establish that the initial run was seen.
